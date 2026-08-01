@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # NimbusFS
 
 **A Cloud-Native Distributed File Storage Platform built with Python, FastAPI and Google Cloud.**
@@ -410,4 +410,4 @@ Structured logging: JSON logs for ingestion into ELK/Cloud Logging.
 License
 Proprietary.
 
->>>>>>> b62d862acc4e93e3c4a06e1dd0022682031f3115
+
