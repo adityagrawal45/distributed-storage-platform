@@ -14,10 +14,18 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db
+from app.repositories.file_metadata_repository import FileMetadataRepository
+from app.repositories.file_version_repository import FileVersionRepository
+from app.repositories.folder_repository import FolderRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
+from app.services.folder_service import FolderService
+from app.services.metadata_service import MetadataService
+from app.services.search_service import SearchService
+from app.services.trash_service import TrashService
 from app.services.user_service import UserService
+from app.services.version_service import VersionService
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
@@ -30,8 +38,23 @@ def get_refresh_token_repository(session: DbSession) -> RefreshTokenRepository:
     return RefreshTokenRepository(session)
 
 
+def get_folder_repository(session: DbSession) -> FolderRepository:
+    return FolderRepository(session)
+
+
+def get_file_metadata_repository(session: DbSession) -> FileMetadataRepository:
+    return FileMetadataRepository(session)
+
+
+def get_file_version_repository(session: DbSession) -> FileVersionRepository:
+    return FileVersionRepository(session)
+
+
 UserRepositoryDep = Annotated[UserRepository, Depends(get_user_repository)]
 RefreshTokenRepositoryDep = Annotated[RefreshTokenRepository, Depends(get_refresh_token_repository)]
+FolderRepositoryDep = Annotated[FolderRepository, Depends(get_folder_repository)]
+FileMetadataRepositoryDep = Annotated[FileMetadataRepository, Depends(get_file_metadata_repository)]
+FileVersionRepositoryDep = Annotated[FileVersionRepository, Depends(get_file_version_repository)]
 
 
 def get_auth_service(
@@ -45,5 +68,38 @@ def get_user_service(user_repository: UserRepositoryDep) -> UserService:
     return UserService(user_repository)
 
 
+def get_folder_service(folder_repository: FolderRepositoryDep) -> FolderService:
+    return FolderService(folder_repository)
+
+
+def get_metadata_service(
+    file_repository: FileMetadataRepositoryDep,
+    version_repository: FileVersionRepositoryDep,
+    folder_repository: FolderRepositoryDep,
+) -> MetadataService:
+    return MetadataService(file_repository, version_repository, folder_repository)
+
+
+def get_search_service(file_repository: FileMetadataRepositoryDep) -> SearchService:
+    return SearchService(file_repository)
+
+
+def get_trash_service(
+    folder_repository: FolderRepositoryDep, file_repository: FileMetadataRepositoryDep
+) -> TrashService:
+    return TrashService(folder_repository, file_repository)
+
+
+def get_version_service(
+    version_repository: FileVersionRepositoryDep, file_repository: FileMetadataRepositoryDep
+) -> VersionService:
+    return VersionService(version_repository, file_repository)
+
+
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 UserServiceDep = Annotated[UserService, Depends(get_user_service)]
+FolderServiceDep = Annotated[FolderService, Depends(get_folder_service)]
+MetadataServiceDep = Annotated[MetadataService, Depends(get_metadata_service)]
+SearchServiceDep = Annotated[SearchService, Depends(get_search_service)]
+TrashServiceDep = Annotated[TrashService, Depends(get_trash_service)]
+VersionServiceDep = Annotated[VersionService, Depends(get_version_service)]
