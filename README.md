@@ -1,96 +1,3 @@
-
-# NimbusFS
-
-**A Cloud-Native Distributed File Storage Platform built with Python, FastAPI and Google Cloud.**
-
-> **Phase 1 of 15** — Backend Foundation: Clean Architecture, Auth, PostgreSQL, Redis, Docker, Testing.
-> File upload/storage features are **not yet implemented** — they arrive in later phases.
-
----
-
-## 1. Project Overview
-
-NimbusFS is being built incrementally into a Google Drive / Dropbox-like distributed
-file storage platform, deployed on GKE. Phase 1 establishes the production-grade
-backend foundation everything else will be built on:
-
-- Clean Architecture with strict layer separation
-- JWT authentication with refresh-token rotation
-- Role-based authorization
-- PostgreSQL via SQLAlchemy 2.0 (async) + Alembic migrations
-- Redis connection (plumbing only — no caching logic yet)
-- Structured JSON logging, global exception handling, standardized API responses
-- Dockerized local development environment
-- Full pytest suite
-
-## 2. Architecture
-
-```
-Client
-  │
-  ▼
-FastAPI App (app/main.py)
-  │  ── Middleware: CORS → TrustedHost → SecurityHeaders → RequestContext
-  │  ── Exception Handlers: validation, auth, domain, DB, unhandled
-  ▼
-API Layer          app/api/v1/{auth,users,health}/routes.py
-  │  (parses input, calls services, wraps output in APIResponse)
-  ▼
-Service Layer       app/services/*.py
-  │  (business logic: registration, login, token rotation, RBAC checks)
-  ▼
-Repository Layer    app/repositories/*.py
-  │  (all persistence access; no business logic)
-  ▼
-Database Layer       app/database/{session,redis}.py
-  │
-  ▼
-PostgreSQL (SQLAlchemy 2.0 async + asyncpg)      Redis (connection only)
-```
-
-Cross-cutting concerns live in `app/core` (config, security), `app/schemas`
-(Pydantic models), `app/exceptions`, `app/logging`, and `app/dependencies`
-(the FastAPI dependency-injection wiring).
-
-Business logic never lives in route handlers — routes are thin, services
-own all rules, repositories own all queries. This is enforced structurally,
-not just by convention.
-
-## 3. Folder Structure
-
-```
-nimbusfs/
-├── app/
-│   ├── api/v1/
-│   │   ├── auth/routes.py        # register, login, refresh, logout
-│   │   ├── users/routes.py       # /me, /{id} (admin-only)
-│   │   ├── health/routes.py      # GET /health
-│   │   └── router.py             # aggregates all v1 routers
-│   ├── core/
-│   │   ├── config/settings.py    # Pydantic Settings (env-driven config)
-│   │   └── security/             # password hashing, JWT creation/verification
-│   ├── database/
-│   │   ├── session.py            # async SQLAlchemy engine/session (Unit of Work)
-│   │   └── redis.py              # Redis connection pool
-│   ├── models/                   # SQLAlchemy 2.0 declarative models (User, RefreshToken)
-│   ├── repositories/             # DB access only, no business logic
-│   ├── services/                 # business logic (AuthService, UserService)
-│   ├── schemas/                  # Pydantic request/response models
-│   ├── dependencies/             # DI providers + auth/RBAC dependencies
-│   ├── middleware/                # request-ID logging, security headers
-│   ├── exceptions/                # domain exceptions + global handlers
-│   ├── logging/                   # structlog JSON logging config
-│   └── main.py                    # app composition (the only "wiring" file)
-├── alembic/                       # migrations
-├── docker/Dockerfile
-├── docker-compose.yml
-├── tests/                         # pytest suite
-├── scripts/                       # run_dev.sh, migrate.sh
-├── requirements.txt
-├── .env.example
-└── README.md
-```
-
 | Directory | Responsibility |
 |---|---|
 | `api/` | HTTP concerns only: routing, request/response wrapping |
@@ -105,6 +12,7 @@ nimbusfs/
 | `middleware/` | Cross-cutting request/response processing |
 | `exceptions/` | Domain exceptions + their translation to HTTP |
 | `logging/` | Structured logging setup |
+| `utils/` | Small stateless helper functions (e.g. path building) |
 | `tests/` | Unit/integration tests, fixtures |
 
 ## 4. Database Design
@@ -136,9 +44,65 @@ nimbusfs/
 We deliberately never persist the raw refresh token — only its `jti` — so a
 database leak cannot be used to forge/replay authentication.
 
+**`folders`** *(Phase 2)*
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID (PK) | |
+| owner_id | UUID (FK → users.id, `CASCADE`) | indexed |
+| parent_folder_id | UUID (FK → folders.id, `CASCADE`), nullable | self-referential; null = top-level |
+| name | VARCHAR(255) | |
+| path | VARCHAR(4096) | materialized path, e.g. `/Documents/Projects`; indexed |
+| level | INTEGER | depth, 0 = top-level; denormalized for cheap reads |
+| is_root | BOOLEAN | true iff `parent_folder_id IS NULL` |
+| is_deleted / deleted_at / deleted_by | soft-delete trio | trash state (see `SoftDeleteMixin`) |
+| created_by / updated_by | UUID (FK → users.id, `SET NULL`), nullable | audit trail (see `AuditMixin`) |
+| created_at / updated_at | TIMESTAMPTZ | |
+
+Unique constraint: `(owner_id, parent_folder_id, name)` **partial index** — only enforced
+`WHERE is_deleted = false`, so a trashed "Reports" doesn't block creating a new one
+in the same location.
+
+**`file_metadata`** *(Phase 2)*
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID (PK) | |
+| owner_id | UUID (FK → users.id, `CASCADE`) | indexed |
+| folder_id | UUID (FK → folders.id, `CASCADE`), nullable | null = top-level |
+| original_filename | VARCHAR(255) | user-facing name |
+| stored_filename | VARCHAR(512), unique | **reserved** future storage object key — no bytes exist yet |
+| extension | VARCHAR(32), nullable | derived from filename |
+| mime_type | VARCHAR(255), nullable | |
+| size | BIGINT | declared/current size in bytes |
+| checksum | VARCHAR(128), nullable | current version's checksum |
+| version | INTEGER | current version pointer (full history in `file_versions`) |
+| status | ENUM(`reserved`,`active`,`archived`) | `reserved` until a future upload phase confirms bytes landed |
+| is_deleted / deleted_at / deleted_by | soft-delete trio | |
+| created_by / updated_by | UUID, nullable | audit trail |
+| created_at / updated_at | TIMESTAMPTZ | |
+
+Unique constraint: `(owner_id, folder_id, original_filename)`, partial on `is_deleted = false`
+— same pattern as folders.
+
+**`file_versions`** *(Phase 2)*
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID (PK) | |
+| file_id | UUID (FK → file_metadata.id, `CASCADE`) | indexed |
+| version | INTEGER | unique per `file_id` |
+| checksum / size | snapshot at that version | |
+| created_at | TIMESTAMPTZ | |
+
+Append-only. `file_metadata.version/checksum/size` always mirrors the latest row
+here; this table exists purely to power `GET /metadata/{id}/versions`.
+
 ## 5. API Design
 
 All endpoints are namespaced under `/api/v1`.
+
+**Auth & Users** *(Phase 1)*
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -149,6 +113,44 @@ All endpoints are namespaced under `/api/v1`.
 | POST | `/auth/logout` | none (valid refresh token) | Revoke a refresh token |
 | GET | `/users/me` | Bearer access token | Current user's profile |
 | GET | `/users/{id}` | Bearer access token, **admin role** | Any user's profile |
+
+**Folders** *(Phase 2, all require Bearer auth)*
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/folders` | Create a folder (top-level if `parent_folder_id` omitted) |
+| GET | `/folders` | List child folders of a parent (or top-level if omitted) |
+| GET | `/folders/tree` | Full nested folder tree (forest, or rooted at one folder) |
+| GET | `/folders/breadcrumb?folder_id=` | Ancestor chain from root to the given folder |
+| GET | `/folders/trash` | List trashed folders |
+| GET | `/folders/{id}` | Get a folder by ID |
+| PUT | `/folders/{id}` | Rename |
+| POST | `/folders/{id}/move` | Move to a new parent |
+| DELETE | `/folders/{id}` | Soft delete (moves to trash, cascades to descendants) |
+| POST | `/folders/{id}/restore` | Restore from trash |
+| DELETE | `/folders/{id}/permanent` | Permanently delete (must be trashed first; irreversible) |
+
+**File Metadata** *(Phase 2, all require Bearer auth)*
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/metadata` | Create a metadata placeholder (reserves storage slot; no upload) |
+| GET | `/metadata/search` | Search/filter/sort/paginate files |
+| GET | `/metadata/trash` | List trashed files |
+| GET | `/metadata/{id}` | Get file metadata by ID |
+| PUT | `/metadata/{id}` | Update metadata (size/checksum change bumps version) |
+| POST | `/metadata/{id}/rename` | Rename |
+| POST | `/metadata/{id}/move` | Move to a new folder |
+| DELETE | `/metadata/{id}` | Soft delete (moves to trash) |
+| POST | `/metadata/{id}/restore` | Restore from trash |
+| DELETE | `/metadata/{id}/permanent` | Permanently delete (must be trashed first; irreversible) |
+| GET | `/metadata/{id}/versions` | Full version history |
+
+**Trash** *(Phase 2)*
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/trash` | Combined view: everything currently trashed (folders + files) |
 
 Every response follows the standard envelope:
 
@@ -178,13 +180,67 @@ Every response follows the standard envelope:
    is rejected — this bounds the damage from a leaked refresh token to one use.
 5. **Logout** → `POST /auth/logout` revokes the given refresh token's `jti`.
    Access tokens are stateless and simply expire naturally; there is no
-   server-side access-token revocation list in Phase 1 by design — see the
-   "Logout Design" note in `app/services/auth_service.py`.
+   server-side access-token revocation list in Phase 1 by design.
 6. **Role-based authorization** → `require_role(UserRole.ADMIN)` is a dependency
    factory used on routes that need it (e.g. `GET /users/{id}`), so authorization
    requirements are visible in the route signature.
 
-## 7. Installation
+## 7. Folder Hierarchy & Materialized Paths *(Phase 2)*
+
+Folders form a self-referential tree via `parent_folder_id`, with no fixed
+depth limit. Each folder also stores a **materialized path**
+(e.g. `/Documents/Projects/AI`) and a **level** (depth, 0 = top-level),
+kept in sync automatically:
+
+- **Create**: `path = parent.path + '/' + name`, `level = parent.level + 1`.
+- **Rename**: the folder's own path is rewritten, and every descendant's
+  path is rewritten too (prefix replacement), in one repository call.
+- **Move**: the folder's path/level are recomputed against the new parent,
+  descendants get both a path-prefix rewrite and a level shift.
+
+This trades a bit of extra work on rename/move for very cheap reads —
+breadcrumbs, subtree queries, and "is X inside Y" checks are simple string
+operations instead of recursive queries.
+
+**Validation enforced before any move/rename lands:**
+- No duplicate folder name within the same parent (soft-deleted siblings excluded)
+- No moving a folder into itself
+- No moving a folder into one of its own descendants (circular reference)
+- Folder names reject empty strings, `.`/`..`, and path-separator characters
+
+## 8. Trash & Soft Delete *(Phase 2)*
+
+There is **no separate trash table**. Both `folders` and `file_metadata`
+carry `is_deleted` / `deleted_at` / `deleted_by` directly (via
+`SoftDeleteMixin`). This means:
+
+- **Delete** = flip `is_deleted = true`. Deleting a folder cascades the
+  same flag to every descendant folder (and, once created inside it,
+  every descendant file) so a trashed folder's contents move with it.
+- **Restore** = flip it back. Restoring a folder restores the descendants
+  that were trashed alongside it, without resurrecting anything that was
+  independently trashed earlier.
+- **Permanent delete** = the *only* operation that issues a real SQL
+  `DELETE`, and it requires the item to already be in the trash — you
+  cannot skip straight from active to permanently gone.
+
+## 9. Search, Pagination, Sorting, Filtering *(Phase 2)*
+
+`GET /metadata/search` supports all of the following simultaneously:
+
+- **Free-text search (`q`)**: matches the file's own name OR the name of
+  the folder it lives in.
+- **Filters**: `folder_id`, `extension`, `mime_type`, `version`,
+  `is_deleted`, `created_after`/`created_before`, `updated_after`/`updated_before`.
+- **Sorting**: `sort_by` (name, created_at, updated_at, size, type) ×
+  `sort_order` (asc/desc).
+- **Pagination**: `page` / `page_size` (max 100), returning `total`,
+  `total_pages`, `has_next`, `has_previous` alongside `items`.
+
+The same `Page[T]` / `PaginationParams` pair is reused by every list-style
+endpoint, so pagination behaves identically across the whole API.
+
+## 10. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -193,7 +249,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 8. Environment Variables
+## 11. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -207,7 +263,7 @@ See `.env.example` for the full list. Key variables:
 | `CORS_ALLOWED_ORIGINS` | Comma-separated list of allowed origins |
 | `LOG_LEVEL` / `LOG_JSON` | Logging verbosity/format |
 
-## 9. Running Locally (without Docker)
+## 12. Running Locally (without Docker)
 
 Requires a local PostgreSQL and Redis instance matching your `.env`.
 
@@ -219,7 +275,7 @@ alembic upgrade head
 
 API available at `http://localhost:8000`, docs at `http://localhost:8000/docs`.
 
-## 10. Running with Docker
+## 13. Running with Docker
 
 ```bash
 cp .env.example .env
@@ -233,7 +289,7 @@ network. Apply migrations inside the running container:
 docker compose exec api alembic upgrade head
 ```
 
-## 11. Database Migrations (Alembic)
+## 14. Database Migrations (Alembic)
 
 ```bash
 # Generate a new migration from model changes
@@ -246,10 +302,11 @@ alembic upgrade head
 alembic downgrade -1
 ```
 
-The Phase 1 baseline migration (`0001_initial`) creates `users` and
-`refresh_tokens`.
+Migrations so far:
+- `0001_initial` — `users`, `refresh_tokens`
+- `0002_metadata` — `folders`, `file_metadata`, `file_versions`
 
-## 12. API Documentation
+## 15. API Documentation
 
 - Swagger UI: `GET /docs`
 - ReDoc: `GET /redoc`
@@ -257,7 +314,7 @@ The Phase 1 baseline migration (`0001_initial`) creates `users` and
 
 (Docs are automatically disabled when `ENVIRONMENT=production`.)
 
-## 13. Testing
+## 16. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
 services required.
@@ -266,20 +323,27 @@ services required.
 pytest -v
 ```
 
-Coverage includes: registration (success/duplicate/validation), login
-(success/wrong password/nonexistent user), protected routes (valid/missing/
-invalid token), role-based authorization, refresh-token rotation (including
-replay rejection), logout, and the health endpoint.
+Coverage includes:
+- **Phase 1**: registration, login, protected routes, role-based authorization,
+  refresh-token rotation (including replay rejection), logout, health endpoint.
+- **Phase 2**: folder CRUD, nested creation, duplicate-name rejection, rename
+  with cascading path updates, move (including circular-reference and
+  move-into-self rejection), folder tree, breadcrumb, folder/file trash +
+  restore + permanent delete, file metadata CRUD, rename, move, version
+  bumping on content change, search (filename, folder-name, extension,
+  MIME type, deleted status), sorting, pagination, and cross-owner data
+  isolation.
 
-## 14. Future Roadmap (Phases 2–15, not yet built)
+## 17. Future Roadmap (Phases 3–15, not yet built)
 
-File upload/download, chunked/multipart uploads, Google Cloud Storage
-integration, file metadata & versioning, sharing & permissions, Pub/Sub-driven
-background workers, virus scanning, thumbnails, full-text search, rate
-limiting, caching, CI/CD via GitHub Actions, Terraform IaC, GKE deployment,
-Cloud Armor, Cloud CDN, observability (Cloud Monitoring/Logging dashboards).
+Actual file upload/download, chunked/multipart uploads, Google Cloud Storage
+integration (wiring `stored_filename` to real objects), sharing & permissions,
+Pub/Sub-driven background workers, virus scanning, thumbnails, full-text
+content search, rate limiting, Redis caching, CI/CD via GitHub Actions,
+Terraform IaC, GKE deployment, Cloud Armor, Cloud CDN, observability
+(Cloud Monitoring/Logging dashboards).
 
-## 15. Contribution Guide
+## 18. Contribution Guide
 
 1. Create a feature branch from `main`.
 2. Keep business logic in `services/`, persistence in `repositories/` — never
@@ -288,126 +352,3 @@ Cloud Armor, Cloud CDN, observability (Cloud Monitoring/Logging dashboards).
 4. Run `alembic revision --autogenerate` for any model change and commit the
    generated migration alongside the model change.
 5. Follow existing typing/async/PEP8 conventions.
-=======
-Distributed File Storage System – Phase 1
-A production-ready foundation for a distributed file storage system, built with FastAPI, PostgreSQL, Redis, and Docker, following Clean Architecture.
-
-Overview
-This project is a scalable backend service that supports user authentication (JWT with refresh tokens), role-based access, and a health-check endpoint. It is designed to evolve into a multi-pod Kubernetes deployment with Google Cloud services.
-
-Architecture
-The code follows Clean Architecture with clear separation:
-
-API Layer: Routes and dependencies.
-
-Domain: SQLAlchemy models and Pydantic schemas.
-
-Services: Business logic.
-
-Repositories: Data access abstraction.
-
-Infrastructure: DB, Redis, logging, config.
-
-All components are decoupled for testability and maintainability.
-
-Folder Structure
-text
-app/...
-tests/...
-migrations/...
-docker-compose.yml
-Dockerfile
-README.md
-Setup Instructions
-Prerequisites
-Python 3.12+
-
-Docker & Docker Compose
-
-(Optional) PostgreSQL and Redis locally
-
-Environment Variables
-Copy .env.example to .env and adjust secrets (especially SECRET_KEY).
-
-Running Locally (without Docker)
-Create virtual environment:
-
-bash
-python -m venv venv
-source venv/bin/activate
-Install dependencies:
-
-bash
-pip install -r requirements.txt
-Run PostgreSQL and Redis (or use Docker for them only).
-
-Apply migrations:
-
-'''bash
-alembic upgrade head
-Run the server:
-
-bash
-uvicorn app.main:app --reload
-API docs at http://localhost:8000/docs.
-
-Running with Docker Compose
-Ensure .env is set.
-
-Build and start:
-
-bash
-docker-compose up -d --build
-Wait for services to be healthy.
-
-Access API at http://localhost:8000.
-
-Testing
-Run tests with pytest:
-
-bash
-pytest -v
-API Documentation
-Swagger UI: http://localhost:8000/docs
-
-ReDoc: http://localhost:8000/redoc
-
-Authentication Flow
-Register via /api/v1/auth/register with email, name, password.
-
-Login via /api/v1/auth/login to obtain access & refresh tokens.
-
-Use access token in Authorization: Bearer <token> for protected endpoints.
-
-When access token expires, use /api/v1/auth/refresh with refresh token to get a new pair.
-
-Logout: client discards tokens (future: blacklist).
-
-Future Roadmap
-File upload/download with chunking.
-
-Google Cloud Storage integration.
-
-Kubernetes deployment with horizontal scaling.
-
-Background workers for async processing.
-
-File sharing and versioning.
-
-Enhanced monitoring and observability.
-
-Design Decisions
-Clean Architecture: ensures business logic is independent of frameworks.
-
-Async SQLAlchemy: for non-blocking I/O.
-
-JWT with refresh tokens: stateless authentication, scalable.
-
-Repository pattern: simplifies swapping databases.
-
-Structured logging: JSON logs for ingestion into ELK/Cloud Logging.
-
-License
-Proprietary.
-
-
