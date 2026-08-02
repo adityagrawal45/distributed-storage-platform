@@ -1,16 +1,24 @@
 from app.exceptions.custom_exceptions import (
     AuthenticationException,
     AuthorizationException,
+    CircularReferenceException,
     ConflictException,
     DatabaseConnectionException,
+    DuplicateFileException,
+    DuplicateFolderException,
     EmailAlreadyExistsException,
+    FileNotFoundException,
+    FolderNotFoundException,
     InactiveUserException,
     InvalidCredentialsException,
+    InvalidMoveException,
     InvalidTokenException,
     NimbusFSException,
     NotFoundException,
     RedisConnectionException,
     TokenExpiredException,
+    TrashException,
+    ValidationException,
 )
 
 __all__ = [
@@ -26,4 +34,12 @@ __all__ = [
     "EmailAlreadyExistsException",
     "DatabaseConnectionException",
     "RedisConnectionException",
+    "FolderNotFoundException",
+    "FileNotFoundException",
+    "DuplicateFolderException",
+    "DuplicateFileException",
+    "InvalidMoveException",
+    "CircularReferenceException",
+    "TrashException",
+    "ValidationException",
 ]

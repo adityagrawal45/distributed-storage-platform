@@ -86,3 +86,46 @@ class DatabaseConnectionException(NimbusFSException):
 class RedisConnectionException(NimbusFSException):
     def __init__(self, detail: str = "Redis connection error."):
         super().__init__(detail)
+
+
+# ---------------------------------------------------------------------
+# Metadata Management (Phase 2): Folders & Files
+# ---------------------------------------------------------------------
+class FolderNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Folder not found."):
+        super().__init__(detail)
+
+
+class FileNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "File not found."):
+        super().__init__(detail)
+
+
+class DuplicateFolderException(ConflictException):
+    def __init__(self, detail: str = "A folder with this name already exists in this location."):
+        super().__init__(detail)
+
+
+class DuplicateFileException(ConflictException):
+    def __init__(self, detail: str = "A file with this name already exists in this location."):
+        super().__init__(detail)
+
+
+class InvalidMoveException(NimbusFSException):
+    def __init__(self, detail: str = "This move operation is not allowed."):
+        super().__init__(detail)
+
+
+class CircularReferenceException(InvalidMoveException):
+    def __init__(self, detail: str = "Cannot move a folder into itself or one of its own descendants."):
+        super().__init__(detail)
+
+
+class TrashException(NimbusFSException):
+    def __init__(self, detail: str = "This item is not in the trash."):
+        super().__init__(detail)
+
+
+class ValidationException(NimbusFSException):
+    def __init__(self, detail: str = "Validation failed."):
+        super().__init__(detail)

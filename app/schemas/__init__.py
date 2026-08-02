@@ -1,6 +1,26 @@
 from app.schemas.auth import AccessTokenResponse, LoginRequest, RefreshTokenRequest, TokenPair
+from app.schemas.file_metadata import (
+    FileMetadataCreate,
+    FileMetadataRead,
+    FileMetadataUpdate,
+    FileMove,
+    FileRename,
+    FileVersionRead,
+)
+from app.schemas.folder import (
+    BreadcrumbItem,
+    BreadcrumbResponse,
+    FolderCreate,
+    FolderMove,
+    FolderRead,
+    FolderRename,
+    FolderTreeNode,
+)
 from app.schemas.health import ComponentStatus, HealthCheckResponse
+from app.schemas.pagination import Page, PaginationParams
 from app.schemas.response import APIResponse, ErrorDetail
+from app.schemas.search import FileSearchParams, FolderListParams
+from app.schemas.sorting import FileSortField, FolderSortField, SortOrder
 from app.schemas.user import UserBase, UserCreate, UserRead
 
 __all__ = [
@@ -15,4 +35,24 @@ __all__ = [
     "AccessTokenResponse",
     "HealthCheckResponse",
     "ComponentStatus",
+    "Page",
+    "PaginationParams",
+    "FolderCreate",
+    "FolderRename",
+    "FolderMove",
+    "FolderRead",
+    "FolderTreeNode",
+    "BreadcrumbItem",
+    "BreadcrumbResponse",
+    "FileMetadataCreate",
+    "FileMetadataUpdate",
+    "FileRename",
+    "FileMove",
+    "FileMetadataRead",
+    "FileVersionRead",
+    "FileSearchParams",
+    "FolderListParams",
+    "SortOrder",
+    "FolderSortField",
+    "FileSortField",
 ]
