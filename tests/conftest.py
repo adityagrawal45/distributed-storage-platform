@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 """
 Shared pytest fixtures.
 
@@ -67,50 +66,21 @@ def valid_user_payload() -> dict:
         "email": "ada@nimbusfs.io",
         "password": "StrongP@ssw0rd",
     }
-=======
-import pytest
-import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from app.main import app
-from app.infrastructure.database import get_db
-from app.domain.models import Base
-from app.core.config import settings
-import asyncio
-
-# Use test database
-TEST_DATABASE_URL = settings.DATABASE_URL.unicode_string().replace("file_storage", "test_file_storage")
-
-engine = create_async_engine(TEST_DATABASE_URL, echo=False)
-TestingSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-async def override_get_db():
-    async with TestingSessionLocal() as session:
-        yield session
-
-app.dependency_overrides[get_db] = override_get_db
-
-
-@pytest_asyncio.fixture(scope="function")
-async def db_session():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    async with TestingSessionLocal() as session:
-        yield session
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-
-
-@pytest_asyncio.fixture(scope="function")
-async def client():
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        yield ac
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
->>>>>>> b62d862acc4e93e3c4a06e1dd0022682031f3115
+@pytest_asyncio.fixture
+async def authed_client(client: AsyncClient, valid_user_payload: dict) -> AsyncClient:
+    """
+    A client pre-registered, pre-logged-in, and carrying a valid
+    `Authorization: Bearer` header — used by Phase 2 tests (folders/
+    metadata) that need an authenticated owner but aren't testing auth
+    itself.
+    """
+    await client.post("/api/v1/auth/register", json=valid_user_payload)
+    login_response = await client.post(
+        "/api/v1/auth/login",
+        data={"username": valid_user_payload["email"], "password": valid_user_payload["password"]},
+    )
+    access_token = login_response.json()["data"]["access_token"]
+    client.headers["Authorization"] = f"Bearer {access_token}"
+    return client
