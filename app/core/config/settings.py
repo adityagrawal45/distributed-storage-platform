@@ -116,6 +116,39 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = True
 
+    # ------------------------------------------------------------------
+    # Google Cloud Storage (Phase 3)
+    # ------------------------------------------------------------------
+    GCS_PROJECT_ID: str = "nimbusfs-dev"
+    GCS_BUCKET_NAME: str = "nimbusfs-files-dev"
+    # Path to a service-account JSON key file. Left unset in
+    # staging/production, where Application Default Credentials (a
+    # workload-identity-bound service account on GKE/Cloud Run) are used
+    # instead — never ship a key file inside a container image.
+    GCS_CREDENTIALS_PATH: str | None = None
+    SIGNED_URL_EXPIRATION_MINUTES: int = 15
+    MAX_UPLOAD_SIZE_MB: int = 100
+    # Empty = allow every MIME type except what BLOCKED_EXTENSIONS rejects.
+    ALLOWED_MIME_TYPES_RAW: str = Field(default="", alias="ALLOWED_MIME_TYPES")
+    # Executable/script extensions are blocked by default — see
+    # StorageService design decisions for the rationale.
+    BLOCKED_EXTENSIONS_RAW: str = Field(
+        default="exe,bat,cmd,msi,dll,com,scr,jar,vbs,ps1,sh,app,apk",
+        alias="BLOCKED_EXTENSIONS",
+    )
+
+    @property
+    def MAX_UPLOAD_SIZE_BYTES(self) -> int:
+        return self.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+    @property
+    def ALLOWED_MIME_TYPES(self) -> List[str]:
+        return [item.strip().lower() for item in self.ALLOWED_MIME_TYPES_RAW.split(",") if item.strip()]
+
+    @property
+    def BLOCKED_EXTENSIONS(self) -> List[str]:
+        return [item.strip().lstrip(".").lower() for item in self.BLOCKED_EXTENSIONS_RAW.split(",") if item.strip()]
+
     @property
     def CORS_ALLOWED_ORIGINS(self) -> List[str]:
         """Comma-separated env value, e.g. 'http://a.com,http://b.com', as a list."""

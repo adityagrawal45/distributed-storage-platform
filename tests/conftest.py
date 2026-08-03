@@ -24,7 +24,9 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.database.session import Base, get_db
+from app.dependencies.providers import get_gcs_client
 from app.main import app
+from tests.fakes.fake_gcs import FakeGCSClient
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -44,12 +46,19 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
         await conn.run_sync(Base.metadata.drop_all)
 
 
+@pytest.fixture
+def fake_gcs_client() -> FakeGCSClient:
+    """A fresh in-memory fake GCS client per test — see tests/fakes/fake_gcs.py."""
+    return FakeGCSClient()
+
+
 @pytest_asyncio.fixture
-async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+async def client(db_session: AsyncSession, fake_gcs_client: FakeGCSClient) -> AsyncGenerator[AsyncClient, None]:
     async def _override_get_db():
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_gcs_client] = lambda: fake_gcs_client
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

@@ -63,7 +63,7 @@ Unique constraint: `(owner_id, parent_folder_id, name)` **partial index** — on
 `WHERE is_deleted = false`, so a trashed "Reports" doesn't block creating a new one
 in the same location.
 
-**`file_metadata`** *(Phase 2)*
+**`file_metadata`** *(Phase 2 core + Phase 3 storage columns)*
 
 | Column | Type | Notes |
 |---|---|---|
@@ -71,19 +71,34 @@ in the same location.
 | owner_id | UUID (FK → users.id, `CASCADE`) | indexed |
 | folder_id | UUID (FK → folders.id, `CASCADE`), nullable | null = top-level |
 | original_filename | VARCHAR(255) | user-facing name |
-| stored_filename | VARCHAR(512), unique | **reserved** future storage object key — no bytes exist yet |
+| stored_filename | VARCHAR(512), unique | per-row unique key reservation (legacy Phase 2 field; distinct from `object_name` — see below) |
 | extension | VARCHAR(32), nullable | derived from filename |
-| mime_type | VARCHAR(255), nullable | |
-| size | BIGINT | declared/current size in bytes |
-| checksum | VARCHAR(128), nullable | current version's checksum |
+| mime_type | VARCHAR(255), nullable | server-detected from content, not trusted from the client |
+| size | BIGINT | current size in bytes |
+| checksum | VARCHAR(128), nullable, indexed | SHA-256 of the file's content; drives duplicate detection |
 | version | INTEGER | current version pointer (full history in `file_versions`) |
-| status | ENUM(`reserved`,`active`,`archived`) | `reserved` until a future upload phase confirms bytes landed |
+| status | ENUM(`reserved`,`active`,`archived`) | `reserved` = metadata-only (Phase 2); `active` = bytes uploaded (Phase 3) |
+| **storage_provider** | VARCHAR(32), nullable | `"gcs"` today; abstraction point for a future backend |
+| **bucket_name** | VARCHAR(255), nullable | which GCS bucket the object lives in |
+| **object_name** | VARCHAR(1024), nullable, indexed (NOT unique) | the actual GCS object key — see "Object Naming" below |
+| **public_url** | VARCHAR(2048), nullable | reserved for future use; always `NULL` today (buckets are private, see Security) |
+| **storage_class** | VARCHAR(32), nullable | GCS storage class reported after upload (e.g. `STANDARD`) |
+| **etag** | VARCHAR(255), nullable | GCS object etag, for optimistic integrity checks |
+| **upload_status** | ENUM(`pending`,`completed`,`failed`), indexed | lifecycle of the *bytes*, independent of `status` (the *row*) |
+| **uploaded_at** | TIMESTAMPTZ, nullable | when the bytes were confirmed persisted |
 | is_deleted / deleted_at / deleted_by | soft-delete trio | |
 | created_by / updated_by | UUID, nullable | audit trail |
 | created_at / updated_at | TIMESTAMPTZ | |
 
 Unique constraint: `(owner_id, folder_id, original_filename)`, partial on `is_deleted = false`
 — same pattern as folders.
+
+**Why `object_name` is NOT unique**: content-based duplicate detection (see
+"Duplicate Detection" below) intentionally lets two different `file_metadata`
+rows point at the *same* GCS object when their content is byte-identical.
+`stored_filename` stays unique per-row (it's a Phase 2 legacy reservation),
+but the physical `object_name` it may share is a many-to-one relationship
+by design.
 
 **`file_versions`** *(Phase 2)*
 
@@ -145,6 +160,54 @@ All endpoints are namespaced under `/api/v1`.
 | POST | `/metadata/{id}/restore` | Restore from trash |
 | DELETE | `/metadata/{id}/permanent` | Permanently delete (must be trashed first; irreversible) |
 | GET | `/metadata/{id}/versions` | Full version history |
+
+**Files — Cloud Storage** *(Phase 3, all require Bearer auth)*
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/files/upload` | Multipart upload: bytes → GCS, metadata → Postgres, in one call |
+| GET | `/files/{id}/download` | Stream a file's bytes; supports `Range` requests |
+| GET | `/files/{id}/signed-url` | Time-boxed V4 signed URL for direct, temporary access |
+| PUT | `/files/{id}/replace` | Upload new bytes as the next version |
+| DELETE | `/files/{id}/permanent` | Delete bytes from GCS **and** the metadata row (must be trashed first) |
+
+Note the split with `/metadata`: `DELETE /metadata/{id}` (Phase 2) soft-deletes
+a row without touching storage — a trashed file's bytes stay recoverable via
+`POST /metadata/{id}/restore`. `DELETE /files/{id}/permanent` (Phase 3) is what
+actually reclaims storage, and only after the row is already trashed.
+
+<details>
+<summary>Files API examples</summary>
+
+```bash
+# Upload
+curl -X POST http://localhost:8000/api/v1/files/upload \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -F "file=@report.pdf" \
+  -F "folder_id=<optional-folder-uuid>"
+
+# Download (streaming, supports Range)
+curl -H "Authorization: Bearer $ACCESS_TOKEN" \
+  http://localhost:8000/api/v1/files/<file_id>/download -o report.pdf
+
+# Resume/range download
+curl -H "Authorization: Bearer $ACCESS_TOKEN" -H "Range: bytes=0-1023" \
+  http://localhost:8000/api/v1/files/<file_id>/download
+
+# Signed URL (defaults to SIGNED_URL_EXPIRATION_MINUTES)
+curl -H "Authorization: Bearer $ACCESS_TOKEN" \
+  "http://localhost:8000/api/v1/files/<file_id>/signed-url?expires_in_minutes=60"
+
+# Replace (new version)
+curl -X PUT http://localhost:8000/api/v1/files/<file_id>/replace \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -F "file=@report-v2.pdf"
+
+# Permanently delete (must already be trashed via DELETE /metadata/{id})
+curl -X DELETE http://localhost:8000/api/v1/files/<file_id>/permanent \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+</details>
 
 **Trash** *(Phase 2)*
 
@@ -240,7 +303,137 @@ carry `is_deleted` / `deleted_at` / `deleted_by` directly (via
 The same `Page[T]` / `PaginationParams` pair is reused by every list-style
 endpoint, so pagination behaves identically across the whole API.
 
-## 10. Installation
+## 10. Cloud Storage Architecture *(Phase 3)*
+
+Bytes and metadata are deliberately split across two systems:
+
+```
+Client --multipart--> FastAPI --metadata--> PostgreSQL (file_metadata, file_versions)
+                          |
+                          +--bytes--> Google Cloud Storage (private bucket)
+```
+
+`app/services/storage_service.py::StorageService` is the **only** module that
+imports `google.cloud.storage` — nothing else touches a `Blob`/`Bucket`
+directly. `app/services/file_upload_service.py::FileUploadService` is the
+only orchestrator that talks to both `StorageService` and
+`FileMetadataRepository` in the same operation, which is where the
+two-systems consistency problem is actually solved.
+
+### Object Naming
+
+Uploaded bytes are **never** stored under the user's original filename.
+Instead, `StorageService.generate_object_name()` builds:
+
+```
+{tenant}/{owner_id}/{year}/{month}/{uuid4}.{extension}
+```
+
+Why:
+1. **Path/collision safety** — user-controlled filenames can contain path
+   traversal segments, unicode tricks, or simply collide with another file
+   (two users can both have `"invoice.pdf"`); a UUID guarantees a globally
+   unique, injection-safe key regardless of what anyone names their files.
+2. **Sharding** — the `{owner}/{year}/{month}/…` prefix gives GCS's internal
+   load balancing a natural partition key, and makes "list this user's
+   objects from a given month" cheap for future lifecycle/archival tooling.
+3. **Stability** — renaming a file (`original_filename`) never requires
+   renaming the underlying object; the object name is permanent for the
+   object's lifetime, exactly mirroring the `stored_filename` reservation
+   Phase 2 already established.
+
+### Upload Flow & Consistency
+
+```
+validate folder exists
+  -> validate + hash the upload (filename, size, sniffed MIME, extension)
+  -> reject duplicate filename-in-folder (before spending a network upload)
+  -> check for identical content already uploaded by this owner (dedup)
+  -> upload bytes to GCS (skipped if deduped)
+  -> persist FileMetadata (status=active) + FileVersion(v1)
+```
+
+**Rollback strategy**: if metadata persistence fails *after* a real
+(non-deduped) upload already succeeded, the just-uploaded object is deleted
+so no orphaned, unreferenced object is left in the bucket. If that rollback
+delete itself fails, `RollbackFailedException` is raised (rather than
+silently swallowing the error) — an operator being paged on it is better
+than silent drift between Postgres and GCS.
+
+### Duplicate Detection
+
+SHA-256 is computed by streaming the upload once (same pass used to sniff
+its MIME type). If a non-deleted `FileMetadata` row for the same owner
+already has that checksum, the new row is created pointing at the **same**
+`object_name` — no bytes are re-uploaded. This is deliberate
+content-addressable-storage behavior: it saves storage cost and upload
+bandwidth for the common case of the same file landing in two folders, or a
+client-side retry. The trade-off — one object can now be referenced by more
+than one row — is exactly why permanent delete (below) checks for other
+referencing rows before deleting the object itself.
+
+### Download Flow & Signed URLs
+
+`GET /files/{id}/download` streams bytes back to the client via
+`StreamingResponse`, chunk by chunk, without buffering the whole file in
+memory — real streaming, not `download_as_bytes()` into a response body.
+An HTTP `Range` header is honored (returns `206 Partial Content` with
+`Content-Range`), so range-friendly clients (video/audio scrubbing, download
+managers, resumable downloads) work correctly.
+
+`GET /files/{id}/signed-url` issues a V4 signed URL — a time-boxed
+(`SIGNED_URL_EXPIRATION_MINUTES`, overridable per-request), pre-authenticated
+link straight to the object in GCS. This is the **only** sanctioned way a
+client gets direct object access; the bucket itself is never public (see
+Security, below).
+
+### Replace (New Version)
+
+Replacing a file's content uploads to a **brand-new** object name, swaps
+`FileMetadata` to point at it, bumps `version`, and only *then* deletes the
+old object (skipped if another row still references it via dedup). Doing it
+in this order means a crash at any point still leaves either the old
+object+row (untouched) or the new object+row (fully switched over)
+consistent — never a state where metadata points at bytes that don't exist.
+
+### Deletion Strategy
+
+- **Soft delete** (`DELETE /metadata/{id}`, unchanged from Phase 2) — flips
+  `is_deleted`. The GCS object is left alone, so `POST /metadata/{id}/restore`
+  can bring the file back with its bytes intact.
+- **Permanent delete** (`DELETE /files/{id}/permanent`, Phase 3) — requires
+  the row to already be trashed, then deletes the database row and, only if
+  no other row still references the same object (dedup safety check),
+  deletes the GCS object too.
+
+### Security
+
+- **Private buckets, always.** Uniform bucket-level access, no `allUsers`/
+  `allAuthenticatedUsers` IAM bindings, ever. `public_url` exists as a schema
+  column for a possible future CDN-fronted use case but is never populated
+  today — the only sanctioned access path is a signed URL or an
+  authenticated `/files/{id}/download` request.
+- **IAM, least privilege.** The app's service account gets
+  `roles/storage.objectAdmin` scoped to its one bucket (see GCS Setup
+  above), never project-wide `roles/storage.admin`.
+- **Signed URLs are time-boxed**, default 15 minutes, capped at 7 days
+  (`expires_in_minutes` query param, `le=10080`) — long enough to be useful,
+  short enough that a leaked URL (logged, forwarded, cached by a proxy)
+  has a bounded blast radius.
+- **Input validation happens before any bytes reach GCS**: filename
+  (length/characters), size (`MAX_UPLOAD_SIZE_MB`), extension
+  (`BLOCKED_EXTENSIONS`), and MIME type are all checked pre-upload — see
+  Upload Flow above.
+- **MIME type is sniffed from content**, not trusted from the client's
+  `Content-Type` header or the filename extension — both are trivially
+  spoofable (e.g. renaming `payload.exe` to `photo.jpg`).
+- **Virus scanning is a placeholder for a future phase.** No AV engine is
+  wired in yet; `FileValidationService` is the intended integration point
+  — a scan step would slot in after content-sniffing and before the GCS
+  upload call, with the same "reject before any bytes are written" ordering
+  everything else here follows.
+
+## 11. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -249,7 +442,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 11. Environment Variables
+## 12. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -262,8 +455,47 @@ See `.env.example` for the full list. Key variables:
 | `REDIS_*` | Redis connection |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated list of allowed origins |
 | `LOG_LEVEL` / `LOG_JSON` | Logging verbosity/format |
+| `GCS_PROJECT_ID` / `GCS_BUCKET_NAME` | Google Cloud project + bucket for file storage |
+| `GCS_CREDENTIALS_PATH` | Service-account key file path; **leave unset** in staging/production (uses Application Default Credentials / Workload Identity instead) |
+| `SIGNED_URL_EXPIRATION_MINUTES` | Default signed-URL lifetime; overridable per-request |
+| `MAX_UPLOAD_SIZE_MB` | Hard cap on upload size (rejected with `413`) |
+| `ALLOWED_MIME_TYPES` | Comma-separated allowlist; empty = allow all except `BLOCKED_EXTENSIONS` |
+| `BLOCKED_EXTENSIONS` | Comma-separated extension blocklist (executables/scripts by default) |
 
-## 12. Running Locally (without Docker)
+### Google Cloud Storage Setup
+
+```bash
+# 1. Create the bucket (uniform bucket-level access, never public)
+gsutil mb -p <PROJECT_ID> -l <REGION> -b on gs://nimbusfs-files-dev
+
+# 2. Create a service account for local development
+gcloud iam service-accounts create nimbusfs-storage \
+  --display-name "NimbusFS Storage (dev)"
+
+# 3. Grant it object-level access ONLY to this bucket (not project-wide Storage Admin)
+gsutil iam ch \
+  serviceAccount:nimbusfs-storage@<PROJECT_ID>.iam.gserviceaccount.com:roles/storage.objectAdmin \
+  gs://nimbusfs-files-dev
+
+# 4. For local dev only: export a key and point GCS_CREDENTIALS_PATH at it.
+#    Never do this in staging/production — see below.
+gcloud iam service-accounts keys create ./gcs-dev-key.json \
+  --iam-account nimbusfs-storage@<PROJECT_ID>.iam.gserviceaccount.com
+```
+
+**IAM permissions**: grant `roles/storage.objectAdmin` scoped to the single
+bucket (via `gsutil iam ch` above), not `roles/storage.admin` on the project
+— the app only ever needs to create/read/delete objects inside its own
+bucket, never manage buckets or IAM policy itself.
+
+**Credentials in staging/production**: don't ship a key file in the
+container image or mount one as a Kubernetes secret. Instead, bind the
+GKE service account to the IAM service account via Workload Identity, leave
+`GCS_CREDENTIALS_PATH` unset, and `storage.Client()` picks up Application
+Default Credentials automatically — this is what makes `app/database/gcs.py`
+work unchanged across environments.
+
+## 14. Running Locally (without Docker)
 
 Requires a local PostgreSQL and Redis instance matching your `.env`.
 
@@ -275,7 +507,7 @@ alembic upgrade head
 
 API available at `http://localhost:8000`, docs at `http://localhost:8000/docs`.
 
-## 13. Running with Docker
+## 15. Running with Docker
 
 ```bash
 cp .env.example .env
@@ -289,7 +521,7 @@ network. Apply migrations inside the running container:
 docker compose exec api alembic upgrade head
 ```
 
-## 14. Database Migrations (Alembic)
+## 16. Database Migrations (Alembic)
 
 ```bash
 # Generate a new migration from model changes
@@ -305,8 +537,11 @@ alembic downgrade -1
 Migrations so far:
 - `0001_initial` — `users`, `refresh_tokens`
 - `0002_metadata` — `folders`, `file_metadata`, `file_versions`
+- `0003_storage` — adds `storage_provider`, `bucket_name`, `object_name`,
+  `public_url`, `storage_class`, `etag`, `upload_status`, `uploaded_at` to
+  `file_metadata`
 
-## 15. API Documentation
+## 17. API Documentation
 
 - Swagger UI: `GET /docs`
 - ReDoc: `GET /redoc`
@@ -314,7 +549,7 @@ Migrations so far:
 
 (Docs are automatically disabled when `ENVIRONMENT=production`.)
 
-## 16. Testing
+## 18. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
 services required.
@@ -333,17 +568,28 @@ Coverage includes:
   bumping on content change, search (filename, folder-name, extension,
   MIME type, deleted status), sorting, pagination, and cross-owner data
   isolation.
+- **Phase 3** (`tests/test_file_storage.py`, against an in-memory
+  `FakeGCSClient` — see `tests/fakes/fake_gcs.py`, never real GCS): upload
+  success, upload into a nonexistent folder (404), duplicate filename in
+  the same folder (409), empty file rejection (400), blocked extension
+  rejection (415), content-based duplicate detection/deduplication,
+  streaming download round-trip, HTTP Range requests (206), downloading a
+  metadata-only (never-uploaded) file (404), signed URL generation (default
+  and custom expiration), replace (version bump + object swap + old object
+  cleanup), permanent delete (object + row removed), permanent-delete
+  safety when an object is still shared via dedup, rollback of an orphaned
+  object when metadata persistence fails after a successful upload, a
+  simulated storage-backend outage (502), and cross-owner access isolation.
 
-## 17. Future Roadmap (Phases 3–15, not yet built)
+## 19. Future Roadmap (Phases 4–15, not yet built)
 
-Actual file upload/download, chunked/multipart uploads, Google Cloud Storage
-integration (wiring `stored_filename` to real objects), sharing & permissions,
-Pub/Sub-driven background workers, virus scanning, thumbnails, full-text
-content search, rate limiting, Redis caching, CI/CD via GitHub Actions,
-Terraform IaC, GKE deployment, Cloud Armor, Cloud CDN, observability
-(Cloud Monitoring/Logging dashboards).
+Chunked/resumable uploads, sharing & permissions between users, virus
+scanning integration, thumbnail generation, full-text content search,
+Pub/Sub-driven background workers, rate limiting, Redis caching, CI/CD via
+GitHub Actions, Terraform IaC, GKE deployment, Cloud Armor, Cloud CDN,
+observability (Cloud Monitoring/Logging dashboards).
 
-## 18. Contribution Guide
+## 20. Contribution Guide
 
 1. Create a feature branch from `main`.
 2. Keep business logic in `services/`, persistence in `repositories/` — never

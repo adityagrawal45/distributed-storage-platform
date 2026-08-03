@@ -129,3 +129,82 @@ class TrashException(NimbusFSException):
 class ValidationException(NimbusFSException):
     def __init__(self, detail: str = "Validation failed."):
         super().__init__(detail)
+
+
+# ---------------------------------------------------------------------
+# Cloud Storage (Phase 3)
+# ---------------------------------------------------------------------
+class StorageException(NimbusFSException):
+    """Base class for all Google Cloud Storage integration failures."""
+
+    def __init__(self, detail: str = "A storage backend error occurred."):
+        super().__init__(detail)
+
+
+class BucketNotFoundException(StorageException):
+    def __init__(self, detail: str = "The configured storage bucket does not exist."):
+        super().__init__(detail)
+
+
+class StorageObjectNotFoundException(StorageException):
+    def __init__(self, detail: str = "The requested file's bytes could not be located in storage."):
+        super().__init__(detail)
+
+
+class StoragePermissionException(StorageException):
+    def __init__(self, detail: str = "Permission denied by the storage backend."):
+        super().__init__(detail)
+
+
+class StorageTimeoutException(StorageException):
+    def __init__(self, detail: str = "The storage backend timed out."):
+        super().__init__(detail)
+
+
+class UploadFailedException(StorageException):
+    def __init__(self, detail: str = "File upload to storage failed."):
+        super().__init__(detail)
+
+
+class DownloadFailedException(StorageException):
+    def __init__(self, detail: str = "File download from storage failed."):
+        super().__init__(detail)
+
+
+class ChecksumMismatchException(StorageException):
+    def __init__(self, detail: str = "Uploaded content failed integrity verification (checksum mismatch)."):
+        super().__init__(detail)
+
+
+class RollbackFailedException(StorageException):
+    """
+    Raised when an upload/metadata rollback itself fails, leaving an
+    orphaned object or row. Never silently swallowed — see
+    FileUploadService design decisions.
+    """
+
+    def __init__(self, detail: str = "Failed to roll back a partially completed operation."):
+        super().__init__(detail)
+
+
+class FileTooLargeException(ValidationException):
+    def __init__(self, detail: str = "File exceeds the maximum allowed upload size."):
+        super().__init__(detail)
+
+
+class UnsupportedFileTypeException(ValidationException):
+    def __init__(self, detail: str = "This file type is not allowed."):
+        super().__init__(detail)
+
+
+class DuplicateFileContentException(ConflictException):
+    """
+    Not an error condition per se — raised by callers that want a hard
+    "reject exact re-uploads" policy. FileUploadService's default
+    duplicate-detection behavior instead transparently dedupes storage
+    bytes and still succeeds (see its docstring), so this is only used
+    where a caller explicitly opts into strict duplicate rejection.
+    """
+
+    def __init__(self, detail: str = "This exact file content has already been uploaded."):
+        super().__init__(detail)
