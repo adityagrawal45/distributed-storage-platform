@@ -5,7 +5,9 @@ from app.schemas.file_metadata import (
     FileMetadataUpdate,
     FileMove,
     FileRename,
+    FileUploadResponse,
     FileVersionRead,
+    SignedUrlResponse,
 )
 from app.schemas.folder import (
     BreadcrumbItem,
@@ -50,6 +52,8 @@ __all__ = [
     "FileMove",
     "FileMetadataRead",
     "FileVersionRead",
+    "FileUploadResponse",
+    "SignedUrlResponse",
     "FileSearchParams",
     "FolderListParams",
     "SortOrder",

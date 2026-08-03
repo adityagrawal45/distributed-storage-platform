@@ -11,8 +11,11 @@ override any provider in tests via `app.dependency_overrides`.
 from typing import Annotated
 
 from fastapi import Depends
+from google.cloud import storage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
+from app.database.gcs import get_storage_client
 from app.database.session import get_db
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
@@ -20,14 +23,31 @@ from app.repositories.folder_repository import FolderRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
+from app.services.file_upload_service import FileUploadService
+from app.services.file_validation_service import FileValidationService
 from app.services.folder_service import FolderService
 from app.services.metadata_service import MetadataService
 from app.services.search_service import SearchService
+from app.services.storage_service import StorageService
 from app.services.trash_service import TrashService
 from app.services.user_service import UserService
 from app.services.version_service import VersionService
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
+
+
+def get_gcs_client() -> storage.Client:
+    """
+    Separate dependency (rather than calling `get_storage_client()`
+    directly from `get_storage_service`) purely so tests can override
+    just this one provider with a fake/mocked client via
+    `app.dependency_overrides`, without needing to fake the entire
+    `StorageService`.
+    """
+    return get_storage_client()
+
+
+GCSClientDep = Annotated[storage.Client, Depends(get_gcs_client)]
 
 
 def get_user_repository(session: DbSession) -> UserRepository:
@@ -94,6 +114,31 @@ def get_version_service(
     version_repository: FileVersionRepositoryDep, file_repository: FileMetadataRepositoryDep
 ) -> VersionService:
     return VersionService(version_repository, file_repository)
+
+
+def get_storage_service(client: GCSClientDep) -> StorageService:
+    return StorageService(client)
+
+
+def get_file_validation_service() -> FileValidationService:
+    return FileValidationService(get_settings())
+
+
+StorageServiceDep = Annotated[StorageService, Depends(get_storage_service)]
+FileValidationServiceDep = Annotated[FileValidationService, Depends(get_file_validation_service)]
+
+
+def get_file_upload_service(
+    file_repository: FileMetadataRepositoryDep,
+    folder_repository: FolderRepositoryDep,
+    version_repository: FileVersionRepositoryDep,
+    storage_service: StorageServiceDep,
+    validator: FileValidationServiceDep,
+) -> FileUploadService:
+    return FileUploadService(file_repository, folder_repository, version_repository, storage_service, validator)
+
+
+FileUploadServiceDep = Annotated[FileUploadService, Depends(get_file_upload_service)]
 
 
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]

@@ -19,8 +19,14 @@ from app.exceptions.custom_exceptions import (
     AuthenticationException,
     AuthorizationException,
     ConflictException,
+    FileTooLargeException,
     NimbusFSException,
     NotFoundException,
+    StorageException,
+    StorageObjectNotFoundException,
+    StoragePermissionException,
+    StorageTimeoutException,
+    UnsupportedFileTypeException,
 )
 from app.logging.logger import get_logger
 from app.schemas.response import APIResponse
@@ -77,6 +83,39 @@ async def conflict_exception_handler(request: Request, exc: ConflictException) -
 async def domain_exception_handler(request: Request, exc: NimbusFSException) -> JSONResponse:
     logger.error("domain_exception", detail=exc.detail, path=str(request.url))
     return _envelope(request, status.HTTP_400_BAD_REQUEST, exc.detail)
+
+
+async def file_too_large_exception_handler(request: Request, exc: FileTooLargeException) -> JSONResponse:
+    logger.info("file_too_large", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, exc.detail)
+
+
+async def unsupported_file_type_exception_handler(request: Request, exc: UnsupportedFileTypeException) -> JSONResponse:
+    logger.info("unsupported_file_type", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, exc.detail)
+
+
+async def storage_object_not_found_exception_handler(
+    request: Request, exc: StorageObjectNotFoundException
+) -> JSONResponse:
+    logger.info("storage_object_not_found", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_404_NOT_FOUND, exc.detail)
+
+
+async def storage_permission_exception_handler(request: Request, exc: StoragePermissionException) -> JSONResponse:
+    logger.error("storage_permission_denied", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_403_FORBIDDEN, exc.detail)
+
+
+async def storage_timeout_exception_handler(request: Request, exc: StorageTimeoutException) -> JSONResponse:
+    logger.error("storage_timeout", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_504_GATEWAY_TIMEOUT, exc.detail)
+
+
+async def storage_exception_handler(request: Request, exc: StorageException) -> JSONResponse:
+    """Catch-all for storage failures not covered by a more specific handler above."""
+    logger.error("storage_error", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_502_BAD_GATEWAY, exc.detail)
 
 
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
