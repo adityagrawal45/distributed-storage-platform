@@ -127,5 +127,24 @@ class FileMetadata(Base, AuditMixin, SoftDeleteMixin):
         server_default=UploadStatus.PENDING.value,
     )
 
+    # ------------------------------------------------------------------
+    # Optimistic concurrency control (Phase 4). NOT the same thing as
+    # `version` above: `version` is the file's *content* revision number
+    # (business data, visible to clients, bumped on re-upload). This
+    # column is purely a row-level guard SQLAlchemy increments on every
+    # UPDATE and checks in the WHERE clause. In a single-instance app a
+    # lost update is unlikely (one process, mostly-sequential requests);
+    # with N stateless instances behind a load balancer, two instances
+    # can genuinely race to update the same row (e.g. a rename and a move
+    # landing on different instances at the same moment). Without this,
+    # the second UPDATE silently wins and the first is lost with no
+    # error. With it, SQLAlchemy raises `StaleDataError` for the loser,
+    # which `app/exceptions/handlers.py` translates into a 409 the client
+    # can safely retry against.
+    # ------------------------------------------------------------------
+    lock_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+
+    __mapper_args__ = {"version_id_col": lock_version}
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<FileMetadata id={self.id} name={self.original_filename!r} v{self.version}>"

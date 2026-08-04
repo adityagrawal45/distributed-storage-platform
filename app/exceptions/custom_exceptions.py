@@ -197,6 +197,34 @@ class UnsupportedFileTypeException(ValidationException):
         super().__init__(detail)
 
 
+class ConcurrentModificationException(ConflictException):
+    """
+    Raised (indirectly — see the `StaleDataError` handler in
+    app/exceptions/handlers.py) when an optimistic-lock version check
+    fails: another request modified the same row between this request's
+    read and write. Distinct from `DuplicateFileException` (a naming
+    conflict) — this is a *timing* conflict, and the correct client
+    response is "re-fetch and retry," not "pick a different name."
+    """
+
+    def __init__(self, detail: str = "This item was modified by another request. Please retry."):
+        super().__init__(detail)
+
+
+class LockAcquisitionException(NimbusFSException):
+    """Raised when a distributed lock (app.core.distributed_lock) cannot be acquired in time."""
+
+    def __init__(self, detail: str = "Could not acquire the resource lock; another operation is in progress."):
+        super().__init__(detail)
+
+
+class IdempotencyConflictException(ConflictException):
+    """Raised when a request reuses an Idempotency-Key while the original request is still in flight."""
+
+    def __init__(self, detail: str = "A request with this Idempotency-Key is already being processed."):
+        super().__init__(detail)
+
+
 class DuplicateFileContentException(ConflictException):
     """
     Not an error condition per se — raised by callers that want a hard

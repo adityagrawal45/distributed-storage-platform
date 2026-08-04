@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     DATABASE_POOL_SIZE: int = 10
     DATABASE_MAX_OVERFLOW: int = 20
     DATABASE_ECHO: bool = False
+    # Optional read-replica connection string (async, asyncpg driver).
+    # Left unset by default -> `get_db_read()` transparently falls back to
+    # the primary engine, so this is pure infrastructure until a later
+    # phase actually provisions a replica (see README "Read/Write
+    # Separation" for the design).
+    DATABASE_READ_REPLICA_URL: str | None = None
 
     # ------------------------------------------------------------------
     # Redis
@@ -109,6 +115,60 @@ class Settings(BaseSettings):
     REDIS_DB: int = 0
     REDIS_PASSWORD: str | None = None
     REDIS_MAX_CONNECTIONS: int = 20
+
+    # ------------------------------------------------------------------
+    # Distributed Backend (Phase 4)
+    # ------------------------------------------------------------------
+    # Stable identifier for THIS process, exposed in health checks, logs,
+    # and the `X-Server-ID` response header so a multi-instance deployment
+    # can be debugged ("which pod served this request?"). Normally left
+    # unset: Kubernetes/Cloud Run inject a unique hostname per replica
+    # automatically (see app.core.server_identity), so an explicit
+    # override is only needed for local multi-container demos where the
+    # hostname alone isn't descriptive (see docker-compose.yml's app1/
+    # app2/app3 services).
+    INSTANCE_ID: str | None = None
+    # Populated by CI/CD (Docker build args) — see docker/Dockerfile.
+    BUILD_VERSION: str = "dev"
+    GIT_COMMIT_SHA: str = "unknown"
+
+    # Startup dependency checks (DB/Redis/GCS) retry with exponential
+    # backoff before the process fails fast and refuses to start — see
+    # app.core.retry and app.main's lifespan.
+    DEPENDENCY_RETRY_ATTEMPTS: int = 3
+    DEPENDENCY_RETRY_BACKOFF_SECONDS: float = 0.5
+    DEPENDENCY_RETRY_BACKOFF_MAX_SECONDS: float = 8.0
+
+    # How long shutdown waits for in-flight requests to finish before
+    # closing pools regardless (see app.main's lifespan shutdown path).
+    GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: float = 30.0
+
+    # Idempotency-Key support (see app.middleware.idempotency).
+    IDEMPOTENCY_ENABLED: bool = True
+    IDEMPOTENCY_KEY_TTL_SECONDS: int = 86400  # 24h — long enough to cover realistic client retry windows
+
+    # Distributed lock default TTL (see app.core.distributed_lock). A lock
+    # holder that crashes before releasing still self-heals after this
+    # many seconds instead of deadlocking the resource forever.
+    DISTRIBUTED_LOCK_DEFAULT_TTL_SECONDS: int = 30
+
+    # Rate limiting is a PLACEHOLDER in Phase 4 — infrastructure only,
+    # disabled by default. A later phase decides real limits/policy.
+    RATE_LIMIT_ENABLED: bool = False
+    RATE_LIMIT_REQUESTS_PER_MINUTE: int = 120
+
+    # Comma-separated list of proxy/load-balancer IPs allowed to set
+    # `X-Forwarded-For`/`X-Forwarded-Proto`. Empty (default) = trust
+    # nothing but the direct TCP peer. `*` trusts any peer's forwarded
+    # headers — convenient for local docker-compose behind nginx, never
+    # appropriate in production (see README Security section).
+    TRUSTED_PROXIES_RAW: str = Field(default="", alias="TRUSTED_PROXIES")
+
+    # In-process circuit breaker guarding Redis calls (cache/lock/
+    # idempotency) — local resilience state, not application state (see
+    # app.core.circuit_breaker for why this doesn't violate statelessness).
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = 5
+    CIRCUIT_BREAKER_RESET_TIMEOUT_SECONDS: float = 30.0
 
     # ------------------------------------------------------------------
     # Logging
@@ -159,12 +219,21 @@ class Settings(BaseSettings):
         return [item.strip() for item in self.ALLOWED_HOSTS_RAW.split(",") if item.strip()]
 
     @property
+    def TRUSTED_PROXIES(self) -> List[str]:
+        return [item.strip() for item in self.TRUSTED_PROXIES_RAW.split(",") if item.strip()]
+
+    @property
     def DATABASE_URL(self) -> str:
         """Async SQLAlchemy connection string (asyncpg driver)."""
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+
+    @property
+    def DATABASE_URL_READ(self) -> str:
+        """Read-replica connection string, falling back to the primary when unset."""
+        return self.DATABASE_READ_REPLICA_URL or self.DATABASE_URL
 
     @property
     def DATABASE_URL_SYNC(self) -> str:

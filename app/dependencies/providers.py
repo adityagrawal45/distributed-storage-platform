@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.database.gcs import get_storage_client
-from app.database.session import get_db
+from app.database.session import get_db, get_db_read
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
@@ -28,12 +28,28 @@ from app.services.file_validation_service import FileValidationService
 from app.services.folder_service import FolderService
 from app.services.metadata_service import MetadataService
 from app.services.search_service import SearchService
+from app.services.cache_service import CacheService
 from app.services.storage_service import StorageService
 from app.services.trash_service import TrashService
 from app.services.user_service import UserService
 from app.services.version_service import VersionService
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
+DbSessionRead = Annotated[AsyncSession, Depends(get_db_read)]
+
+
+def get_cache_service() -> CacheService:
+    """
+    Fresh, cheap wrapper per request — `CacheService` holds no per-instance
+    state of its own beyond a shared, module-level circuit breaker, so
+    there's no benefit to a singleton here (mirrors `get_gcs_client`'s
+    reasoning: the expensive part is the underlying connection pool,
+    already shared at the module level in `app/database/redis.py`).
+    """
+    return CacheService()
+
+
+CacheServiceDep = Annotated[CacheService, Depends(get_cache_service)]
 
 
 def get_gcs_client() -> storage.Client:

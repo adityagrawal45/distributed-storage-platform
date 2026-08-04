@@ -20,6 +20,7 @@ Design decisions:
 import uuid
 from typing import Annotated
 
+import structlog
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 
@@ -51,6 +52,14 @@ async def get_current_user(
         raise InvalidTokenException(detail="User no longer exists.")
     if not user.is_active:
         raise InactiveUserException()
+
+    # Bound into structlog's contextvars (set up per-request by
+    # RequestContextMiddleware) so every log line emitted for the rest of
+    # this request automatically carries `user_id`, without threading it
+    # through every service/repository call by hand — see README
+    # "Correlation IDs & Request Tracing" for why contextvars, not
+    # explicit parameters, are this project's tracing mechanism.
+    structlog.contextvars.bind_contextvars(user_id=str(user.id))
 
     return user
 

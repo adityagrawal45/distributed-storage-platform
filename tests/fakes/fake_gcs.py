@@ -102,6 +102,10 @@ class FakeBucket:
     def blob(self, name: str) -> FakeBlob:
         return FakeBlob(self, name)
 
+    def exists(self) -> bool:
+        """Used by the readiness/health checks (Phase 4) to verify bucket reachability."""
+        return True
+
 
 class FakeGCSClient:
     """Stands in for `google.cloud.storage.Client` in tests."""

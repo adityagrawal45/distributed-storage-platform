@@ -13,13 +13,17 @@ from fastapi import Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.circuit_breaker import CircuitOpenError
+from app.core.retry import RetryExhaustedError
 from app.exceptions.custom_exceptions import (
     AuthenticationException,
     AuthorizationException,
     ConflictException,
     FileTooLargeException,
+    LockAcquisitionException,
     NimbusFSException,
     NotFoundException,
     StorageException,
@@ -116,6 +120,35 @@ async def storage_exception_handler(request: Request, exc: StorageException) -> 
     """Catch-all for storage failures not covered by a more specific handler above."""
     logger.error("storage_error", detail=exc.detail, path=str(request.url))
     return _envelope(request, status.HTTP_502_BAD_GATEWAY, exc.detail)
+
+
+async def stale_data_exception_handler(request: Request, exc: StaleDataError) -> JSONResponse:
+    """
+    Optimistic-lock conflict (see `FileMetadata.lock_version`): another
+    request updated this row between our read and write. Registered
+    ahead of the generic `SQLAlchemyError` handler (Starlette dispatches
+    by exception MRO, so the more specific type always wins regardless of
+    registration order, but we register it explicitly for readability).
+    """
+    logger.info("optimistic_lock_conflict", error=str(exc), path=str(request.url))
+    return _envelope(
+        request, status.HTTP_409_CONFLICT, "This item was modified by another request. Please retry."
+    )
+
+
+async def lock_acquisition_exception_handler(request: Request, exc: LockAcquisitionException) -> JSONResponse:
+    logger.warning("distributed_lock_acquisition_failed", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_409_CONFLICT, exc.detail)
+
+
+async def circuit_open_exception_handler(request: Request, exc: CircuitOpenError) -> JSONResponse:
+    logger.warning("circuit_breaker_rejected_request", error=str(exc), path=str(request.url))
+    return _envelope(request, status.HTTP_503_SERVICE_UNAVAILABLE, "A dependency is temporarily unavailable.")
+
+
+async def retry_exhausted_exception_handler(request: Request, exc: RetryExhaustedError) -> JSONResponse:
+    logger.error("retry_exhausted", error=str(exc), path=str(request.url))
+    return _envelope(request, status.HTTP_503_SERVICE_UNAVAILABLE, "A dependency is temporarily unavailable.")
 
 
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:

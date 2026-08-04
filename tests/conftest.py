@@ -20,9 +20,11 @@ from collections.abc import AsyncGenerator
 
 import pytest
 import pytest_asyncio
+from fakeredis import aioredis as fake_aioredis
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import app.database.redis as redis_db
 from app.database.session import Base, get_db
 from app.dependencies.providers import get_gcs_client
 from app.main import app
@@ -52,13 +54,45 @@ def fake_gcs_client() -> FakeGCSClient:
     return FakeGCSClient()
 
 
+@pytest.fixture
+def fake_redis_client(monkeypatch) -> fake_aioredis.FakeRedis:
+    """
+    A fresh in-memory fake Redis per test (Phase 4) — mirrors
+    `fake_gcs_client`'s role for GCS: the test suite stays hermetic, no
+    real Redis process required.
+
+    Monkeypatches `app.database.redis.get_redis_client` (the ONE seam
+    every Phase 4 Redis consumer — cache service, distributed lock,
+    idempotency/rate-limit middleware, health checks — is required to
+    call through, by convention; see `app/database/redis.py`'s
+    docstring) so a single patch point covers all of them at once. A
+    single `FakeRedis` instance is reused for every `get_redis_client()`
+    call within the test (each caller still calls its own `.aclose()`,
+    which fakeredis tolerates without losing its in-memory state).
+    """
+    fake_client = fake_aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(redis_db, "get_redis_client", lambda: fake_client)
+    return fake_client
+
+
 @pytest_asyncio.fixture
-async def client(db_session: AsyncSession, fake_gcs_client: FakeGCSClient) -> AsyncGenerator[AsyncClient, None]:
+async def client(
+    db_session: AsyncSession, fake_gcs_client: FakeGCSClient, fake_redis_client: fake_aioredis.FakeRedis
+) -> AsyncGenerator[AsyncClient, None]:
     async def _override_get_db():
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_gcs_client] = lambda: fake_gcs_client
+
+    # Simulates a fully-started instance: real deployments only reach
+    # this state once `app.main`'s `lifespan` startup checks pass, but
+    # `httpx.ASGITransport` never drives the ASGI lifespan protocol, so
+    # `app.state.ready` would otherwise stay at its unstarted default
+    # (False) for every test. Tests that specifically exercise
+    # not-ready/draining behavior override this explicitly.
+    app.state.ready = True
+    app.state.active_requests = 0
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

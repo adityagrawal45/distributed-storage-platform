@@ -1,18 +1,71 @@
-version: '3.8'
+# ---------------------------------------------------------------------
+# Phase 4 topology — mirrors the architecture diagram in README:
+#
+#   client -> nginx (load balancer) -> app1 / app2 / app3 -> postgres/redis/GCS
+#
+# Three IDENTICAL, interchangeable app instances share the same
+# Postgres, Redis, and (real) GCS bucket — nothing is pinned to one
+# instance, so killing any one of app1/app2/app3 (`docker compose stop
+# app2`) proves statelessness locally: requests keep succeeding against
+# the other two, with no data loss, because no instance ever held state
+# the others didn't also have access to. This is deliberately
+# docker-compose, not Kubernetes — Phase 5's job — but it's the same
+# shape.
+# ---------------------------------------------------------------------
+
+x-app-env: &app-env
+  ENVIRONMENT: development
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_USER: nimbusfs
+  POSTGRES_PASSWORD: nimbusfs
+  POSTGRES_DB: nimbusfs
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  # The nginx container's bridge-network IP isn't known/stable in
+  # advance, so this demo trusts any peer's X-Forwarded-For — acceptable
+  # ONLY because nginx is the sole ingress point in this compose network
+  # and nothing here is reachable directly from outside it. A real
+  # deployment sets this to the load balancer's actual, fixed IP range
+  # (see README Security section) — never "*" on the public internet.
+  TRUSTED_PROXIES: "*"
+
+x-app-common: &app-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  env_file:
+    - .env
+  volumes:
+    - ./app:/app/app
+    - ./alembic:/app/alembic
+    - ./alembic.ini:/app/alembic.ini
+  command: >
+    sh -c "
+      alembic upgrade head &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    "
+  restart: unless-stopped
+
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: file_storage_postgres
+    container_name: nimbusfs_postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: file_storage
+      POSTGRES_USER: nimbusfs
+      POSTGRES_PASSWORD: nimbusfs
+      POSTGRES_DB: nimbusfs
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U nimbusfs"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -20,7 +73,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: file_storage_redis
+    container_name: nimbusfs_redis
     ports:
       - "6379:6379"
     healthcheck:
@@ -30,32 +83,46 @@ services:
       retries: 5
     restart: unless-stopped
 
-  app:
-    build: .
-    container_name: file_storage_app
+  # Three stateless, interchangeable app instances. Each gets its own
+  # INSTANCE_ID purely so `/health`'s `server.instance_id` and the
+  # `X-Server-ID` response header are legible in this local demo — a
+  # real Kubernetes/Cloud Run deployment gets an equivalent unique value
+  # for free from the platform (Pod name / revision-instance ID), which
+  # is why INSTANCE_ID is optional everywhere else (see
+  # app/core/server_identity.py).
+  app1:
+    <<: *app-common
+    container_name: nimbusfs_app1
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app1
+
+  app2:
+    <<: *app-common
+    container_name: nimbusfs_app2
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app2
+
+  app3:
+    <<: *app-common
+    container_name: nimbusfs_app3
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app3
+
+  # Google Cloud Load Balancer stand-in — see docker/nginx.conf.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nimbusfs_nginx
+    depends_on:
+      - app1
+      - app2
+      - app3
     ports:
       - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    environment:
-      - ENVIRONMENT=development
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/file_storage
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-dev-secret-key}
-    env_file:
-      - .env
     volumes:
-      - ./app:/app/app
-      - ./alembic.ini:/app/alembic.ini
-      - ./migrations:/app/migrations
-    command: >
-      sh -c "
-        alembic upgrade head &&
-        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-      "
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
 
 volumes:
