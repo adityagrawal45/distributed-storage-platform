@@ -14,7 +14,24 @@ Design decisions:
   without any application code knowing the difference.
 - Each test function gets a fresh schema (`create_all` before,
   `drop_all` after) for full isolation between tests.
+- Phase 4: `/health`/`/ready` deliberately check *real* DB/Redis
+  connectivity (see app/database/session.py, app/database/redis.py —
+  these health checks intentionally bypass the SQLite/fake overrides so
+  they report the truth about actual infra reachability). Against an
+  unreachable Postgres/Redis in a sandboxed test environment, the
+  built-in retry/backoff (`Settings.RETRY_MAX_ATTEMPTS`) would otherwise
+  add several real seconds per health-check call across the suite. The
+  env vars below are set *before* `app.main` (and therefore
+  `get_settings()`) is ever imported, so the test suite trades that
+  retry resilience for speed — this changes nothing about
+  production/dev behavior, which reads these from the real environment.
 """
+
+import os
+
+os.environ.setdefault("RETRY_MAX_ATTEMPTS", "1")
+os.environ.setdefault("RETRY_BASE_DELAY_SECONDS", "0.01")
+os.environ.setdefault("RETRY_MAX_DELAY_SECONDS", "0.05")
 
 from collections.abc import AsyncGenerator
 
@@ -23,10 +40,12 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.database.redis import get_redis
 from app.database.session import Base, get_db
 from app.dependencies.providers import get_gcs_client
 from app.main import app
 from tests.fakes.fake_gcs import FakeGCSClient
+from tests.fakes.fake_redis import FakeRedisClient
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -52,13 +71,25 @@ def fake_gcs_client() -> FakeGCSClient:
     return FakeGCSClient()
 
 
+@pytest.fixture
+def fake_redis_client() -> FakeRedisClient:
+    """A fresh in-memory fake Redis client per test — see tests/fakes/fake_redis.py."""
+    return FakeRedisClient()
+
+
 @pytest_asyncio.fixture
-async def client(db_session: AsyncSession, fake_gcs_client: FakeGCSClient) -> AsyncGenerator[AsyncClient, None]:
+async def client(
+    db_session: AsyncSession, fake_gcs_client: FakeGCSClient, fake_redis_client: FakeRedisClient
+) -> AsyncGenerator[AsyncClient, None]:
     async def _override_get_db():
         yield db_session
 
+    async def _override_get_redis():
+        yield fake_redis_client
+
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_gcs_client] = lambda: fake_gcs_client
+    app.dependency_overrides[get_redis] = _override_get_redis
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
