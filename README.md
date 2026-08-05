@@ -433,7 +433,256 @@ consistent — never a state where metadata points at bytes that don't exist.
   upload call, with the same "reject before any bytes are written" ordering
   everything else here follows.
 
-## 11. Installation
+## 11. Distributed Backend Architecture *(Phase 4)*
+
+Phase 4 turns NimbusFS from "one FastAPI process" into "N interchangeable
+FastAPI replicas behind a load balancer," in preparation for a Kubernetes/
+Cloud Run deployment in Phase 5. No Kubernetes, autoscaling, or deployment
+manifests exist yet — this phase is purely about making the *application
+itself* safe to run that way.
+
+```
+                     Clients
+                         │
+                         ▼
+              Google Cloud Load Balancer
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+   FastAPI #1      FastAPI #2      FastAPI #3
+        │                │                │
+        └────────────────┼────────────────┘
+                         │
+                  Shared Redis
+                         │
+                 Shared PostgreSQL
+                         │
+              Google Cloud Storage
+```
+
+### Stateless design
+
+No server may hold state a client's *next* request depends on. Concretely:
+
+| Never stored on a server | Where it actually lives instead |
+|---|---|
+| Sessions | Nowhere — `access`/`refresh` JWTs (Phase 1) carry all session state |
+| Uploaded file bytes | Google Cloud Storage (Phase 3) |
+| Temporary upload buffers | Streamed straight through to GCS, never written to local disk |
+| Application cache | Redis (shared, Phase 4 plumbing only — no metadata caching yet) |
+| In-flight request coordination | Redis (distributed locks, idempotency-key records) |
+
+This is what makes horizontal scaling trivial: since no replica has any
+memory a client's next request depends on, a load balancer can route each
+request to *any* replica, replicas can be added/removed at will, and a
+crashed replica loses nothing but its own in-flight requests (which the
+client's own retry — see Idempotency below — makes safe to redo against a
+different replica).
+
+### Request flow
+
+```
+Client
+  -> Load Balancer            (routes to any healthy, ready replica)
+  -> FastAPI instance         (any one — fully interchangeable)
+  -> TrustedProxyMiddleware   (resolves real client IP/scheme from X-Forwarded-*)
+  -> RequestContextMiddleware (request/correlation/trace IDs, structured logging)
+  -> Authentication           (JWT verified locally — no session store lookup)
+  -> Business logic           (services/repositories — no server-local state)
+  -> PostgreSQL                (single shared source of truth)
+  -> Google Cloud Storage      (single shared bytes store)
+  -> Response                 (X-Request-ID/X-Correlation-ID/X-Server-ID headers)
+```
+
+Every hop after the load balancer could have landed on a different replica
+without changing the outcome — that's the whole point.
+
+### Server identity
+
+Every replica exposes its own identity (`app/core/server_info.py`) in
+every log line and every health-check response:
+
+| Field | Purpose |
+|---|---|
+| `instance_id` | Random UUID, generated fresh per process start |
+| `hostname` | OS hostname — the pod/container name on GKE/Cloud Run |
+| `process_id` | OS PID, for correlating with process-level metrics |
+| `app_version` / `build_version` / `git_commit` | Exactly which build is running |
+| `environment` | development/testing/staging/production |
+
+### Distributed logging & correlation IDs
+
+`RequestContextMiddleware` (`app/middleware/request_context.py`) generates
+three distinct IDs per request and binds them into `structlog`'s
+contextvars, so every log line anywhere in the call stack — routes,
+services, repositories, the GCS storage layer — carries them automatically:
+
+- **`request_id`** — unique per hop, always server-generated, never trusted
+  from a client header.
+- **`correlation_id`** — unique per end-to-end client operation, honored
+  from an inbound `X-Correlation-ID` header if present (so a retried
+  operation across multiple HTTP calls can be traced as one story),
+  otherwise generated fresh.
+- **`trace_id`** — reserved for OpenTelemetry/Cloud Trace integration in a
+  future phase; honored from `X-Trace-ID` if supplied, defaults to the
+  correlation ID otherwise so the field is always populated pre-OTel.
+
+All three, plus `server_id`, are echoed back as response headers
+(`X-Request-ID`, `X-Correlation-ID`, `X-Trace-ID`, `X-Server-ID`,
+`X-Response-Time-Ms`) and emitted as JSON via `structlog`
+(`app/logging/logger.py`, unchanged from Phase 1) — ready to ship straight
+into Google Cloud Logging or any other JSON-log aggregator without a
+parsing step; grep any of these IDs across every replica's logs to
+reconstruct one request's full journey through a distributed fleet.
+
+### Health, readiness & liveness
+
+Three endpoints with three distinct probe semantics (`app/api/v1/health/routes.py`):
+
+| Endpoint | Checks | Used for |
+|---|---|---|
+| `GET /health` | DB + Redis + Storage (deep) | Dashboards, humans, monitoring |
+| `GET /ready` | DB + Redis + Storage (deep), `503` if any unhealthy | Load balancer / readiness probe — "route traffic here?" |
+| `GET /live` | Nothing external — answers instantly | Liveness probe — "is this process alive?" |
+
+Splitting `/ready` from `/live` matters: a slow database should pull a
+replica out of the load balancer's rotation (`/ready` -> `503`), but must
+never cause an otherwise-healthy process to be killed and restarted (which
+is what a failing liveness probe triggers) — killing the process doesn't
+fix a slow database, it just adds a restart storm on top of it.
+
+### Startup & shutdown lifecycle
+
+`app/main.py`'s `lifespan()`:
+
+- **Startup**: connect DB -> connect Redis -> verify the GCS bucket exists
+  -> log `application_ready`. Each check runs through the shared retry
+  policy (`app/core/retry.py`, exponential backoff + full jitter) to
+  absorb one transient blip (e.g. Postgres still finishing crash recovery
+  during a coordinated restart). If a dependency is still unreachable
+  after retrying, startup raises and the process exits non-zero —
+  `Settings.FAIL_FAST_ON_STARTUP` (default `true`). A replica that can
+  never reach its database should never accept traffic; a crash-looping
+  pod is a far clearer operational signal than one silently serving 500s
+  forever.
+- **Shutdown**: close the Postgres connection pool, close the Redis
+  connection pool, log `application_shutdown_complete`. Distributed locks
+  are deliberately never explicitly released here — every lock has a
+  bounded TTL (`app/core/distributed_lock.py`), so a replica that dies
+  uncleanly (`kill -9`, OOM) self-heals within that TTL regardless of
+  whether any shutdown hook got to run. In production, uvicorn's own
+  `--timeout-graceful-shutdown` (set to >= `SHUTDOWN_GRACE_PERIOD_SECONDS`)
+  is what actually stops routing new connections and drains in-flight ones
+  before this hook runs — this hook is defense-in-depth, not the primary
+  mechanism.
+
+### Redis infrastructure
+
+`app/database/redis.py` provides the shared connection pool every replica
+draws from; three Phase 4 features build on it directly:
+
+- **`app/core/distributed_lock.py`** — a `SET NX PX`-based lock with a
+  Lua-scripted, token-checked release (so replica A can never release a
+  lock replica B has since re-acquired after A's lock expired). TTL-based,
+  not renewal-based — a deliberate simplicity trade-off documented in the
+  module itself.
+- **`app/services/idempotency_service.py`** — see Idempotency below.
+- **`check_redis_connection()`** — retry-wrapped health check used by
+  `/health`, `/ready`, and startup.
+
+Metadata *caching* is explicitly **not** implemented yet — this phase
+prepares the plumbing (pool, DI, health check, retry) only.
+
+### Database improvements
+
+- **Connection pooling**: `pool_size`/`max_overflow`/`pool_pre_ping`/
+  `pool_recycle`/`pool_timeout` all explicitly tuned (`app/database/session.py`).
+  Scaling ceiling documented inline: total Postgres connections used is
+  `replica_count * (pool_size + max_overflow)`, which must stay under
+  Postgres's own `max_connections` — a future-phase concern (PgBouncer, or
+  raising `max_connections`) once replica count grows past what today's
+  defaults allow.
+- **Retry strategy**: `check_database_connection()` retries transient
+  failures with the shared backoff policy.
+- **Deadlock handling**: `run_with_deadlock_retry()` retries a unit of
+  work specifically on Postgres's `40P01` deadlock SQLSTATE, and only
+  that — any other `OperationalError` fails immediately, unretried.
+- **Read/write separation & optimistic locking**: both are *designed*,
+  documented in detail in `app/database/session.py`'s module docstring,
+  and deliberately **not** wired up yet (no read-replica engine exists;
+  no `row_version` column has been added to any model) — doing either
+  half-heartedly here would either add operational complexity with no
+  current benefit (a replica engine nothing routes to) or conflate two
+  unrelated meanings of "version" on `FileMetadata` (see that docstring
+  for why `FileMetadata.version`, the file's *content* version, can't
+  double as a row-level optimistic-lock counter).
+
+### Idempotent APIs
+
+`POST /files/upload` accepts an optional `Idempotency-Key` header
+(`app/services/idempotency_service.py`):
+
+1. Client generates one UUID per *logical* upload attempt and sends it on
+   every retry of that same attempt.
+2. First request with a given key atomically claims it in Redis (`SET NX`)
+   and proceeds; concurrent duplicates (a genuine race between two retries
+   in flight) get `409 Conflict` — "already being processed" — rather than
+   both executing the upload.
+3. A request that completes has its response cached under that key
+   (`IDEMPOTENCY_KEY_TTL_SECONDS`, default 24h); a later retry with the
+   *same* key replays the exact original response instead of re-uploading.
+4. A key reused with a different logical request (different filename/
+   folder — see `compute_fingerprint`'s docstring for exactly what's
+   fingerprinted and why) is rejected with `422` as a client bug, not
+   silently replayed.
+5. A request that genuinely fails releases its claim immediately, so the
+   same key can be retried right away rather than waiting out the full TTL.
+
+This composes with — but is distinct from — Phase 3's SHA-256 content-based
+deduplication: idempotency prevents *duplicate uploads from network
+retries*; content dedup prevents *duplicate storage bytes for identical
+content*, however it got uploaded.
+
+### Trusted proxies & forwarded headers
+
+Behind Google Cloud Load Balancer, the ASGI server sees the LB as the TCP
+peer, not the real client. `TrustedProxyMiddleware`
+(`app/middleware/proxy_headers.py`) resolves the real client IP/scheme from
+`X-Forwarded-For`/`X-Forwarded-Proto`, but only when the peer is in
+`Settings.TRUSTED_PROXIES` (`*` for this phase's scope — pin to real proxy
+CIDRs once the network topology is fixed) — never trusted unconditionally,
+since that would let any direct client spoof its own IP in logs/rate-limit
+keys.
+
+### Retry, circuit breaker & rate-limit seams
+
+- **`app/core/retry.py`** — generic async retry with exponential backoff +
+  full jitter (jitter specifically to avoid a thundering herd when many
+  replicas reconnect to a recovering dependency simultaneously). Used for
+  DB/Redis/Storage health checks and startup verification.
+- **`app/core/circuit_breaker.py`** — a minimal per-dependency, in-process
+  (deliberately not Redis-shared — see module docstring) three-state
+  breaker primitive. Provided as infrastructure this phase; broader
+  application beyond the health-check paths is left to whichever future
+  phase needs it.
+- **`app/middleware/rate_limit.py`** — an explicit no-op placeholder that
+  documents the seam a real Redis-backed limiter will occupy (`429` +
+  `Retry-After`, keyed by client IP/user ID) — deferred past this phase,
+  wired in now so the response contract (`X-RateLimit-*` headers) doesn't
+  change later.
+
+### Error handling
+
+Every Phase 4 failure mode gets its own domain exception + handler
+(`app/exceptions/`), mapped consistently onto the standard `APIResponse`
+envelope: `LockAcquisitionException` (409), `CircuitBreakerOpenException`
+(503), `ServiceUnavailableException` (503),
+`IdempotencyKeyInProgressException` (409),
+`IdempotencyKeyReplayedException` (422) — no endpoint ever returns a raw
+stack trace or an inconsistent error shape for these.
+
+## 12. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -442,7 +691,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 12. Environment Variables
+## 13. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -461,6 +710,13 @@ See `.env.example` for the full list. Key variables:
 | `MAX_UPLOAD_SIZE_MB` | Hard cap on upload size (rejected with `413`) |
 | `ALLOWED_MIME_TYPES` | Comma-separated allowlist; empty = allow all except `BLOCKED_EXTENSIONS` |
 | `BLOCKED_EXTENSIONS` | Comma-separated extension blocklist (executables/scripts by default) |
+| `BUILD_VERSION` / `GIT_COMMIT` | Baked in at container build time; surfaced in logs + health endpoints (Phase 4) |
+| `TRUSTED_PROXIES` | Comma-separated proxy IPs whose `X-Forwarded-*` headers are honored; `*` trusts any (Phase 4) |
+| `IDEMPOTENCY_KEY_TTL_SECONDS` | How long a completed `Idempotency-Key` response is replayable (Phase 4) |
+| `LOCK_DEFAULT_TTL_SECONDS` | Default TTL for Redis-backed distributed locks (Phase 4) |
+| `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_DELAY_SECONDS` / `RETRY_MAX_DELAY_SECONDS` | Backoff policy for transient DB/Redis/Storage failures (Phase 4) |
+| `FAIL_FAST_ON_STARTUP` | Refuse to finish startup if a critical dependency is unreachable after retrying (Phase 4) |
+| `SHUTDOWN_GRACE_PERIOD_SECONDS` | Ceiling on graceful shutdown; match/exceed with uvicorn's `--timeout-graceful-shutdown` (Phase 4) |
 
 ### Google Cloud Storage Setup
 
@@ -495,7 +751,7 @@ GKE service account to the IAM service account via Workload Identity, leave
 Default Credentials automatically — this is what makes `app/database/gcs.py`
 work unchanged across environments.
 
-## 14. Running Locally (without Docker)
+## 15. Running Locally (without Docker)
 
 Requires a local PostgreSQL and Redis instance matching your `.env`.
 
@@ -507,7 +763,7 @@ alembic upgrade head
 
 API available at `http://localhost:8000`, docs at `http://localhost:8000/docs`.
 
-## 15. Running with Docker
+## 16. Running with Docker
 
 ```bash
 cp .env.example .env
@@ -521,7 +777,7 @@ network. Apply migrations inside the running container:
 docker compose exec api alembic upgrade head
 ```
 
-## 16. Database Migrations (Alembic)
+## 17. Database Migrations (Alembic)
 
 ```bash
 # Generate a new migration from model changes
@@ -541,7 +797,7 @@ Migrations so far:
   `public_url`, `storage_class`, `etag`, `upload_status`, `uploaded_at` to
   `file_metadata`
 
-## 17. API Documentation
+## 18. API Documentation
 
 - Swagger UI: `GET /docs`
 - ReDoc: `GET /redoc`
@@ -549,7 +805,7 @@ Migrations so far:
 
 (Docs are automatically disabled when `ENVIRONMENT=production`.)
 
-## 18. Testing
+## 19. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
 services required.
@@ -580,16 +836,35 @@ Coverage includes:
   safety when an object is still shared via dedup, rollback of an orphaned
   object when metadata persistence fails after a successful upload, a
   simulated storage-backend outage (502), and cross-owner access isolation.
+- **Phase 4** (`tests/test_distributed.py` + additions to
+  `tests/test_health.py`, against an in-memory `FakeRedisClient` — see
+  `tests/fakes/fake_redis.py`, never real Redis): idempotency-key replay
+  on retry, idempotency-key reused with a different payload (422),
+  concurrent requests sharing one idempotency key (never two uploads),
+  the `IdempotencyService` unit contract (proceed/replay/fail), distributed
+  lock acquire/release/conflict and token-safety (a released lock never
+  clobbers a different holder's re-acquired one), retry-with-backoff
+  (transient success, exhaustion, non-retryable exceptions skip retry),
+  circuit breaker state transitions (closed -> open -> half-open),
+  `/health`/`/ready`/`/live` response shape, correlation/trace/server-ID
+  headers and their propagation from an inbound `X-Correlation-ID`,
+  graceful degradation (a dependency check that itself raises still
+  returns a structured `200`/`503`, never a `500`), and many-concurrent-
+  requests-get-unique-IDs as a statelessness sanity check. Note:
+  `/health`/`/ready` intentionally check *real* DB/Redis connectivity
+  (not the SQLite/fake overrides) — see `tests/conftest.py` for how the
+  suite keeps that fast and deterministic without requiring real infra.
 
-## 19. Future Roadmap (Phases 4–15, not yet built)
+## 20. Future Roadmap (Phases 5–15, not yet built)
 
-Chunked/resumable uploads, sharing & permissions between users, virus
-scanning integration, thumbnail generation, full-text content search,
-Pub/Sub-driven background workers, rate limiting, Redis caching, CI/CD via
-GitHub Actions, Terraform IaC, GKE deployment, Cloud Armor, Cloud CDN,
-observability (Cloud Monitoring/Logging dashboards).
+Kubernetes/GKE deployment, autoscaling (HPA), chunked/resumable uploads,
+sharing & permissions between users, virus scanning integration, thumbnail
+generation, full-text content search, Pub/Sub-driven background workers,
+real rate limiting, Redis metadata caching, CI/CD via GitHub Actions,
+Terraform IaC, Cloud Armor, Cloud CDN, observability (Cloud Monitoring/
+Logging dashboards, OpenTelemetry tracing).
 
-## 20. Contribution Guide
+## 21. Contribution Guide
 
 1. Create a feature branch from `main`.
 2. Keep business logic in `services/`, persistence in `repositories/` — never

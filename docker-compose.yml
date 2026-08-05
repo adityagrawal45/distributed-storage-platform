@@ -50,6 +50,13 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-secret-key}
+      # Phase 4: distributed backend identity. INSTANCE_ID is left unset
+      # here deliberately — Settings generates a fresh one per process
+      # start, which is exactly what we want even for a single-container
+      # compose setup (restart the container, get a new identity).
+      - BUILD_VERSION=${BUILD_VERSION:-dev-local}
+      - GIT_COMMIT=${GIT_COMMIT:-unknown}
+      - FAIL_FAST_ON_STARTUP=true
     env_file:
       - .env
     volumes:
