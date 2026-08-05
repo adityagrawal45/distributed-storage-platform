@@ -18,10 +18,15 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.exceptions.custom_exceptions import (
     AuthenticationException,
     AuthorizationException,
+    CircuitBreakerOpenException,
     ConflictException,
     FileTooLargeException,
+    IdempotencyKeyInProgressException,
+    IdempotencyKeyReplayedException,
+    LockAcquisitionException,
     NimbusFSException,
     NotFoundException,
+    ServiceUnavailableException,
     StorageException,
     StorageObjectNotFoundException,
     StoragePermissionException,
@@ -121,6 +126,35 @@ async def storage_exception_handler(request: Request, exc: StorageException) -> 
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
     logger.error("database_error", error=str(exc), path=str(request.url))
     return _envelope(request, status.HTTP_503_SERVICE_UNAVAILABLE, "A database error occurred.")
+
+
+async def lock_acquisition_exception_handler(request: Request, exc: LockAcquisitionException) -> JSONResponse:
+    logger.warning("lock_acquisition_failed", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_409_CONFLICT, exc.detail)
+
+
+async def circuit_breaker_open_exception_handler(request: Request, exc: CircuitBreakerOpenException) -> JSONResponse:
+    logger.error("circuit_breaker_open", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_503_SERVICE_UNAVAILABLE, exc.detail)
+
+
+async def service_unavailable_exception_handler(request: Request, exc: ServiceUnavailableException) -> JSONResponse:
+    logger.error("service_unavailable", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_503_SERVICE_UNAVAILABLE, exc.detail)
+
+
+async def idempotency_key_replayed_exception_handler(
+    request: Request, exc: IdempotencyKeyReplayedException
+) -> JSONResponse:
+    logger.warning("idempotency_key_replayed_with_different_body", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail)
+
+
+async def idempotency_key_in_progress_exception_handler(
+    request: Request, exc: IdempotencyKeyInProgressException
+) -> JSONResponse:
+    logger.info("idempotency_key_in_progress", detail=exc.detail, path=str(request.url))
+    return _envelope(request, status.HTTP_409_CONFLICT, exc.detail)
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:

@@ -20,7 +20,7 @@ Design decisions:
 import uuid
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer
 
 from app.core.config import get_settings
@@ -35,6 +35,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_PREFIX}/auth/lo
 
 
 async def get_current_user(
+    request: Request,
     token: Annotated[str, Depends(oauth2_scheme)],
     user_repository: UserRepositoryDep,
 ) -> User:
@@ -51,6 +52,12 @@ async def get_current_user(
         raise InvalidTokenException(detail="User no longer exists.")
     if not user.is_active:
         raise InactiveUserException()
+
+    # Stashed on request.state so RequestContextMiddleware's completion
+    # log line can include *who* made the request without threading a
+    # user ID through every route signature — see
+    # app/middleware/request_context.py.
+    request.state.user_id = user.id
 
     return user
 

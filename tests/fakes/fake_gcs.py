@@ -102,6 +102,10 @@ class FakeBucket:
     def blob(self, name: str) -> FakeBlob:
         return FakeBlob(self, name)
 
+    def exists(self) -> bool:
+        """Fake buckets always exist once referenced — mirrors a real, pre-provisioned bucket."""
+        return True
+
 
 class FakeGCSClient:
     """Stands in for `google.cloud.storage.Client` in tests."""

@@ -22,13 +22,17 @@ Design decisions:
   synchronous — there is no supported async client as of this writing).
 """
 
+import asyncio
 from functools import lru_cache
 
 from google.cloud import storage
 
 from app.core.config import get_settings
+from app.core.retry import RetryExhaustedError, retry_async
+from app.logging.logger import get_logger
 
 settings = get_settings()
+logger = get_logger(__name__)
 
 
 @lru_cache
@@ -39,3 +43,43 @@ def get_storage_client() -> storage.Client:
             settings.GCS_CREDENTIALS_PATH, project=settings.GCS_PROJECT_ID
         )
     return storage.Client(project=settings.GCS_PROJECT_ID)
+
+
+async def check_storage_connection(client: storage.Client | None = None, *, with_retry: bool = True) -> bool:
+    """
+    Verifies the configured bucket exists and is reachable.
+
+    Used by `/health` and `/ready` (with retry, tolerating one transient
+    blip) and by startup verification (see `app/main.py`'s lifespan,
+    which fails fast if this never succeeds — see
+    `Settings.FAIL_FAST_ON_STARTUP`). The synchronous `google-cloud-
+    storage` SDK call is run off the event loop via `asyncio.to_thread`,
+    same pattern as `StorageService`.
+
+    `client` is accepted as a parameter (defaulting to the process-wide
+    singleton) rather than always resolved internally, purely so tests
+    can pass the same `FakeGCSClient` that overrides
+    `app.dependencies.providers.get_gcs_client` elsewhere — this
+    function must never make a real network call in the test suite.
+    """
+    client = client or get_storage_client()
+
+    async def _bucket_exists() -> bool:
+        bucket = await asyncio.to_thread(client.bucket, settings.GCS_BUCKET_NAME)
+        return await asyncio.to_thread(bucket.exists)
+
+    try:
+        if not with_retry:
+            return await _bucket_exists()
+        try:
+            return await retry_async(
+                _bucket_exists,
+                max_attempts=settings.RETRY_MAX_ATTEMPTS,
+                base_delay=settings.RETRY_BASE_DELAY_SECONDS,
+                max_delay=settings.RETRY_MAX_DELAY_SECONDS,
+                operation_name="gcs_bucket_exists",
+            )
+        except RetryExhaustedError:
+            return False
+    except Exception:
+        return False

@@ -10,12 +10,15 @@ override any provider in tests via `app.dependency_overrides`.
 
 from typing import Annotated
 
+import redis.asyncio as redis
 from fastapi import Depends
 from google.cloud import storage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.distributed_lock import DistributedLockFactory
 from app.database.gcs import get_storage_client
+from app.database.redis import get_redis
 from app.database.session import get_db
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
@@ -26,6 +29,7 @@ from app.services.auth_service import AuthService
 from app.services.file_upload_service import FileUploadService
 from app.services.file_validation_service import FileValidationService
 from app.services.folder_service import FolderService
+from app.services.idempotency_service import IdempotencyService
 from app.services.metadata_service import MetadataService
 from app.services.search_service import SearchService
 from app.services.storage_service import StorageService
@@ -34,6 +38,21 @@ from app.services.user_service import UserService
 from app.services.version_service import VersionService
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
+RedisClientDep = Annotated[redis.Redis, Depends(get_redis)]
+
+
+def get_distributed_lock_factory(client: RedisClientDep) -> DistributedLockFactory:
+    settings = get_settings()
+    return DistributedLockFactory(client, default_ttl_seconds=settings.LOCK_DEFAULT_TTL_SECONDS)
+
+
+def get_idempotency_service(client: RedisClientDep) -> IdempotencyService:
+    settings = get_settings()
+    return IdempotencyService(client, ttl_seconds=settings.IDEMPOTENCY_KEY_TTL_SECONDS)
+
+
+DistributedLockFactoryDep = Annotated[DistributedLockFactory, Depends(get_distributed_lock_factory)]
+IdempotencyServiceDep = Annotated[IdempotencyService, Depends(get_idempotency_service)]
 
 
 def get_gcs_client() -> storage.Client:

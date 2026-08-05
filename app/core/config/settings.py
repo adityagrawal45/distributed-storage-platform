@@ -12,6 +12,8 @@ Design decisions:
   process (cheap, immutable, safe to share across async requests).
 """
 
+import socket
+import uuid
 from enum import Enum
 from functools import lru_cache
 from typing import List
@@ -115,6 +117,73 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = True
+
+    # ------------------------------------------------------------------
+    # Server / Instance Identity (Phase 4)
+    # ------------------------------------------------------------------
+    # `INSTANCE_ID` identifies *this process* across a fleet of
+    # interchangeable replicas — critical once >1 FastAPI instance is
+    # running behind a load balancer. It is deliberately random and
+    # generated once per process (not persisted), never configured by an
+    # operator: on Cloud Run/GKE every pod restart should get a fresh
+    # identity. `HOSTNAME` defaults to the OS hostname, which on
+    # Cloud Run/GKE is the container/pod name — useful for correlating
+    # logs back to a specific replica in the platform's own console.
+    INSTANCE_ID: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    HOSTNAME: str = Field(default_factory=lambda: socket.gethostname())
+    # `BUILD_VERSION`/`GIT_COMMIT` are baked into the container image at
+    # build time (e.g. `docker build --build-arg GIT_COMMIT=$(git rev-parse
+    # HEAD)`) and surfaced via env vars — NOT computed at runtime, so a
+    # running process can prove exactly which build it's serving.
+    BUILD_VERSION: str = Field(default="dev-local")
+    GIT_COMMIT: str = Field(default="unknown")
+
+    # ------------------------------------------------------------------
+    # Distributed Backend (Phase 4)
+    # ------------------------------------------------------------------
+    # Trusted reverse proxies (load balancer / Cloud Run front end) whose
+    # `X-Forwarded-*` headers we honor. "*" trusts any proxy — fine
+    # behind a locked-down Cloud LB where the app is never internet-
+    # reachable directly, but should be pinned to real proxy CIDRs/IPs
+    # once that topology is known.
+    TRUSTED_PROXIES_RAW: str = Field(default="*", alias="TRUSTED_PROXIES")
+
+    # Idempotency-Key support (see app/services/idempotency_service.py).
+    IDEMPOTENCY_KEY_TTL_SECONDS: int = 86400  # 24h — long enough to absorb client retry storms
+    IDEMPOTENCY_LOCK_TIMEOUT_SECONDS: int = 60  # generous ceiling on "how long can one upload take"
+
+    # Distributed lock defaults (app/core/distributed_lock.py).
+    LOCK_DEFAULT_TTL_SECONDS: int = 30
+    LOCK_ACQUIRE_TIMEOUT_SECONDS: float = 5.0
+    LOCK_RETRY_INTERVAL_SECONDS: float = 0.1
+
+    # Retry policy applied to transient infra failures (DB/Redis/GCS)
+    # during startup and on the request path — see app/core/retry.py.
+    RETRY_MAX_ATTEMPTS: int = 3
+    RETRY_BASE_DELAY_SECONDS: float = 0.2
+    RETRY_MAX_DELAY_SECONDS: float = 2.0
+
+    # Startup fails fast (process exits) if critical dependencies are
+    # unreachable after retrying — this is intentional: a Kubernetes/Cloud
+    # Run scheduler should not route traffic to a replica that can never
+    # serve a request, and a crash-looping pod is a much clearer signal
+    # than one silently serving 500s. Set to False only for offline
+    # tooling (e.g. `alembic` invocations) that import the app without
+    # ever running the ASGI lifespan.
+    FAIL_FAST_ON_STARTUP: bool = True
+
+    # Graceful shutdown: how long to wait for in-flight requests to
+    # finish before forcibly closing pools. Uvicorn's own
+    # `--timeout-graceful-shutdown` should be set to a value >= this.
+    SHUTDOWN_GRACE_PERIOD_SECONDS: float = 10.0
+
+    @property
+    def TRUSTED_PROXIES(self) -> List[str]:
+        return [item.strip() for item in self.TRUSTED_PROXIES_RAW.split(",") if item.strip()]
+
+    @property
+    def trust_any_proxy(self) -> bool:
+        return self.TRUSTED_PROXIES_RAW.strip() == "*"
 
     # ------------------------------------------------------------------
     # Google Cloud Storage (Phase 3)

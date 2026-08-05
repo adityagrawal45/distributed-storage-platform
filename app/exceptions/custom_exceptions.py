@@ -208,3 +208,51 @@ class DuplicateFileContentException(ConflictException):
 
     def __init__(self, detail: str = "This exact file content has already been uploaded."):
         super().__init__(detail)
+
+
+# ---------------------------------------------------------------------
+# Distributed Backend (Phase 4)
+# ---------------------------------------------------------------------
+class LockAcquisitionException(NimbusFSException):
+    """Raised when a distributed (Redis-backed) lock cannot be acquired."""
+
+    def __init__(self, detail: str = "Could not acquire the required distributed lock."):
+        super().__init__(detail)
+
+
+class CircuitBreakerOpenException(NimbusFSException):
+    """Raised when a call is short-circuited because its breaker is open."""
+
+    def __init__(self, detail: str = "This dependency is temporarily unavailable (circuit breaker open)."):
+        super().__init__(detail)
+
+
+class ServiceUnavailableException(NimbusFSException):
+    """Raised when a critical dependency (DB/Redis/Storage) cannot be reached."""
+
+    def __init__(self, detail: str = "A required dependency is currently unavailable."):
+        super().__init__(detail)
+
+
+class IdempotencyKeyReplayedException(NimbusFSException):
+    """
+    Raised when an `Idempotency-Key` is reused with a *different* request
+    body than the original — a client bug (or misuse), not a safe retry.
+    Safe retries (identical key + identical body) are handled by
+    replaying the cached response instead of raising.
+    """
+
+    def __init__(self, detail: str = "This Idempotency-Key was already used with a different request body."):
+        super().__init__(detail)
+
+
+class IdempotencyKeyInProgressException(ConflictException):
+    """
+    Raised when a request reuses an `Idempotency-Key` whose original
+    request is still being processed by (possibly) another replica —
+    the safe response is to reject the concurrent duplicate rather than
+    let two replicas both execute the same non-idempotent side effect.
+    """
+
+    def __init__(self, detail: str = "A request with this Idempotency-Key is already being processed."):
+        super().__init__(detail)

@@ -4,9 +4,9 @@ services:
     image: postgres:16-alpine
     container_name: file_storage_postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: file_storage
+      POSTGRES_USER: nimbusfs
+      POSTGRES_PASSWORD: nimbusfs
+      POSTGRES_DB: nimbusfs
     ports:
       - "5432:5432"
     volumes:
@@ -42,15 +42,20 @@ services:
         condition: service_healthy
     environment:
       - ENVIRONMENT=development
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/file_storage
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-dev-secret-key}
+      - POSTGRES_USER=nimbusfs
+      - POSTGRES_PASSWORD=nimbusfs
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=nimbusfs
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-secret-key}
     env_file:
       - .env
     volumes:
       - ./app:/app/app
       - ./alembic.ini:/app/alembic.ini
-      - ./migrations:/app/migrations
+      - ./alembic:/app/alembic
     command: >
       sh -c "
         alembic upgrade head &&
