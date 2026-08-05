@@ -13,15 +13,16 @@ project's "no business logic in the API layer" rule.
 import uuid
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, Form, Query, Request, UploadFile, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, File, Form, Header, Query, Request, UploadFile, status
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.core.config import get_settings
 from app.dependencies.auth import CurrentUser
-from app.dependencies.providers import FileUploadServiceDep
+from app.dependencies.providers import FileUploadServiceDep, IdempotencyServiceDep
 from app.exceptions.custom_exceptions import ValidationException
 from app.schemas.file_metadata import FileMetadataRead, FileUploadResponse, SignedUrlResponse
 from app.schemas.response import APIResponse
+from app.services.idempotency_service import IdempotencyOutcome, compute_fingerprint
 
 router = APIRouter(prefix="/files", tags=["File Storage"])
 
@@ -61,23 +62,61 @@ def _parse_range_header(range_header: str, total_size: int) -> tuple[int, int]:
     response_model=APIResponse[FileUploadResponse],
     status_code=status.HTTP_201_CREATED,
     summary="Upload a file's bytes to cloud storage and create its metadata",
+    description=(
+        "Supports an optional `Idempotency-Key` header (Phase 4): retrying the "
+        "same upload with the same key after a network failure replays the "
+        "original response instead of creating a duplicate file. See "
+        "app/services/idempotency_service.py for the full contract."
+    ),
 )
 async def upload_file(
     current_user: CurrentUser,
     file_upload_service: FileUploadServiceDep,
+    idempotency_service: IdempotencyServiceDep,
     file: UploadFile = File(...),
     folder_id: uuid.UUID | None = Form(default=None),
-) -> APIResponse[FileUploadResponse]:
-    file_metadata, is_duplicate = await file_upload_service.upload_file(current_user.id, folder_id, file)
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> APIResponse[FileUploadResponse] | JSONResponse:
+    if idempotency_key:
+        fingerprint = compute_fingerprint(
+            "upload", str(folder_id), file.filename or "", file.content_type or ""
+        )
+        check = await idempotency_service.check_or_begin(current_user.id, idempotency_key, fingerprint)
+        if check.outcome is IdempotencyOutcome.REPLAY:
+            # Safe retry: return exactly what the original attempt returned
+            # instead of re-executing the (non-idempotent) upload.
+            return JSONResponse(status_code=check.cached_status_code, content=check.cached_body)
+
+    try:
+        file_metadata, is_duplicate = await file_upload_service.upload_file(current_user.id, folder_id, file)
+    except Exception:
+        if idempotency_key:
+            # Release the claim so a genuine failure (e.g. transient GCS
+            # outage) can be retried immediately with the same key,
+            # rather than blocking the client behind the full TTL.
+            await idempotency_service.fail(current_user.id, idempotency_key)
+        raise
+
     message = (
         "Identical content already existed; reused the existing storage object."
         if is_duplicate
         else "File uploaded successfully."
     )
-    return APIResponse(
+    response = APIResponse(
         message=message,
         data=FileUploadResponse(file=FileMetadataRead.model_validate(file_metadata), is_duplicate=is_duplicate),
     )
+
+    if idempotency_key:
+        await idempotency_service.complete(
+            current_user.id,
+            idempotency_key,
+            fingerprint,
+            status.HTTP_201_CREATED,
+            response.model_dump(mode="json"),
+        )
+
+    return response
 
 
 @router.get("/{file_id}/download", summary="Stream a file's bytes, with HTTP Range support")
