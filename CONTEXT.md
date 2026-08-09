@@ -1,13 +1,14 @@
 # NimbusFS — Project Context
 
-Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4.
+Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5.
 
-## Current Status: Phases 1–4 complete, repo healthy
+## Current Status: Phases 1–5 complete, repo healthy
 
 The repo previously had **committed, unresolved Git merge-conflict markers** in 8 files (from a bad merge, `086377c "Merged existing repository"`) plus a parallel orphaned legacy implementation tree. **All of that has been resolved** — see "History: What Was Fixed" below for the record. As of now:
 
 - `app.main` imports cleanly, the app starts, all routes are live.
-- Full test suite: **104/104 passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4), against in-memory SQLite (`aiosqlite`) — no external services needed to run `pytest`. `/health`/`/ready` deliberately check *real* DB/Redis connectivity (see `app/database/session.py`/`redis.py`), so those two routes' test assertions are shape-only, not "must be healthy" — see `tests/conftest.py` for how the suite still stays fast without real infra.
+- Full test suite: **104/104 passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4), against in-memory SQLite (`aiosqlite`) — no external services needed to run `pytest`. `/health`/`/ready` deliberately check *real* DB/Redis connectivity (see `app/database/session.py`/`redis.py`), so those two routes' test assertions are shape-only, not "must be healthy" — see `tests/conftest.py` for how the suite still stays fast without real infra. **Phase 5 added no application code** (only `k8s/`, `docker/Dockerfile`, `docker-compose.yml`, `.gitignore`, README/CONTEXT docs) — re-ran the full suite after Phase 5 and confirmed still 104/104, no regressions.
+- Phase 5 added a `k8s/` manifest set + `scripts/k8s-*.sh` runbook scripts, verified with `python -c "import yaml..."` (all 16 YAML files parse) and `bash -n` (all 3 scripts syntax-check clean) — **not** applied against a real GKE cluster in this session (none available); see "Phase 5 Verification Caveat" below.
 - No known unresolved conflicts, no orphaned legacy code, no stray env files.
 
 ## What NimbusFS Is
@@ -17,9 +18,10 @@ A **cloud-native distributed file storage platform** (Google-Drive-style) built 
 - **Phase 1**: user registration/auth (JWT access+refresh, role-based access)
 - **Phase 2**: folder hierarchy, file metadata, soft-delete/trash, versioning, search & pagination
 - **Phase 3**: real file upload/download via Google Cloud Storage, signed URLs, streaming downloads with Range support, SHA-256 content-based duplicate detection, upload/metadata rollback consistency
-- **Phase 4**: distributed backend architecture — stateless multi-replica design, correlation/trace/server-ID propagation + structured logging, `/health`+`/ready`+`/live` endpoints, fail-fast startup + graceful shutdown lifecycle, Redis-backed distributed locks, Redis-backed `Idempotency-Key` support on `POST /files/upload`, DB/Redis/Storage retry-with-backoff, a circuit breaker primitive, trusted-proxy/forwarded-header handling, a rate-limit middleware placeholder. No Kubernetes/deployment manifests yet — that's Phase 5.
+- **Phase 4**: distributed backend architecture — stateless multi-replica design, correlation/trace/server-ID propagation + structured logging, `/health`+`/ready`+`/live` endpoints, fail-fast startup + graceful shutdown lifecycle, Redis-backed distributed locks, Redis-backed `Idempotency-Key` support on `POST /files/upload`, DB/Redis/Storage retry-with-backoff, a circuit breaker primitive, trusted-proxy/forwarded-header handling, a rate-limit middleware placeholder.
+- **Phase 5**: Kubernetes deployment on GKE — full manifest set in `k8s/` (Namespace, ResourceQuota/LimitRange, ServiceAccount+RBAC via Workload Identity, ConfigMap/Secret, Deployment with startup/readiness/liveness probes + rolling strategy + pod anti-affinity/node affinity, ClusterIP Service with container-native load balancing, HPA 3→10 on CPU+memory, PodDisruptionBudget, default-deny NetworkPolicy, GKE Ingress + BackendConfig + FrontendConfig + ManagedCertificate), a hardened multi-stage non-root Dockerfile (now the single canonical one for dev + prod), and `scripts/k8s-deploy.sh`/`k8s-smoke-test.sh`/`k8s-scale-demo.sh`. No Pub/Sub, background workers, chunked uploads, monitoring stack, CI/CD automation, multi-region, or DR yet — those are future phases.
 
-**Not yet built** (future phases, per README §20): Kubernetes/GKE deployment + autoscaling, chunked/resumable uploads, sharing/permissions between users, virus scanning (placeholder only), thumbnails, full-text content search, Pub/Sub background workers, real rate limiting, Redis *metadata* caching (Phase 4 only built the plumbing), CI/CD, Terraform, observability/OpenTelemetry tracing.
+**Not yet built** (future phases, per README §21): chunked/resumable uploads, sharing/permissions between users, virus scanning (placeholder only), thumbnails, full-text content search, Pub/Sub background workers, real rate limiting, Redis *metadata* caching (Phase 4 only built the plumbing), CI/CD automation (Phase 5 only documented the intended shape), Terraform, observability/OpenTelemetry tracing (Phase 5 only prepared Prometheus annotations), multi-region deployment, disaster recovery.
 
 ## Tech Stack
 
@@ -36,7 +38,8 @@ A **cloud-native distributed file storage platform** (Google-Drive-style) built 
 | Logging | `structlog` (structured, JSON-toggleable via `LOG_JSON`) |
 | Cloud Storage | `google-cloud-storage` SDK, private bucket, V4 signed URLs, MIME sniffing via `filetype` |
 | Testing | `pytest` + `pytest-asyncio` (`asyncio_mode = auto`), `httpx.AsyncClient`, in-memory SQLite (`aiosqlite`), hand-written `FakeGCSClient` (`tests/fakes/fake_gcs.py`) — no external services or real GCS needed |
-| Containers | `Dockerfile` (python:3.12-slim) + `docker-compose.yml` (postgres, redis, app) |
+| Containers | `docker/Dockerfile` (python:3.12-slim, multi-stage, non-root — Phase 5: now the single canonical Dockerfile for both dev and prod) + `docker-compose.yml` (postgres, redis, app) |
+| Orchestration | Kubernetes on GKE (Phase 5) — see `k8s/` (16 manifests) + `k8s/README.md`; not applied to a live cluster in this repo/session, manifests only |
 
 ## Directory Map (live code)
 
@@ -108,7 +111,21 @@ tests/
   test_health/registration/login/protected_routes/folders/metadata/search.py   Phase 1/2 tests
   test_file_storage.py          Phase 3 tests (upload/download/range/signed-url/replace/permanent-delete/dedup/rollback/failure)
   test_distributed.py           Phase 4 tests (idempotency, distributed locks, retry, circuit breaker, correlation
-                                 IDs, graceful degradation, concurrency) — see README §19 for the full list
+                                 IDs, graceful degradation, concurrency) — see README §20 for the full list
+k8s/                             Phase 5: Kubernetes manifests, numerically prefixed for apply order (00-namespace
+                                  through 15-ingress) — see k8s/README.md for the full table + deployment runbook.
+                                  Not pytest-testable (no cluster in this environment); validated via YAML parse +
+                                  `kubectl apply --dry-run=client` guidance only, see "Phase 5 Verification Caveat" below.
+docker/Dockerfile                Phase 5: single canonical multi-stage, non-root Dockerfile (was previously
+                                  duplicated with a root-level single-stage `dockerfile` — that duplicate was
+                                  deleted this phase; docker-compose.yml now builds from docker/Dockerfile explicitly)
+scripts/
+  run_dev.sh / migrate.sh        pre-existing local dev helpers
+  k8s-deploy.sh                  Phase 5: applies all k8s/ manifests in order, waits for rollout
+  k8s-smoke-test.sh              Phase 5: read-only cluster checks by default; `--full` adds a self-healing
+                                  (delete-a-Pod) demo and a rolling-update/rollback demo
+  k8s-scale-demo.sh              Phase 5: drives synthetic load against the in-cluster Service to observe the HPA
+                                  scale 3→10 and back down
 ```
 
 ## API Surface (all under `/api/v1`)
@@ -158,9 +175,27 @@ Every response uses the standard envelope, `app/schemas/response.py::APIResponse
 - Circuit breaker is in-process per replica, deliberately not Redis-shared (a breaker's job is protecting *this process's* outbound calls; coordinating that via Redis would add a round-trip to every call it's meant to fast-fail).
 - Rate limiting is an explicit no-op placeholder (`app/middleware/rate_limit.py`) — infrastructure/seam only, no real limiting yet, per this phase's scope.
 
+## Phase 5 Design Decisions (see README §12 for full detail)
+
+- GKE-native Ingress (not nginx-ingress or another 3rd-party controller) — fewer moving parts for a single-cluster, single-cloud deployment; native integration with ManagedCertificate/BackendConfig/NEGs.
+- Container-native load balancing (NEGs, `08-service.yaml`'s `cloud.google.com/neg` annotation) — GCLB routes to Pod IPs directly, skipping a kube-proxy hop and giving GCLB accurate per-Pod health via BackendConfig.
+- Google-managed TLS certs (ManagedCertificate CRD), not cert-manager + Let's Encrypt — zero extra components to operate for this phase's scope.
+- Soft (`preferred...`) pod anti-affinity/node affinity, not hard (`required...`) — a hard requirement with only 3 replicas across 3 zones could leave a Pod permanently `Pending` during routine node-pool maintenance.
+- `readOnlyRootFilesystem: true` with a single `/tmp` emptyDir exception — required by the namespace's Pod Security "restricted" profile, and independently justified since Phase 4 already guarantees the app never needs to write to its own container filesystem.
+- Plain numbered YAML manifests, not Helm/Kustomize — appropriate for one Deployment/one environment today; revisit if a second microservice or multiple environments make the duplication cost exceed a templating layer's complexity cost.
+- `maxUnavailable: 0, maxSurge: 1` rolling strategy — true zero-downtime, safe specifically because the app is stateless (Phase 4): old and new Pods serving traffic simultaneously never causes a consistency problem.
+- PodDisruptionBudget uses `minAvailable: 2` (an absolute floor), not `maxUnavailable`, so the guarantee holds regardless of what the HPA has scaled `replicas` to at the moment maintenance happens.
+- NetworkPolicy default-deny-all + explicit allow-lists (GCLB health-check ranges, same-namespace Pods, DNS, Cloud SQL, Memorystore, Google APIs via Private Google Access) — requires Dataplane V2 enabled at cluster creation; **the Cloud SQL/Memorystore CIDR blocks in `11-networkpolicy.yaml` are placeholders** (`10.0.0.0/24`) that must be replaced with the real private-services-access ranges before this policy is applied to a real cluster, or all DB/Redis egress will be silently blocked.
+- Docker: `docker/Dockerfile` is now the **single canonical Dockerfile** for both `docker-compose.yml` and every GKE image — the previous root-level single-stage `dockerfile` (no multi-stage, no non-root user) was deleted this phase to remove the duplicate-source-of-truth risk.
+- CI/CD, a monitoring/observability stack, Pub/Sub, background workers, chunked uploads, multi-region, and disaster recovery are all **explicitly out of scope** this phase — only seams were prepared (Prometheus scrape annotations, the documented CI/CD pipeline shape in README §12) — see that section for exactly what was and wasn't done.
+
+## Phase 5 Verification Caveat
+
+No real GKE cluster (or `kind`/`minikube`) was available in this session/environment (`docker ps` failed — Docker Desktop wasn't running), so **the `k8s/` manifests were validated syntactically only**: `python -c "import yaml..."` confirmed all 16 files parse as valid YAML (`k8s/11-networkpolicy.yaml` and `k8s/04-rbac.yaml` are correctly multi-document), and `bash -n` confirmed all 3 `scripts/k8s-*.sh` files are syntactically valid shell. **Nothing was applied to a live cluster; no manifest has been confirmed to actually reconcile successfully against the real Kubernetes API** (e.g. whether every CRD field name/apiVersion is accepted by GKE's actual admission controllers, whether the Pod Security "restricted" profile accepts the Deployment's securityContext as written) — treat `k8s/` as a strong, carefully-reasoned first draft that still needs a real `kubectl apply --dry-run=server` (or a real deploy per `k8s/README.md`) before being trusted in production. If a future session has cluster access, running `./scripts/k8s-deploy.sh` and `./scripts/k8s-smoke-test.sh --full` end-to-end is the natural next verification step.
+
 ## Config (`.env.example`)
 
-All Phase 1/2 vars (see README §13) plus Phase 3: `GCS_PROJECT_ID`, `GCS_BUCKET_NAME`, `GCS_CREDENTIALS_PATH` (leave unset outside local dev — ADC/Workload Identity is used instead), `SIGNED_URL_EXPIRATION_MINUTES`, `MAX_UPLOAD_SIZE_MB`, `ALLOWED_MIME_TYPES`, `BLOCKED_EXTENSIONS`. Plus Phase 4: `INSTANCE_ID`/`HOSTNAME` (leave commented out — generated/defaulted per process), `BUILD_VERSION`, `GIT_COMMIT`, `TRUSTED_PROXIES`, `IDEMPOTENCY_KEY_TTL_SECONDS`, `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`, `LOCK_DEFAULT_TTL_SECONDS`, `LOCK_ACQUIRE_TIMEOUT_SECONDS`, `LOCK_RETRY_INTERVAL_SECONDS`, `RETRY_MAX_ATTEMPTS`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `FAIL_FAST_ON_STARTUP`, `SHUTDOWN_GRACE_PERIOD_SECONDS`.
+All Phase 1/2 vars (see README §14) plus Phase 3: `GCS_PROJECT_ID`, `GCS_BUCKET_NAME`, `GCS_CREDENTIALS_PATH` (leave unset outside local dev — ADC/Workload Identity is used instead), `SIGNED_URL_EXPIRATION_MINUTES`, `MAX_UPLOAD_SIZE_MB`, `ALLOWED_MIME_TYPES`, `BLOCKED_EXTENSIONS`. Plus Phase 4: `INSTANCE_ID`/`HOSTNAME` (leave commented out — generated/defaulted per process), `BUILD_VERSION`, `GIT_COMMIT`, `TRUSTED_PROXIES`, `IDEMPOTENCY_KEY_TTL_SECONDS`, `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`, `LOCK_DEFAULT_TTL_SECONDS`, `LOCK_ACQUIRE_TIMEOUT_SECONDS`, `LOCK_RETRY_INTERVAL_SECONDS`, `RETRY_MAX_ATTEMPTS`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `FAIL_FAST_ON_STARTUP`, `SHUTDOWN_GRACE_PERIOD_SECONDS`.
 
 ## Tests
 
@@ -182,4 +217,4 @@ For the record — these are resolved, not open issues:
 
 ## Suggested Next Steps
 
-Resume roadmap work at **Phase 5** (Kubernetes/GKE deployment — manifests, autoscaling, ingress; see README §20) — the user plans to provide the Phase 5 prompt in a future session. Do not regenerate Phases 1–4; extend the existing codebase only. Phase 4 deliberately left several things designed-but-not-wired (read replicas, row-level optimistic locking, real rate limiting, Redis metadata caching, OpenTelemetry) — revisit only if a future phase's prompt actually calls for them, don't retrofit speculatively.
+Resume roadmap work at **Phase 6** per README §21 "Future Roadmap" — the user plans to provide the Phase 6 prompt in a future session. Do not regenerate Phases 1–5; extend the existing codebase only. Before building on Phase 5, note the unresolved verification caveat above (no manifest has been applied to a real cluster yet) and the placeholder values still in `k8s/` that MUST be replaced before a real deploy: the `<PROJECT_ID>`/domain/image-tag placeholders throughout `k8s/*.yaml`, and especially `11-networkpolicy.yaml`'s Cloud SQL/Memorystore CIDR placeholders (`10.0.0.0/24`) — see `k8s/README.md` for the full one-time setup this depends on (cluster creation, Workload Identity binding, Cloud SQL/Memorystore provisioning, DNS/static IP, image build+push). Phase 4 deliberately left several things designed-but-not-wired (read replicas, row-level optimistic locking, real rate limiting, Redis metadata caching, OpenTelemetry); Phase 5 similarly left CI/CD, a monitoring stack, and multi-region/DR as documented-but-not-built — revisit any of these only if a future phase's prompt actually calls for them, don't retrofit speculatively.
