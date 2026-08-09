@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------
+# ManagedCertificate (Phase 5) — GKE-specific CRD
+# ---------------------------------------------------------------------
+# Requests a Google-managed TLS certificate for the Ingress's HTTPS
+# listener — Google provisions it (via a domain-validated ACME-like
+# flow against the DNS record you point at the Ingress's static IP —
+# see k8s/README.md "TLS Certificate Provisioning") and auto-renews it
+# for the lifetime of this object. No cert-manager install, no manual
+# renewal cron, no private key ever touches this repo or a Secret —
+# Google holds and rotates it internally.
+#
+# Referenced from the Ingress (15-ingress.yaml) via the
+# `networking.gke.io/managed-certificates` annotation. Provisioning
+# takes 15-60 minutes after DNS is pointed correctly — see
+# k8s/README.md "Troubleshooting" for how to check status
+# (`kubectl describe managedcertificate`).
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: nimbusfs-cert
+  namespace: nimbusfs
+spec:
+  domains:
+    - api.nimbusfs.example.com # replace with the real production domain before applying.
