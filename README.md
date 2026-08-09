@@ -682,7 +682,405 @@ envelope: `LockAcquisitionException` (409), `CircuitBreakerOpenException`
 `IdempotencyKeyReplayedException` (422) — no endpoint ever returns a raw
 stack trace or an inconsistent error shape for these.
 
-## 12. Installation
+## 12. Kubernetes Deployment on GKE *(Phase 5)*
+
+Phase 4 made every replica stateless and interchangeable. Phase 5 is
+where that promise gets cashed in: NimbusFS now runs as a
+self-healing, autoscaling, zero-downtime-deployable fleet on Google
+Kubernetes Engine, fronted by a Google Cloud Load Balancer. All
+manifests live in [`k8s/`](k8s/) — every field in every manifest is
+commented in place with the *why*, not just the *what*; this section is
+the narrative/design layer on top. The step-by-step "how do I actually
+deploy this" runbook is [`k8s/README.md`](k8s/README.md).
+
+**Scope note**: this phase deploys the application tier only. Pub/Sub,
+background workers, chunked uploads, a monitoring/observability stack,
+CI/CD automation, multi-region deployment, and disaster recovery are
+all explicitly out of scope — see §21 "Future Roadmap".
+
+### Updated distributed architecture
+
+```
+                          Internet
+                              │
+                Google Cloud Load Balancer  (global, HTTPS, Google-managed cert)
+                              │
+                     Kubernetes Ingress      (k8s/15-ingress.yaml — GKE-native)
+                              │
+                    Kubernetes Service       (k8s/08-service.yaml — ClusterIP + container-native LB)
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+ FastAPI Pod 1          FastAPI Pod 2          FastAPI Pod 3        ← k8s/07-deployment.yaml
+ (zone us-central1-a)   (zone us-central1-b)   (zone us-central1-c)    (HPA: 3 → 10 — k8s/09-hpa.yaml)
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+      Cloud SQL PostgreSQL  Memorystore Redis  Google Cloud Storage
+      (private IP, Phase 1) (private IP, Phase 4) (Workload Identity, Phase 3)
+```
+
+Every arrow into the Pods is now something Kubernetes actively manages
+(a Service's Endpoints list, updated live as readiness changes) rather
+than something a human wires up once and hopes stays correct.
+
+### GKE cluster design
+
+| Component | Choice | Why |
+|---|---|---|
+| **Control plane** | GKE-managed, regional | Google runs and upgrades the API server/etcd/scheduler across 3 zones — no control-plane node for NimbusFS to operate, patch, or lose sleep over. Regional (not zonal) means the control plane itself survives a single-zone outage, matching the Pod-level zone-spreading in `07-deployment.yaml`. |
+| **Worker nodes** | Regional node pool (`nimbusfs-app-pool`), autoscaling 1→6 nodes | Nodes are the thing that actually crashes/gets preempted/needs patching — separating the app's node pool from the cluster's default pool means a `gcloud container node-pools upgrade` on one doesn't have to touch the other. |
+| **Node pools** | Two: default (system/add-ons) + `nimbusfs-app-pool` (app Pods, via `nodeAffinity` — `07-deployment.yaml`) | Isolates application capacity/quota from cluster add-ons (kube-dns, metrics-server, the GKE Ingress controller itself) — a runaway app Pod can't starve the very control-plane-adjacent add-ons the cluster needs to keep functioning. |
+| **Cluster autoscaler** | `--enable-autoscaling --min-nodes 1 --max-nodes 6` per pool | The HPA (Pod count) and Cluster Autoscaler (node count) are two independent, cooperating layers: the HPA decides "I need more Pods," the Cluster Autoscaler decides "there's nowhere to schedule them, add a node." Without the second layer, the HPA's `maxReplicas: 10` would just produce `Pending` Pods once existing nodes are full. |
+| **Networking** | VPC-native (`--enable-ip-alias`) | Pods get real, routable VPC IPs (via alias IP ranges) instead of an overlay network — this is what makes container-native load balancing (NEGs, `08-service.yaml`) possible at all: GCLB can address a Pod IP directly. |
+| **VPC / subnets** | Single VPC, regional subnet, secondary ranges for Pods + Services | Keeps NimbusFS's cluster on the same VPC as Cloud SQL (private IP) and Memorystore (private IP) — no VPC peering/interconnect needed, just firewall/NetworkPolicy rules (`11-networkpolicy.yaml`). |
+| **Private cluster** | `--enable-private-nodes` + `--master-authorized-networks` | Worker nodes get NO public IPs — only reachable from inside the VPC (or via the GCLB, which reaches Pods through the VPC-native path above, not through a node's public IP). This is the cluster-level enforcement of the same "no direct internet exposure" principle `11-networkpolicy.yaml` enforces at the Pod level. |
+| **Release channel** | `regular` | Automatic, tested GKE version/patch upgrades — a deliberate trade-off of a little version control for not being the one responsible for tracking Kubernetes CVEs manually. |
+
+### Kubernetes manifest organization
+
+See the table in [`k8s/README.md`](k8s/README.md#manifest-order) for
+the full file listing and apply order. Summary of the object types and
+what each is *for* (not restating each field — see the manifest files
+themselves):
+
+- **Namespace + ResourceQuota + LimitRange** (`00`–`02`) — the
+  blast-radius and resource-ceiling boundary everything else lives
+  inside.
+- **ServiceAccount + Role/RoleBinding** (`03`–`04`) — Workload Identity
+  (GCS/Cloud SQL credentials with no key file, ever) + least-privilege
+  Kubernetes API access (which the app doesn't currently use at all —
+  the Role is deliberately almost empty).
+- **ConfigMap + Secret** (`05`–`06`) — the twelve-factor config
+  boundary: everything `app/core/config/settings.py` already reads from
+  env vars, split by sensitivity.
+- **Deployment** (`07`) — the actual workload: 3 replicas, rolling
+  strategy, resource requests/limits, three distinct probes, pod
+  anti-affinity, security context.
+- **Service** (`08`) — stable internal address + container-native load
+  balancing wiring.
+- **HorizontalPodAutoscaler** (`09`) — 3→10 replica autoscaling on
+  CPU+memory, asymmetric scale-up/scale-down behavior.
+- **PodDisruptionBudget** (`10`) — protects availability during
+  voluntary disruption (node drains/upgrades), not crashes.
+- **NetworkPolicy** (`11`) — default-deny + explicit allow-lists
+  (zero trust).
+- **BackendConfig + FrontendConfig + ManagedCertificate + Ingress**
+  (`12`–`15`) — the GKE-specific objects that turn a ClusterIP Service
+  into an internet-facing, TLS-terminated, HTTPS-redirecting Google
+  Cloud Load Balancer.
+
+### Health probes: three checks, three different failure responses
+
+Directly reuses Phase 4's three health endpoints
+(`app/api/v1/health/routes.py`) — this phase didn't need to invent new
+ones, only point Kubernetes at the right one for each purpose:
+
+| Probe | Endpoint | Runs | On failure |
+|---|---|---|---|
+| **Startup** | `/api/v1/live` | Every 3s, up to 30s, only right after container start | Nothing yet — gives Phase 4's fail-fast startup sequence (connect DB/Redis, verify GCS bucket) room to finish before liveness starts counting failures against it |
+| **Liveness** | `/api/v1/live` (zero dependency checks) | Every 10s, for the Pod's whole lifetime | 3 consecutive misses → kubelet sends SIGTERM → `terminationGracePeriodSeconds` grace window (app's own `app/main.py` lifespan shutdown runs here) → SIGKILL if still alive → ReplicaSet schedules a replacement Pod |
+| **Readiness** | `/api/v1/ready` (real DB/Redis/Storage checks) | Every 5s, for the Pod's whole lifetime | 2 consecutive misses → Pod removed from the Service's Endpoints (traffic stops routing to it) — **Pod is NOT restarted**; the instant it passes again, it's added back and traffic resumes |
+
+The liveness/readiness split is the single most important design
+decision in this section: conflating them (using `/health` — which
+checks dependencies — for BOTH) would mean a slow Cloud SQL instance
+gets "fixed" by Kubernetes restarting perfectly healthy application
+Pods in a loop, which does nothing for the database and adds a
+self-inflicted restart storm on top of a real outage.
+
+### Resource management & Quality of Service
+
+Every container declares both `requests` (guaranteed minimum) and
+`limits` (hard ceiling), with `limits.cpu/memory > requests.cpu/memory`
+— this makes every NimbusFS Pod **Burstable** QoS, one of three classes:
+
+- **Guaranteed** (`requests == limits` on every resource, every
+  container) — highest eviction priority, never killed for resource
+  pressure before Burstable/BestEffort Pods on the same node. Not used
+  here: it's the right class for something like a database's own Pod,
+  not a horizontally-scaled, bursty HTTP API where over-provisioning
+  every replica to its peak need would be wasteful.
+- **Burstable** (what NimbusFS uses) — guaranteed `requests`, allowed to
+  use spare node capacity up to `limits` when available, evicted before
+  Guaranteed Pods but after BestEffort under node pressure. Matches an
+  API that's mostly idle but spikes during upload bursts.
+- **BestEffort** (no requests/limits at all) — first to be evicted,
+  first to be OOM-killed. `02-limitrange.yaml` exists specifically so
+  no NimbusFS container can ever land in this class by omission.
+
+`ephemeral-storage` limits are set too (covers `/tmp` scratch space and
+the container's writable layers) — without it, a container filling
+local disk (e.g. a very large multipart upload spooling before it
+streams to GCS) could exhaust a shared node's disk and affect every
+other Pod scheduled there, not just itself.
+
+### Network policies: zero trust
+
+`11-networkpolicy.yaml` starts from **default-deny-all** (every Pod,
+both directions) and layers explicit allows on top — GCLB health-check
+ranges + same-namespace Pods for ingress; DNS + Cloud SQL + Memorystore
++ Google APIs (via Private Google Access) for egress. Nothing reaches a
+NimbusFS Pod, and no NimbusFS Pod reaches anything, that isn't on one
+of those lists. This requires the cluster to run Dataplane V2 (enabled
+at cluster-creation time — see `k8s/README.md`'s cluster setup command)
+since NetworkPolicy is not enforced on a GKE cluster by default.
+
+### Pod Disruption Budget
+
+`minAvailable: 2` (against a 3-replica floor) means a **voluntary**
+disruption — a node drain during a GKE node upgrade, the Cluster
+Autoscaler scaling a node pool down — is blocked by the Eviction API
+from ever taking the service below 2 available Pods, forcing routine
+maintenance to proceed one Pod at a time. It does nothing for
+**involuntary** disruption (a node crash) — nothing can prevent that;
+the ReplicaSet's normal self-healing (see below) is the response to
+that instead.
+
+### Self-healing & rolling deployments
+
+**Self-healing**: the Deployment's `selector` continuously reconciles
+actual running Pods against `replicas: 3`. Delete any one Pod by hand
+and the ReplicaSet notices the mismatch (typically within seconds) and
+schedules a replacement — no human, no alert, no runbook step required.
+`./scripts/k8s-smoke-test.sh --full` demonstrates this directly: it
+deletes a live Pod and asserts the ReplicaSet brings the count back to
+3 on its own.
+
+**Rolling update**: `maxUnavailable: 0, maxSurge: 1` means a new image
+version is deployed by bringing up ONE extra Pod on the new version,
+waiting for it to pass readiness, THEN removing one Pod on the old
+version — repeated until all 3 are on the new version. At every point
+in that sequence, at least 3 Pods are serving traffic; it is safe
+specifically because the app is stateless (Phase 4) — old and new Pods
+answering requests side-by-side never causes a consistency problem.
+
+**Rollback**: because the image tag is always an immutable version
+(never `:latest` — see `07-deployment.yaml`'s comment),
+`kubectl rollout undo` can always re-point the Deployment at the
+PREVIOUS, distinct image reference and run the exact same rolling
+procedure in reverse. `k8s/README.md`'s kubectl reference and
+`scripts/k8s-smoke-test.sh --full` both include a live deploy →
+rollback walkthrough.
+
+### Observability preparation (not installed)
+
+Per this phase's explicit scope, no monitoring stack is installed —
+only the seams for one are prepared:
+
+- `prometheus.io/scrape`/`port`/`path` Pod annotations
+  (`07-deployment.yaml`) — ready for a future Prometheus install to
+  auto-discover these Pods, pointed at `/api/v1/health` as a
+  placeholder until a real `/metrics` endpoint exists.
+- Phase 4's structured JSON logs (`structlog`, every line carrying
+  `request_id`/`correlation_id`/`trace_id`/`server_id`) are already
+  Cloud Logging-ingestible with zero changes — GKE's default Fluentbit
+  DaemonSet on Cloud Logging-enabled clusters picks up container stdout
+  automatically.
+- `trace_id` (Phase 4, defaults to `correlation_id` today) is the
+  documented seam for OpenTelemetry — instrumenting it is deliberately
+  left for a future phase, not half-implemented here.
+
+### Docker image (`docker/Dockerfile`)
+
+Now the single canonical Dockerfile for both `docker-compose.yml` (dev)
+and every GKE-deployed image — see its own header comment for the full
+rationale. Summary of what changed this phase:
+
+- Multi-stage build: build toolchain (gcc, `libpq-dev`) never reaches
+  the runtime image — smaller image, smaller attack surface.
+- Non-root, fixed-UID user (`1000:1000`) — matches
+  `07-deployment.yaml`'s `runAsUser`/`runAsGroup` exactly, and is
+  required for the namespace's Pod Security "restricted" admission
+  profile to allow the Pod to be created at all.
+- `HEALTHCHECK` hits `/api/v1/live` (not `/health`) — same
+  liveness-vs-readiness reasoning as the Kubernetes probes.
+- Exec-form `CMD` — lets SIGTERM reach uvicorn directly so Phase 4's
+  graceful-shutdown lifespan hook actually runs during a rolling
+  update, instead of being silently skipped by a shell-form `CMD`.
+- `GIT_COMMIT`/`BUILD_VERSION` build args, baked in at image-build
+  time — feeds directly into Phase 4's `Settings.BUILD_VERSION`/
+  `GIT_COMMIT`, so every `/health` response and log line traces back to
+  the exact image that produced it.
+
+### CI/CD preparation (not built)
+
+Deliberately not implemented this phase — the intended future shape,
+so the seam is documented rather than improvised later:
+
+1. GitHub Actions workflow, triggered on merge to `main`, running
+   `pytest` (all 104+ tests) as a gate.
+2. On pass: `docker build` (using `docker/Dockerfile`, with
+   `GIT_COMMIT`/`BUILD_VERSION` build args from the CI-provided SHA/tag)
+   → push to Artifact Registry, tagged with the Git SHA (immutable,
+   matching `07-deployment.yaml`'s "never `:latest`" rule).
+3. `kubectl set image` (or a GitOps tool watching Artifact Registry) to
+   roll the new tag out via the existing rolling-update strategy — no
+   new deployment mechanism needed, CI would just be what triggers the
+   same `kubectl` commands `k8s/README.md` documents doing by hand today.
+
+### Testing
+
+A Kubernetes cluster isn't something `pytest` can exercise — there's no
+in-memory fake for "a real GKE control plane reconciling a Deployment."
+Phase 5's tests are therefore `scripts/k8s-smoke-test.sh`, run against a
+real (or `kind`/`minikube`) cluster:
+
+- **Read-only checks** (default): namespace/quota/config objects exist,
+  Deployment has the expected ready-replica count, a sample Pod is
+  Ready and answers `/live`+`/ready` from inside the container, Service
+  has live Endpoints, Ingress has an assigned address, HPA is reading
+  metrics, PDB reports a healthy count, NetworkPolicies are present.
+- **`--full` (opt-in, mutates the running Deployment)**: deletes a live
+  Pod and asserts the ReplicaSet recreates it (self-healing); triggers a
+  rolling restart and asserts zero-downtime completion; runs
+  `rollout undo` and asserts successful rollback.
+- **`scripts/k8s-scale-demo.sh`**: drives synthetic load against the
+  in-cluster Service and watches the HPA scale replicas up, then back
+  down after the load stops (exercising the asymmetric
+  stabilization-window behavior in `09-hpa.yaml`).
+
+See `k8s/README.md` §"Deploy" for exact invocation.
+
+### Phase 5 design decisions
+
+- **GKE-native Ingress over an nginx-ingress/other 3rd-party
+  controller**: fewer moving parts to operate (Google manages the
+  actual load balancer infrastructure), and native integration with
+  ManagedCertificate/BackendConfig/NEGs — appropriate for a
+  single-cluster, single-cloud deployment; would reconsider for a
+  genuinely multi-cloud future.
+- **Container-native load balancing (NEGs) over kube-proxy/iptables for
+  external traffic**: GCLB routes directly to Pod IPs, skipping an
+  extra network hop and giving GCLB accurate per-Pod health visibility
+  (via BackendConfig) instead of an aggregated Service-level view.
+- **Google-managed TLS certs over cert-manager + Let's Encrypt**: zero
+  extra components to install/operate for this phase's scope; revisit
+  only if a future phase needs certs for something ManagedCertificate
+  can't express (e.g. wildcard certs across many dynamically-created
+  subdomains).
+- **Soft (`preferred...`) affinity/anti-affinity, not hard
+  (`required...`)**: a hard requirement with only 3 replicas across 3
+  zones/nodes can leave a Pod permanently `Pending` during routine node
+  pool maintenance; soft degrades gracefully to "still scheduled,
+  just less optimally spread" instead.
+- **`readOnlyRootFilesystem: true` with a single `/tmp` `emptyDir`
+  exception**: enforced by the namespace's `restricted` Pod Security
+  profile, and independently justified — Phase 4 already guarantees the
+  app has no legitimate reason to write to its own container
+  filesystem.
+- **Manifests as plain numbered YAML, not Helm/Kustomize**: appropriate
+  for one Deployment, one environment's worth of config today; revisit
+  if/when a second microservice or multiple environments (staging +
+  production clusters) make the duplication cost of plain YAML exceed
+  the complexity cost of a templating layer.
+
+### Performance considerations
+
+- **Cold start**: a new Pod's total time-to-ready is bounded by the
+  startup probe's 30s ceiling (usually much faster — Cloud SQL/
+  Memorystore connections typically establish in low hundreds of ms) —
+  this is what the HPA's scale-up responsiveness (0s stabilization
+  window, `09-hpa.yaml`) is actually waiting on end-to-end.
+  `minReadySeconds: 5` adds a small deliberate floor so a Pod that
+  becomes Ready then immediately flaps doesn't count as "available"
+  during a rollout.
+  
+- **Connection pool math at scale**: `app/database/session.py`'s pool
+  (`DATABASE_POOL_SIZE=10, DATABASE_MAX_OVERFLOW=20`) is PER POD. At
+  the HPA's ceiling of 10 Pods, that's up to 300 possible concurrent
+  Postgres connections — this must stay under Cloud SQL's configured
+  `max_connections`, which is exactly the ceiling documented (and now
+  operationally real, not just theoretical) in that file's own
+  docstring. Choose a Cloud SQL tier whose `max_connections` covers
+  this, or lower `DATABASE_POOL_SIZE`, before relying on the HPA's full
+  range in production.
+
+- **GCLB NEG propagation lag**: Service/Deployment changes (a new
+  Pod becoming Ready, a Pod being removed) take on the order of
+  seconds-to-low-minutes to propagate into GCLB's own view of healthy
+  backends — slower than in-cluster kube-proxy convergence. This is why
+  `12-backendconfig.yaml`'s `connectionDraining` window and the Pod's
+  own `preStop` sleep both exist: both are absorbing the SAME class of
+  propagation-lag race, at two different layers of the stack.
+
+- **HPA CPU-based scaling and I/O-bound work**: Phase 3's GCS calls
+  run via `asyncio.to_thread` (the SDK is synchronous) — under a
+  concurrent upload burst, CPU usage from JSON serialization/thread
+  scheduling rises even though each individual request is
+  network-bound, which is what makes CPU a meaningful (not just
+  convenient) autoscaling signal here rather than a proxy for the wrong
+  thing.
+
+### Interview questions this phase's design answers well
+
+1. *"Why does your liveness probe hit a different endpoint than your
+   readiness probe?"* — Because a slow dependency should remove a Pod
+   from traffic, not restart it; conflating the two turns every
+   database blip into a self-inflicted restart storm.
+2. *"Your Deployment's `maxUnavailable` is 0 — doesn't that mean you
+   can never remove a Pod during rollout?"* — It means Kubernetes must
+   bring the replacement up FIRST (bounded by `maxSurge: 1`); safe here
+   specifically because the app is stateless, so briefly running N+1
+   Pods across two versions causes no consistency problem.
+3. *"How does traffic actually stop reaching a Pod you're about to
+   kill, given SIGTERM and Service endpoint removal happen
+   concurrently, not in order?"* — Two independent absorbers for the
+   same race: the container's own `preStop` sleep, and the GCLB
+   BackendConfig's `connectionDraining` window, at two different layers
+   of the request path.
+4. *"Why is your PodDisruptionBudget `minAvailable: 2` and not
+   `maxUnavailable: 1`?"* — `minAvailable` is an absolute floor
+   regardless of what the HPA has scaled `replicas` to at the moment
+   maintenance happens; `maxUnavailable` would instead scale WITH
+   replicas, which isn't the guarantee actually wanted.
+5. *"What's your blast radius if the JWT_SECRET_KEY Secret leaks?"* —
+   Base64 is encoding, not encryption; real protection is GKE's etcd
+   envelope encryption (cluster-level, not this-manifest-level) plus
+   this namespace's Role granting `get` on that Secret to exactly one
+   ServiceAccount — and the documented next step (Secret Manager CSI
+   driver) for rotation/audit logging beyond what a static Secret gives.
+6. *"Why Burstable QoS instead of Guaranteed for this workload?"* — A
+   horizontally-scaled, bursty HTTP API is better served by guaranteeing
+   a modest baseline and allowing burst up to a higher limit than by
+   over-provisioning every one of up to 10 replicas to peak need.
+
+### Phase 5 completion checklist
+
+- [x] GKE cluster design documented (control plane, node pools, VPC,
+      private cluster, cluster autoscaler) — `k8s/README.md`
+- [x] Namespace, ResourceQuota, LimitRange
+- [x] ServiceAccount (Workload Identity) + Role + RoleBinding
+- [x] ConfigMap (non-secret config) + Secret (template + imperative path)
+- [x] Deployment: 3 replicas, rolling strategy (`maxUnavailable: 0`,
+      `maxSurge: 1`), resource requests/limits, env vars, graceful
+      shutdown (`preStop` + grace period), `imagePullPolicy`
+- [x] Startup, readiness, and liveness probes, each hitting the correct
+      Phase 4 endpoint
+- [x] Node affinity (dedicated app pool) + Pod anti-affinity (zone +
+      host spread)
+- [x] Service (ClusterIP) + container-native load balancing (NEG)
+- [x] Ingress: HTTPS, TLS (Google-managed cert), host/path routing,
+      forward-compatible with future API versioning
+- [x] HorizontalPodAutoscaler: 3→10, CPU + memory metrics, asymmetric
+      scale-up/scale-down behavior
+- [x] PodDisruptionBudget (`minAvailable: 2`)
+- [x] NetworkPolicy: default-deny + explicit ingress/egress allow-lists
+- [x] Dockerfile: multi-stage, non-root, slim, healthcheck, exec-form CMD
+- [x] Observability annotations prepared (Prometheus scrape hints) —
+      stack itself not installed
+- [x] CI/CD path documented — not built
+- [x] `scripts/k8s-deploy.sh`, `scripts/k8s-smoke-test.sh` (+ `--full`),
+      `scripts/k8s-scale-demo.sh`
+- [x] `k8s/README.md` deployment runbook + troubleshooting table
+- [ ] Pub/Sub, background workers, chunked uploads, monitoring stack,
+      CI/CD automation, multi-region, disaster recovery — explicitly
+      deferred to later phases, not started
+
+## 13. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -691,7 +1089,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 13. Environment Variables
+## 14. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -751,7 +1149,7 @@ GKE service account to the IAM service account via Workload Identity, leave
 Default Credentials automatically — this is what makes `app/database/gcs.py`
 work unchanged across environments.
 
-## 15. Running Locally (without Docker)
+## 16. Running Locally (without Docker)
 
 Requires a local PostgreSQL and Redis instance matching your `.env`.
 
@@ -763,7 +1161,7 @@ alembic upgrade head
 
 API available at `http://localhost:8000`, docs at `http://localhost:8000/docs`.
 
-## 16. Running with Docker
+## 17. Running with Docker
 
 ```bash
 cp .env.example .env
@@ -777,7 +1175,7 @@ network. Apply migrations inside the running container:
 docker compose exec api alembic upgrade head
 ```
 
-## 17. Database Migrations (Alembic)
+## 18. Database Migrations (Alembic)
 
 ```bash
 # Generate a new migration from model changes
@@ -797,7 +1195,7 @@ Migrations so far:
   `public_url`, `storage_class`, `etag`, `upload_status`, `uploaded_at` to
   `file_metadata`
 
-## 18. API Documentation
+## 19. API Documentation
 
 - Swagger UI: `GET /docs`
 - ReDoc: `GET /redoc`
@@ -805,7 +1203,7 @@ Migrations so far:
 
 (Docs are automatically disabled when `ENVIRONMENT=production`.)
 
-## 19. Testing
+## 20. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
 services required.
@@ -855,16 +1253,18 @@ Coverage includes:
   (not the SQLite/fake overrides) — see `tests/conftest.py` for how the
   suite keeps that fast and deterministic without requiring real infra.
 
-## 20. Future Roadmap (Phases 5–15, not yet built)
+## 21. Future Roadmap (Phases 6–15, not yet built)
 
-Kubernetes/GKE deployment, autoscaling (HPA), chunked/resumable uploads,
-sharing & permissions between users, virus scanning integration, thumbnail
-generation, full-text content search, Pub/Sub-driven background workers,
-real rate limiting, Redis metadata caching, CI/CD via GitHub Actions,
-Terraform IaC, Cloud Armor, Cloud CDN, observability (Cloud Monitoring/
-Logging dashboards, OpenTelemetry tracing).
+Chunked/resumable uploads, sharing & permissions between users, virus
+scanning integration, thumbnail generation, full-text content search,
+Pub/Sub-driven background workers, real rate limiting, Redis metadata
+caching, CI/CD via GitHub Actions, Terraform IaC, Cloud Armor, Cloud
+CDN, observability (Cloud Monitoring/Logging dashboards, OpenTelemetry
+tracing), multi-region deployment, disaster recovery. Kubernetes/GKE
+deployment and autoscaling (HPA) — previously listed here — shipped in
+Phase 5; see §12.
 
-## 21. Contribution Guide
+## 22. Contribution Guide
 
 1. Create a feature branch from `main`.
 2. Keep business logic in `services/`, persistence in `repositories/` — never
