@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------
+# Ingress (Phase 5) — GKE native Ingress -> Google Cloud Load Balancer
+# ---------------------------------------------------------------------
+# Request flow, end to end:
+#   1. Client resolves `api.nimbusfs.example.com` to the Ingress's
+#      reserved static IP (Cloud DNS / any registrar — see
+#      k8s/README.md).
+#   2. Request hits Google's global external HTTPS Load Balancer (this
+#      Ingress object is what PROVISIONS that GCLB — `ingressClassName:
+#      gce` tells GKE to use its built-in controller, not a 3rd-party
+#      nginx-ingress, to reconcile it).
+#   3. GCLB terminates TLS using the ManagedCertificate (14) and, if the
+#      request arrived on plain HTTP, the FrontendConfig (13) 301s it to
+#      HTTPS first.
+#   4. GCLB matches host + path against the rules below and forwards to
+#      the matched backend Service's NEG (container-native load
+#      balancing — see 08-service.yaml's `cloud.google.com/neg`
+#      annotation) — this hop goes DIRECTLY to a healthy Pod IP, not
+#      through an extra kube-proxy/iptables hop.
+#   5. The BackendConfig (12)'s health check is what GCLB uses to decide
+#      which Pod IPs in that NEG are eligible to receive traffic at all.
+#   6. The Pod handles the request through the normal FastAPI stack —
+#      TrustedProxyMiddleware (Phase 4) reads the `X-Forwarded-For`/
+#      `-Proto` headers GCLB sets, so the app sees the real client IP
+#      and knows the original request was HTTPS even though the Pod
+#      itself only ever speaks plain HTTP on its ClusterIP.
+#
+# Path routing today is a single catch-all to the one existing service
+# — `/api/v1` is already baked into the app's own routing
+# (`Settings.API_V1_PREFIX`), so no path rewriting happens at the
+# Ingress layer. Future API versioning (a hypothetical `/api/v2`
+# talking to a DIFFERENT backend Service entirely, e.g. during a
+# breaking-change migration) is a straightforward SECOND `path` rule
+# added under the same `host` below, routed to a different
+# `backend.service.name` — the Ingress object doesn't need to change
+# shape to support it, only grow a second rule.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nimbusfs-ingress
+  namespace: nimbusfs
+  annotations:
+    kubernetes.io/ingress.class: "gce" # (legacy-form annotation, kept alongside ingressClassName below for GKE controller versions that still read it)
+    kubernetes.io/ingress.global-static-ip-name: "nimbusfs-ip" # reserved via `gcloud compute addresses create nimbusfs-ip --global` — see k8s/README.md — so the IP survives Ingress recreation.
+    networking.gke.io/managed-certificates: "nimbusfs-cert"
+    networking.gke.io/v1beta1.FrontendConfig: "nimbusfs-frontendconfig"
+    kubernetes.io/ingress.allow-http: "true" # HTTP listener stays up specifically so FrontendConfig's redirect (not a dropped connection) is what a plain-HTTP client sees.
+spec:
+  ingressClassName: gce
+  rules:
+    - host: api.nimbusfs.example.com # replace with the real production domain — must match the ManagedCertificate's domain (14) exactly.
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nimbusfs-api
+                port:
+                  name: http
+  # No explicit `tls:` block: the ManagedCertificate CRD + annotation
+  # above is GKE's declarative alternative to the plain-Kubernetes
+  # `spec.tls` (which would require a manually-provisioned cert Secret)
+  # — the two are mutually exclusive ways of getting HTTPS on the same
+  # object; this manifest uses the Google-managed path deliberately for
+  # the auto-renewal properties described in 14-managedcertificate.yaml.
