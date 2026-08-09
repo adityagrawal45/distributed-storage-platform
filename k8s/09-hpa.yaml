@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------
+# HorizontalPodAutoscaler (Phase 5)
+# ---------------------------------------------------------------------
+# Automatically adjusts `nimbusfs-api`'s replica count between 3 and 10
+# based on observed load, so the fleet grows/shrinks with demand instead
+# of being sized (and paid for) at a fixed worst-case guess. This is
+# only safe/correct because of Phase 4's statelessness guarantee — an
+# autoscaler killing/creating Pods on a stateful service would drop
+# in-flight session state; here it never does, because there IS no
+# per-Pod state to drop.
+#
+# `autoscaling/v2` (not `v1`) specifically because it supports multiple
+# metrics (CPU AND memory here) and the `behavior` block below — v1
+# only supports a single CPU-utilization target with no scale-down
+# tuning, which is not production-safe on its own (see "Cooldown"
+# below).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nimbusfs-api-hpa
+  namespace: nimbusfs
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nimbusfs-api
+
+  minReplicas: 3 # never scale below the same floor used for pod anti-affinity/PDB reasoning — fewer than 3 undermines the "survive a zone outage" story.
+  maxReplicas: 10 # ceiling sized to the ResourceQuota (01-resourcequota.yaml) headroom — raising this without raising quota would just make Pods Pending instead of scaling.
+
+  metrics:
+    # Scale on CPU: the primary signal for an I/O-bound-but-not-idle
+    # FastAPI/uvicorn workload — request handling, JSON
+    # serialization, and (per Phase 3) synchronous GCS SDK calls
+    # off-loaded via asyncio.to_thread still consume worker-thread CPU.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70 # target 70% of the *requested* 250m per Pod — leaves burst headroom (limit 500m) before throttling, and triggers scale-out before Pods are already saturated.
+    # Scale on memory too: uploads/downloads (Phase 3) stream through
+    # the process; a burst of large concurrent uploads raises memory
+    # pressure independent of CPU. Without this second metric, a
+    # memory-bound overload would just OOM-kill Pods in a loop instead
+    # of triggering horizontal scale-out.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  # -------------------------------------------------------------
+  # Scaling behavior: separate policies for scale-up vs scale-down are
+  # the actual production-safety knob here — symmetric behavior is the
+  # classic HPA misconfiguration (thrashing: scale to 10, load dips
+  # for 30s, scale back to 3, load returns, repeat).
+  # -------------------------------------------------------------
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0 # react to a load spike immediately — under-provisioning during a real spike (e.g. an upload burst) is worse than a brief over-scale.
+      policies:
+        - type: Percent
+          value: 100 # allowed to double the replica count...
+          periodSeconds: 60 # ...at most once per 60s — bounds how fast the fleet grows so it doesn't overshoot past what's actually needed before metrics catch up.
+        - type: Pods
+          value: 4
+          periodSeconds: 60 # ...or add at most 4 Pods per 60s, whichever policy is LESS restrictive (HPA takes the max of the two by default for scale-up) — the Percent rule dominates early (3->6) while absolute Pods rule caps runaway growth once large (8->10 not 8->16).
+      selectPolicy: Max
+    scaleDown:
+      # This is the important asymmetry: wait 5 minutes of SUSTAINED
+      # lower load before removing a single Pod. HPA scale-down
+      # decisions look back across this whole window and use the
+      # HIGHEST recommendation seen in it — a brief dip mid-window
+      # does NOT trigger scale-down, only a genuinely sustained one
+      # does. This is the direct fix for the thrashing scenario above.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25 # remove at most 25% of current replicas...
+          periodSeconds: 60 # ...per 60s — scale-down is deliberately gradual, since removing capacity too fast right after a load spike subsides risks a second spike catching the fleet undersized again.
+      selectPolicy: Max
