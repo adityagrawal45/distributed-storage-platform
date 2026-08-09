@@ -1,0 +1,125 @@
+# ---------------------------------------------------------------------
+# NetworkPolicy (Phase 5) — zero-trust networking
+# ---------------------------------------------------------------------
+# Zero trust here means: a Pod's ability to send/receive traffic is
+# DENIED by default and each real, necessary path is allow-listed
+# explicitly, rather than allowing everything and trying to enumerate
+# what to block. GKE only enforces NetworkPolicy on clusters created
+# with network policy enforcement enabled (Calico/Dataplane V2) — see
+# k8s/README.md "GKE Cluster Design" for the `--enable-dataplane-v2`
+# cluster-creation flag this depends on.
+#
+# Three objects:
+#   1. A default-deny-all baseline (every Pod in the namespace).
+#   2. An explicit ingress allow for the two things that must reach
+#      these Pods: the GCLB's health-checking IP ranges (Ingress,
+#      09-ingress.yaml, since NEG-mode load balancing — see
+#      08-service.yaml — has the GCLB probe Pods directly) and other
+#      Pods in this same namespace (future intra-namespace
+#      microservice calls).
+#   3. An explicit egress allow for the four things these Pods must
+#      reach out to: DNS, Cloud SQL, Memorystore Redis, and Google
+#      APIs (GCS, over Private Google Access).
+# ---------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: nimbusfs
+spec:
+  podSelector: {} # applies to every Pod in this namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  # No `ingress`/`egress` rules listed -> nothing is allowed by this
+  # policy. Kubernetes NetworkPolicies are additive: this Pod's actual
+  # allowed traffic is the UNION of every policy that selects it, so
+  # the allow-rules below layer on top of this baseline rather than
+  # replacing it.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nimbusfs-api-allow-ingress
+  namespace: nimbusfs
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    # Google Cloud Load Balancer health-check + proxy source ranges.
+    # These are Google-documented, stable ranges (not project-specific)
+    # for both classic and Envoy-based GCLB — required so the GCLB can
+    # health-check Pods directly via NEG (08-service.yaml's
+    # `cloud.google.com/neg` annotation) and forward real traffic.
+    - from:
+        - ipBlock:
+            cidr: 130.211.0.0/22
+        - ipBlock:
+            cidr: 35.191.0.0/16
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Other Pods in this namespace — e.g. a future sibling
+    # microservice calling NimbusFS's API directly over ClusterIP
+    # rather than round-tripping out through the public Ingress.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nimbusfs-api-allow-egress
+  namespace: nimbusfs
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Egress
+  egress:
+    # DNS — required for literally everything else below to resolve;
+    # without this rule, a default-deny Pod can't even look up its own
+    # Cloud SQL/Redis hostnames (or, since ConfigMap uses raw private
+    # IPs here, at minimum Kubernetes' own service discovery breaks).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Cloud SQL PostgreSQL — private IP, replace with the real /32 or
+    # the VPC subnet range once the instance exists (k8s/README.md
+    # "Cluster Setup").
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/24 # placeholder: Cloud SQL private-services-access range
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Memorystore Redis — private IP within the cluster's VPC.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/24 # placeholder: Memorystore reserved IP range
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Google APIs (Cloud Storage, IAM token exchange for Workload
+    # Identity) via Private Google Access — the `private.googleapis.com`
+    # / `restricted.googleapis.com` VIP ranges, NOT the public internet.
+    # This is what keeps GCS traffic off the public internet entirely
+    # even though this Pod has no other internet egress.
+    - to:
+        - ipBlock:
+            cidr: 199.36.153.8/30 # restricted.googleapis.com VIP range
+      ports:
+        - protocol: TCP
+          port: 443
