@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# Phase 5: real Kubernetes Secret manifest — never commit actual
+# secrets. Copy k8s/06-secret.example.yaml to k8s/06-secret.yaml
+# locally (gitignored), or better, create the Secret imperatively via
+# `kubectl create secret` per k8s/README.md — never write it to disk.
+k8s/06-secret.yaml
