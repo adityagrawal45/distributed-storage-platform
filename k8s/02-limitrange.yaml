@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------
+# LimitRange (Phase 5)
+# ---------------------------------------------------------------------
+# Where ResourceQuota (01) caps the namespace's TOTAL consumption,
+# LimitRange constrains what a SINGLE container is allowed to request —
+# it's the guardrail against a future manifest (this Deployment or any
+# other added to this namespace later) omitting requests/limits
+# entirely (which would make it `BestEffort` QoS — first in line to be
+# OOM-killed under node pressure) or requesting something absurd that
+# alone exhausts the quota above.
+#
+# `default`/`defaultRequest` also mean any container that DOES omit
+# requests/limits gets sane values injected automatically rather than
+# silently falling back to unbounded.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: nimbusfs-limits
+  namespace: nimbusfs
+spec:
+  limits:
+    - type: Container
+      default: # applied if a container omits `limits`
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest: # applied if a container omits `requests`
+        cpu: 250m
+        memory: 256Mi
+      min:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "2"
+        memory: 2Gi
