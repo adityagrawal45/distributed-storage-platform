@@ -1,0 +1,296 @@
+# ---------------------------------------------------------------------
+# Deployment (Phase 5)
+# ---------------------------------------------------------------------
+# This is the object that makes Phase 4's "every server is
+# interchangeable" claim real: it manages a ReplicaSet, which in turn
+# owns N identical Pods, continuously reconciling actual state toward
+# this desired spec. Every field below is explained where it appears —
+# see k8s/README.md "How Self-Healing Works" for the Delete-a-Pod
+# demonstration referenced inline.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbusfs-api
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: api
+spec:
+  # Desired steady-state replica count. The HPA (06-hpa.yaml) manages
+  # this field at runtime (3 -> 10 under load) — it's set here only as
+  # the value `kubectl apply` reconciles to if the HPA is ever removed,
+  # and as the HPA's own configured `minReplicas` floor.
+  replicas: 3
+
+  # How the Deployment finds ITS OWN Pods among all Pods in the
+  # namespace, to know which ones belong to this ReplicaSet. Must be a
+  # subset of (and, in practice as here, identical to) the Pod
+  # template's own labels below — this is what lets `kubectl delete
+  # pod <one-pod>` (see k8s/README.md's self-healing demo) still leave
+  # the Deployment able to notice "actual replicas (2) != desired (3)"
+  # and schedule a replacement.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: api
+
+  # ---------------------------------------------------------------
+  # Rolling update strategy — how a new image version replaces the old
+  # one with zero downtime (see k8s/README.md "Deploy v2, Rollback to
+  # v1" walkthrough).
+  # ---------------------------------------------------------------
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Max Pods that may be unavailable during the rollout, relative to
+      # `replicas`. 0 means Kubernetes must bring up a replacement
+      # BEFORE removing an old Pod — true zero-downtime, at the cost of
+      # briefly running more than `replicas` Pods (bounded by maxSurge).
+      # This is safe specifically BECAUSE the app is stateless (Phase
+      # 4): an old and new Pod serving traffic simultaneously never
+      # causes a consistency problem, since neither holds state the
+      # other doesn't also see via Postgres/Redis/GCS.
+      maxUnavailable: 0
+      # Max EXTRA Pods (above `replicas`) allowed during rollout. 1
+      # means the rollout replaces Pods one at a time: bring up 1 new
+      # (now at 4/3), wait for it to pass readiness, remove 1 old (back
+      # to 3/3), repeat. Slower than a larger surge but minimizes the
+      # blast radius of a bad new image — the readiness probe (below)
+      # is what stops a broken rollout from ever exceeding 1 bad Pod
+      # receiving traffic.
+      maxSurge: 1
+
+  # Grace period between SIGTERM and SIGKILL when a Pod is terminated
+  # (rollout, scale-down, or eviction). Set slightly above
+  # `SHUTDOWN_GRACE_PERIOD_SECONDS` (app/core/config/settings.py, 10s)
+  # so the application's own graceful-shutdown logic (app/main.py
+  # lifespan: stop accepting new work, close DB/Redis pools) always
+  # finishes before Kubernetes escalates to a hard kill.
+  minReadySeconds: 5 # a Pod must stay Ready this long before counting as "available" during rollout — absorbs a flapping readiness probe.
+  progressDeadlineSeconds: 300 # if the rollout hasn't progressed in 5 minutes, the Deployment is marked Failed — surfaces a stuck rollout instead of hanging forever.
+
+  # Number of old ReplicaSets kept around (scaled to 0) for instant
+  # `kubectl rollout undo` — see k8s/README.md's rollback demo.
+  revisionHistoryLimit: 5
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nimbusfs
+        app.kubernetes.io/component: api
+      annotations:
+        # -----------------------------------------------------------
+        # Observability preparation (Phase 5 scope: annotate only, do
+        # not install a scrape/collection stack).
+        # -----------------------------------------------------------
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/api/v1/health" # placeholder until a real /metrics endpoint exists (future phase)
+    spec:
+      serviceAccountName: nimbusfs-ksa # Workload Identity — see 03-serviceaccount.yaml
+      terminationGracePeriodSeconds: 15
+
+      # -------------------------------------------------------------
+      # Pod-level security context — satisfies the namespace's `restricted`
+      # Pod Security Admission profile (00-namespace.yaml).
+      # -------------------------------------------------------------
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # matches the `nimbusfs` user created in docker/Dockerfile
+        runAsGroup: 1000
+        fsGroup: 1000 # so the mounted /tmp emptyDir (below) is group-writable by that same UID
+        seccompProfile:
+          type: RuntimeDefault
+
+      # -------------------------------------------------------------
+      # Scheduling: spread replicas for real fault tolerance, not just
+      # replica *count*. 3 Pods on one node is not high availability —
+      # one node failure would take the whole service down.
+      # -------------------------------------------------------------
+      affinity:
+        # Pod anti-affinity: prefer scheduling this Deployment's own
+        # Pods onto DIFFERENT nodes (and, more strongly, different
+        # zones) from each other. `preferred...` (soft), not
+        # `required...` (hard) — with only 3 nodes/zones available a
+        # hard requirement could leave a Pod permanently Pending during
+        # a node pool resize; soft anti-affinity degrades gracefully
+        # instead of blocking scheduling.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: api
+                topologyKey: topology.kubernetes.io/zone # spread across zones first — survives a full zone outage
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: api
+                topologyKey: kubernetes.io/hostname # then across individual nodes within a zone
+        # Node affinity: prefer the dedicated application node pool
+        # (see k8s/README.md "Node Pools") over the default/system pool,
+        # so app Pods aren't competing with cluster add-ons for capacity.
+        # Soft again — falls back to any node rather than going Pending
+        # if that pool is momentarily full.
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: cloud.google.com/gke-nodepool
+                    operator: In
+                    values: ["nimbusfs-app-pool"]
+
+      containers:
+        - name: nimbusfs-api
+          # Pin to an immutable tag (a Git SHA or semver, from Artifact
+          # Registry — see k8s/README.md "CI/CD Preparation"), never
+          # `:latest`. `:latest` makes rollback meaningless (there's no
+          # way to know what "latest" pointed to yesterday) and defeats
+          # `kubectl rollout undo`, which works by re-pointing at a
+          # PREVIOUS, DISTINCT image reference.
+          image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
+          imagePullPolicy: IfNotPresent # safe (not Always) precisely BECAUSE the tag above is immutable — this tag will only ever point at one image, so caching it is free.
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          # ---------------------------------------------------------
+          # Configuration: env vars from ConfigMap + Secret, exactly as
+          # `app/core/config/settings.py` (Pydantic Settings) already
+          # expects — zero application code changes needed for this
+          # phase.
+          # ---------------------------------------------------------
+          envFrom:
+            - configMapRef:
+                name: nimbusfs-config
+            - secretRef:
+                name: nimbusfs-secrets
+
+          # ---------------------------------------------------------
+          # Resource requests & limits — see k8s/README.md "Quality of
+          # Service" for the Guaranteed/Burstable/BestEffort explainer.
+          # requests != limits below means this Pod's QoS class is
+          # Burstable: guaranteed at least `requests`, allowed to burst
+          # up to `limits` when spare node capacity exists, first in
+          # line for eviction under node memory pressure only after
+          # any BestEffort Pods. This is the right trade-off for a
+          # bursty HTTP API (upload spikes) that isn't so critical it
+          # needs the stronger (and more wasteful) Guaranteed class
+          # (requests == limits).
+          # ---------------------------------------------------------
+          resources:
+            requests:
+              cpu: 250m # 0.25 vCPU baseline — sized from steady-state request handling, not peak.
+              memory: 256Mi
+              ephemeral-storage: 256Mi # covers /tmp scratch space (see volumeMounts) and container writable layers.
+            limits:
+              cpu: 500m # hard ceiling; a runaway request loop is throttled, not allowed to starve neighbors.
+              memory: 512Mi # hard ceiling; EXCEEDING memory (unlike CPU) gets the container OOM-killed, not throttled — sized with headroom above steady-state RSS.
+              ephemeral-storage: 512Mi
+
+          # ---------------------------------------------------------
+          # Probes — three distinct checks, matching the three distinct
+          # endpoints Phase 4 built specifically for this
+          # (app/api/v1/health/routes.py). See k8s/README.md "Health
+          # Probes" for the full failure/recovery flow.
+          # ---------------------------------------------------------
+
+          # Startup probe: gives the app up to 30s (10 x 3s) to finish
+          # its Phase-4 fail-fast startup sequence (connect DB, connect
+          # Redis, verify the GCS bucket — app/main.py's
+          # `_verify_critical_dependencies`) before liveness/readiness
+          # start being evaluated at all. Without this, a liveness probe
+          # with a short `initialDelaySeconds` could kill a Pod that's
+          # simply still connecting to a Cloud SQL instance on a cold
+          # start, causing a restart loop that never actually converges.
+          startupProbe:
+            httpGet:
+              path: /api/v1/live
+              port: http
+            periodSeconds: 3
+            failureThreshold: 10 # 10 x 3s = 30s ceiling for startup before liveness takes over and restarts the Pod.
+            timeoutSeconds: 2
+
+          # Liveness probe: "is the process able to respond at all?"
+          # Intentionally hits `/live` (Phase 4: zero dependency checks,
+          # answers in constant time) — NEVER `/health` or `/ready` here.
+          # If a slow/unreachable Cloud SQL instance made liveness fail,
+          # Kubernetes would restart Pods in response to a DATABASE
+          # problem, which doesn't fix the database and just adds a
+          # restart storm on top. On failure (3 consecutive misses over
+          # 30s): kubelet sends SIGTERM, waits
+          # `terminationGracePeriodSeconds`, then SIGKILL, and the
+          # ReplicaSet schedules a fresh replacement Pod.
+          livenessProbe:
+            httpGet:
+              path: /api/v1/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Readiness probe: "can this Pod accept traffic RIGHT NOW?"
+          # Hits `/ready` (Phase 4: real DB/Redis/Storage checks,
+          # `503` if any is down). On failure, the Pod is NOT
+          # restarted — it's removed from the Service's Endpoints
+          # object (see 08-service.yaml) so the Service/Ingress simply
+          # stop routing traffic to it, while the kubelet keeps
+          # checking in the background. The instant `/ready` succeeds
+          # again (successThreshold: 1), the Pod is re-added to
+          # Endpoints and traffic resumes — no restart, no cold start,
+          # just a brief traffic pause for that one Pod.
+          readinessProbe:
+            httpGet:
+              path: /api/v1/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+
+          # ---------------------------------------------------------
+          # Graceful shutdown: preStop + terminationGracePeriodSeconds
+          # work together to close the well-known Kubernetes race
+          # between "Pod marked Terminating" and "Service's iptables/
+          # IPVS rules updated to stop sending it new connections" —
+          # those two things happen concurrently, not sequentially, so
+          # a Pod that dies the instant SIGTERM arrives can drop
+          # requests that were already in flight to it. Sleeping briefly
+          # in preStop before SIGTERM is even sent gives kube-proxy/the
+          # Ingress controller time to converge first.
+          # ---------------------------------------------------------
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+          # `readOnlyRootFilesystem` (Pod Security "restricted" profile
+          # requirement, and good practice regardless: the app is
+          # stateless — Phase 4 — so it has no legitimate reason to
+          # write to its own container filesystem). The one thing
+          # Python/uvicorn may still want to write to is /tmp (e.g.
+          # multipart upload spooling for very large files before
+          # streaming to GCS) — satisfied via the `tmp` emptyDir volume
+          # below rather than relaxing this to `false`.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi # bounded, ephemeral, node-local scratch space only — never a substitute for the GCS-backed persistence this app actually uses.
