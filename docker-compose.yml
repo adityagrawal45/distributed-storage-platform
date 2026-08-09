@@ -31,7 +31,17 @@ services:
     restart: unless-stopped
 
   app:
-    build: .
+    # Phase 5: builds from the same canonical multi-stage Dockerfile
+    # used to produce the image GKE deploys (see docker/Dockerfile's own
+    # header comment) — local dev and production run the identical
+    # image, differing only in the `command:` override below (--reload)
+    # and env vars, never in a separately-maintained Dockerfile.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_VERSION: ${BUILD_VERSION:-dev-local}
     container_name: file_storage_app
     ports:
       - "8000:8000"
