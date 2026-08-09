@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------
+# PodDisruptionBudget (Phase 5)
+# ---------------------------------------------------------------------
+# Distinguishes two very different kinds of Pod loss:
+#   - INVOLUNTARY disruption (node crash, kernel panic, AZ outage) — a
+#     PDB cannot prevent these; nothing can.
+#   - VOLUNTARY disruption (a cluster operator draining a node for a
+#     GKE node upgrade, the Cluster Autoscaler scaling a node pool
+#     down, a manual `kubectl drain`) — a PDB CAN and DOES block these,
+#     specifically to protect availability during otherwise-routine
+#     maintenance.
+#
+# `minAvailable: 2` (against a floor of 3 replicas — see the HPA's
+# `minReplicas`) means the Eviction API will refuse to evict a Pod if
+# doing so would drop available replicas below 2 — a node drain during
+# a GKE control-plane/node upgrade is forced to proceed one Pod at a
+# time, waiting for each evicted Pod's replacement to become Ready
+# before touching the next node, rather than potentially draining all
+# 3 Pods' nodes back-to-back and taking the whole service down mid-
+# upgrade.
+#
+# `minAvailable` (not `maxUnavailable`) chosen so the guarantee reads
+# as an absolute floor regardless of what `replicas` is scaled to by
+# the HPA at the moment maintenance happens.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nimbusfs-api-pdb
+  namespace: nimbusfs
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: api
