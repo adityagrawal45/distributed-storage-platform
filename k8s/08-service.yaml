@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------
+# Service (Phase 5) — ClusterIP
+# ---------------------------------------------------------------------
+# A Service is a stable virtual IP + DNS name in front of a set of Pods
+# that come and go (rollouts, scale events, crashes). Without it,
+# nothing in the cluster — least of all the Ingress (09-ingress.yaml)
+# — would have a fixed address to send traffic to; Pod IPs are
+# ephemeral by design and change on every reschedule.
+#
+# `type: ClusterIP` (the default, stated explicitly here) means this IP
+# is only reachable INSIDE the cluster's VPC-native network — it is not
+# itself internet-facing. That's intentional layering: the GKE Ingress
+# (09-ingress.yaml) creates the actual internet-facing Google Cloud Load
+# Balancer, which then forwards to this ClusterIP Service as its
+# backend. NimbusFS never exposes a `LoadBalancer`-type Service directly
+# — going through Ingress is what buys host/path routing, a shared
+# GCLB IP across future services, and centralized TLS termination (see
+# 09-ingress.yaml).
+#
+# Service discovery / DNS: kube-dns (or Cloud DNS for GKE's managed DNS
+# option) automatically registers this Service as
+# `nimbusfs-api.nimbusfs.svc.cluster.local` — any future in-cluster
+# microservice (Phase 5's "future microservices compatibility" goal)
+# reaches NimbusFS by that name (or the short form `nimbusfs-api` from
+# within the same namespace) with zero hardcoded IPs, and kube-proxy
+# load-balances across every Pod currently listed in this Service's
+# Endpoints object — which is exactly the set of Pods currently passing
+# their readiness probe (see 07-deployment.yaml).
+apiVersion: v1
+kind: Service
+metadata:
+  name: nimbusfs-api
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: api
+  annotations:
+    # Tells the GKE Ingress controller which health check to program
+    # onto the Google Cloud Load Balancer's backend service — see
+    # 09-ingress.yaml's BackendConfig, which this annotation references.
+    cloud.google.com/backend-config: '{"default": "nimbusfs-backendconfig"}'
+    # Enables container-native load balancing (Pods as GCLB backends
+    # directly via a Network Endpoint Group, bypassing an extra
+    # kube-proxy hop) — the standard, recommended pairing with GKE
+    # Ingress on VPC-native clusters.
+    cloud.google.com/neg: '{"ingress": true}'
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 80 # what other in-cluster clients / the Ingress address this Service as
+      targetPort: http # named container port from the Deployment (8000) — decoupled so the container port can change without touching this Service
+      protocol: TCP
+  # Does NOT affect Ingress/GCLB traffic (GCLB terminates externally and
+  # forwards via NEG, bypassing this entirely) — only relevant for
+  # traffic from other in-cluster clients hitting this ClusterIP
+  # directly. `ClientIP` would pin a client to one backend Pod for a
+  # window; left at the default `None` (round-robin-ish via
+  # kube-proxy/iptables) since NimbusFS is stateless — Phase 4 — so
+  # session affinity would only add uneven load distribution for no
+  # benefit.
+  sessionAffinity: None
