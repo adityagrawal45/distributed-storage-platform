@@ -1,0 +1,29 @@
+# ---------------------------------------------------------------------
+# ResourceQuota (Phase 5)
+# ---------------------------------------------------------------------
+# Caps TOTAL resource consumption across every Pod in the `nimbusfs`
+# namespace, independent of any single Deployment's own
+# requests/limits (07-deployment.yaml). This is the safety net against
+# the HPA (06-hpa.yaml) scaling to its configured max (10 replicas)
+# *plus* some future second Deployment in this namespace *plus* a
+# misconfigured manifest, all at once, starving the rest of the
+# cluster (or other namespaces sharing it) of capacity.
+#
+# Sizing: 10 replicas x (500m CPU limit, 512Mi memory limit — see
+# Deployment) = 5 CPU / 5Gi at the HPA's own ceiling, so quota is set
+# with headroom above that for one-off Jobs/debug Pods without being
+# effectively unlimited.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: nimbusfs-quota
+  namespace: nimbusfs
+spec:
+  hard:
+    requests.cpu: "6"
+    requests.memory: 6Gi
+    limits.cpu: "8"
+    limits.memory: 8Gi
+    pods: "20"
+    services: "10"
+    persistentvolumeclaims: "0" # NimbusFS is stateless by design (Phase 4) — no PVCs should ever be created here.
