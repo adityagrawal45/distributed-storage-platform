@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------
+# BackendConfig (Phase 5) — GKE-specific CRD
+# ---------------------------------------------------------------------
+# The Google Cloud Load Balancer created by the Ingress (15-ingress.yaml)
+# health-checks backends using ITS OWN health-check object, separate
+# from (though ideally aligned with) the Kubernetes readiness probe —
+# this CRD is how that GCLB-level health check is configured
+# declaratively instead of by hand in the Cloud Console. Referenced from
+# 08-service.yaml's `cloud.google.com/backend-config` annotation.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: nimbusfs-backendconfig
+  namespace: nimbusfs
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /api/v1/ready # same endpoint the Kubernetes readiness probe uses (07-deployment.yaml) — keeps GCLB-level and kubelet-level "is this backend ready" answers consistent.
+    port: 8000
+    checkIntervalSec: 10
+    timeoutSec: 3
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+  # Connection draining: when a backend Pod is removed (rollout,
+  # scale-down, or a failed health check), GCLB stops sending it NEW
+  # requests immediately but keeps existing in-flight connections alive
+  # for this many seconds instead of severing them — the GCLB-level
+  # counterpart to the Pod's own `preStop` sleep + graceful-shutdown
+  # lifespan (app/main.py), applied one layer up the stack.
+  connectionDraining:
+    drainingTimeoutSec: 30
+  # Client requests idle for longer than this are closed by GCLB.
+  # Comfortably above what any NimbusFS endpoint needs, including a
+  # large streamed upload/download (Phase 3) on a slow connection.
+  timeoutSec: 60
