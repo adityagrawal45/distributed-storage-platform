@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------
+# FrontendConfig (Phase 5) — GKE-specific CRD
+# ---------------------------------------------------------------------
+# Configures the GCLB's FRONTEND (the internet-facing side, as opposed
+# to BackendConfig's backend-facing health checks). Its one job here:
+# force HTTP -> HTTPS redirect at the load balancer, so
+# `http://api.nimbusfs.example.com/...` never reaches the application
+# in plaintext — it 301s to HTTPS before the request goes anywhere near
+# a Pod. Referenced from the Ingress (15-ingress.yaml) via the
+# `networking.gke.io/v1beta1.FrontendConfig` annotation.
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: nimbusfs-frontendconfig
+  namespace: nimbusfs
+spec:
+  redirectToHttps:
+    enabled: true
+    responseCodeName: MOVED_PERMANENTLY_DEFAULT # 301
