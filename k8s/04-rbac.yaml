@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------
+# Role + RoleBinding (Phase 5) — least-privilege Kubernetes API access
+# ---------------------------------------------------------------------
+# NimbusFS's application code never calls the Kubernetes API today — all
+# its configuration arrives as environment variables at container start
+# (see ConfigMap/Secret, 05/06), not via live API reads. This Role is
+# therefore intentionally almost empty: `get`/`list`/`watch` on this
+# namespace's own ConfigMap and Secret ONLY, nothing else — no pods, no
+# exec, no cluster-scoped anything.
+#
+# Why bind it at all if the app doesn't use it? Two reasons:
+#   1. Defense in depth / least privilege as a stated policy, not an
+#      accident of omission — a Pod with NO Role bound still gets a
+#      default token that, combined with a future RBAC misconfiguration
+#      elsewhere, could be more than this. An explicit, minimal Role
+#      documents and enforces the ceiling.
+#   2. Forward-compatibility: a future phase (e.g. a readiness gate
+#      controller, or hot-reloading config via the Kubernetes watch API
+#      instead of a Pod restart) would need exactly this — read-only
+#      access to its own namespace's config — and it's already here.
+#
+# Deliberately a Role (namespace-scoped), never a ClusterRole — this
+# service has no legitimate reason to read anything outside its own
+# namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nimbusfs-app-role
+  namespace: nimbusfs
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    resourceNames: ["nimbusfs-config", "nimbusfs-secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nimbusfs-app-rolebinding
+  namespace: nimbusfs
+subjects:
+  - kind: ServiceAccount
+    name: nimbusfs-ksa
+    namespace: nimbusfs
+roleRef:
+  kind: Role
+  name: nimbusfs-app-role
+  apiGroup: rbac.authorization.k8s.io
