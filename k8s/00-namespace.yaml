@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------
+# Namespace (Phase 5)
+# ---------------------------------------------------------------------
+# Every NimbusFS Kubernetes object lives in its own namespace rather than
+# `default`. This buys three things even for a single-service cluster:
+#   1. Blast radius: a `kubectl delete --all` mistake in this namespace
+#      can never touch cluster-system objects (kube-system, ingress
+#      controllers) or, later, sibling microservices in their own
+#      namespaces.
+#   2. RBAC scoping: Role/RoleBinding (see 04-rbac.yaml) bind to a
+#      namespace, not the whole cluster — least privilege is only
+#      expressible if there's a namespace boundary to express it against.
+#   3. ResourceQuota/LimitRange (see 01/02) are namespace-scoped by
+#      definition — this is the unit Kubernetes bills/limits against.
+#
+# `pod-security.kubernetes.io/enforce: restricted` opts the whole
+# namespace into the Pod Security Admission "restricted" profile —
+# GKE's built-in replacement for the deprecated PodSecurityPolicy. It
+# rejects any Pod spec that runs as root, allows privilege escalation,
+# or skips seccomp — enforced at admission time, not just documented as
+# a convention. The Deployment's securityContext (07-deployment.yaml)
+# is written to satisfy this profile.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/part-of: nimbusfs
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
