@@ -25,6 +25,11 @@ Design decisions:
   `get_settings()`) is ever imported, so the test suite trades that
   retry resilience for speed — this changes nothing about
   production/dev behavior, which reads these from the real environment.
+- Phase 6: `CHUNK_MIN_SIZE_BYTES` is similarly lowered for tests only —
+  the production default (1 MiB) would make every chunked-upload test
+  push real megabyte-sized byte buffers through SQLite/FakeGCSClient
+  for no benefit; a 1 KiB floor keeps `tests/test_chunked_upload.py`
+  fast while still exercising the exact same code paths.
 """
 
 import os
@@ -32,6 +37,7 @@ import os
 os.environ.setdefault("RETRY_MAX_ATTEMPTS", "1")
 os.environ.setdefault("RETRY_BASE_DELAY_SECONDS", "0.01")
 os.environ.setdefault("RETRY_MAX_DELAY_SECONDS", "0.05")
+os.environ.setdefault("CHUNK_MIN_SIZE_BYTES", "1024")
 
 from collections.abc import AsyncGenerator
 
