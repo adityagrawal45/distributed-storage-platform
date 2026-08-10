@@ -45,3 +45,21 @@ class BaseRepository(Generic[ModelType]):
     async def delete(self, entity: ModelType) -> None:
         await self._session.delete(entity)
         await self._session.flush()
+
+    async def flush(self) -> None:
+        """
+        Persists in-place mutations of an already-tracked entity (one
+        previously returned by `get_by_id`/`add`) without waiting for
+        the request-boundary commit in `app.database.session.get_db`.
+
+        Added for Phase 6: `ChunkedUploadService` mutates
+        `UploadSession.status` repeatedly within a single request (e.g.
+        UPLOADING -> COMPLETING -> COMPLETED) and needs later reads in
+        that same request/transaction to see the latest value —
+        `autoflush=False` on the session factory means that otherwise
+        wouldn't happen automatically. Existing services haven't needed
+        this because they either mutate-then-return (Phase 3's
+        `replace_file`) or only ever create new rows (`add`, which
+        already flushes internally).
+        """
+        await self._session.flush()
