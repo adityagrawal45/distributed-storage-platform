@@ -24,8 +24,11 @@ from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
+from app.repositories.upload_chunk_repository import UploadChunkRepository
+from app.repositories.upload_session_repository import UploadSessionRepository
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
+from app.services.chunked_upload_service import ChunkedUploadService
 from app.services.file_upload_service import FileUploadService
 from app.services.file_validation_service import FileValidationService
 from app.services.folder_service import FolderService
@@ -89,11 +92,21 @@ def get_file_version_repository(session: DbSession) -> FileVersionRepository:
     return FileVersionRepository(session)
 
 
+def get_upload_session_repository(session: DbSession) -> UploadSessionRepository:
+    return UploadSessionRepository(session)
+
+
+def get_upload_chunk_repository(session: DbSession) -> UploadChunkRepository:
+    return UploadChunkRepository(session)
+
+
 UserRepositoryDep = Annotated[UserRepository, Depends(get_user_repository)]
 RefreshTokenRepositoryDep = Annotated[RefreshTokenRepository, Depends(get_refresh_token_repository)]
 FolderRepositoryDep = Annotated[FolderRepository, Depends(get_folder_repository)]
 FileMetadataRepositoryDep = Annotated[FileMetadataRepository, Depends(get_file_metadata_repository)]
 FileVersionRepositoryDep = Annotated[FileVersionRepository, Depends(get_file_version_repository)]
+UploadSessionRepositoryDep = Annotated[UploadSessionRepository, Depends(get_upload_session_repository)]
+UploadChunkRepositoryDep = Annotated[UploadChunkRepository, Depends(get_upload_chunk_repository)]
 
 
 def get_auth_service(
@@ -158,6 +171,31 @@ def get_file_upload_service(
 
 
 FileUploadServiceDep = Annotated[FileUploadService, Depends(get_file_upload_service)]
+
+
+def get_chunked_upload_service(
+    upload_session_repository: UploadSessionRepositoryDep,
+    upload_chunk_repository: UploadChunkRepositoryDep,
+    file_repository: FileMetadataRepositoryDep,
+    folder_repository: FolderRepositoryDep,
+    version_repository: FileVersionRepositoryDep,
+    storage_service: StorageServiceDep,
+    validator: FileValidationServiceDep,
+    lock_factory: DistributedLockFactoryDep,
+) -> ChunkedUploadService:
+    return ChunkedUploadService(
+        upload_session_repository,
+        upload_chunk_repository,
+        file_repository,
+        folder_repository,
+        version_repository,
+        storage_service,
+        validator,
+        lock_factory,
+    )
+
+
+ChunkedUploadServiceDep = Annotated[ChunkedUploadService, Depends(get_chunked_upload_service)]
 
 
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
