@@ -47,6 +47,7 @@ Design decisions:
 """
 
 import asyncio
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -63,12 +64,19 @@ from app.exceptions.custom_exceptions import (
     StoragePermissionException,
     StorageTimeoutException,
     UploadFailedException,
+    ValidationException,
 )
 from app.logging.logger import get_logger
 
 logger = get_logger(__name__)
 
 DEFAULT_CHUNK_SIZE = 256 * 1024  # 256 KiB streaming chunk size
+
+# GCS hard limit on source objects per single Compose call (Phase 6) —
+# not configurable, it's a property of the GCS API itself. See
+# `compose_objects`'s docstring for how uploads with more parts than
+# this are handled via multi-stage composition.
+GCS_COMPOSE_MAX_SOURCES = 32
 
 
 @dataclass(frozen=True)
@@ -294,3 +302,134 @@ class StorageService:
 
         stored_checksum = (blob.metadata or {}).get("sha256")
         return blob.size == expected_size and stored_checksum == expected_checksum
+
+    # ------------------------------------------------------------------
+    # Chunked / resumable uploads (Phase 6)
+    # ------------------------------------------------------------------
+    # A single chunk lands via the same `upload()` method above — a
+    # chunk is just an ordinary, independent object as far as GCS is
+    # concerned (see ChunkedUploadService for why independent temp
+    # objects, not one shared resumable session, are what makes
+    # genuinely PARALLEL chunk uploads possible). The two methods below
+    # are what's new: merging those independent chunk objects into one
+    # final object, and computing a whole-object hash GCS's own Compose
+    # operation doesn't provide.
+
+    async def compose_objects(
+        self, destination_object_name: str, source_object_names: list[str], *, content_type: str | None = None
+    ) -> UploadResult:
+        """
+        Concatenates `source_object_names`, IN THE GIVEN ORDER, into
+        `destination_object_name` via GCS's native Compose operation.
+
+        GCS caps a single Compose call at `GCS_COMPOSE_MAX_SOURCES` (32)
+        source objects. For more than that, this recurses: batches of
+        <=32 are composed into intermediate composite objects, those
+        intermediates are composed together, and so on, until a single
+        call produces `destination_object_name` itself — this is what
+        the official docs describe as the pattern for composing more
+        than 32 parts (composite objects can themselves be Compose
+        sources). Intermediate objects are cleaned up here; the
+        original per-chunk temp objects are the caller's
+        (`ChunkedUploadService`) responsibility to delete once it has
+        confirmed the whole tree landed successfully.
+        """
+        if not source_object_names:
+            raise ValidationException("Cannot compose an upload with zero chunks.")
+
+        async def _compose_batch(dest_name: str, sources: list[str]) -> storage.Blob:
+            def _do_compose() -> storage.Blob:
+                bucket = self._bucket()
+                destination_blob = bucket.blob(dest_name)
+                if content_type:
+                    destination_blob.content_type = content_type
+                destination_blob.compose([bucket.blob(name) for name in sources])
+                destination_blob.reload()
+                return destination_blob
+
+            try:
+                return await asyncio.to_thread(_do_compose)
+            except Exception as exc:  # noqa: BLE001 - translated below
+                logger.error(
+                    "storage_compose_failed", destination=dest_name, source_count=len(sources), error=str(exc)
+                )
+                translated = _translate_gcs_error(exc, context="Compose")
+                raise UploadFailedException(translated.detail) from exc
+
+        logger.info(
+            "storage_compose_started", destination=destination_object_name, source_count=len(source_object_names)
+        )
+
+        current_layer = source_object_names
+        stage = 0
+        intermediate_objects: list[str] = []
+
+        while len(current_layer) > GCS_COMPOSE_MAX_SOURCES:
+            next_layer: list[str] = []
+            for batch_index, i in enumerate(range(0, len(current_layer), GCS_COMPOSE_MAX_SOURCES)):
+                batch = current_layer[i : i + GCS_COMPOSE_MAX_SOURCES]
+                intermediate_name = f"{destination_object_name}.compose-stage{stage}-{batch_index}"
+                await _compose_batch(intermediate_name, batch)
+                intermediate_objects.append(intermediate_name)
+                next_layer.append(intermediate_name)
+            current_layer = next_layer
+            stage += 1
+
+        final_blob = await _compose_batch(destination_object_name, current_layer)
+
+        if intermediate_objects:
+            await self.delete_many(intermediate_objects)
+
+        logger.info("storage_compose_completed", destination=destination_object_name, size=final_blob.size)
+        return UploadResult(
+            object_name=destination_object_name,
+            bucket_name=self._bucket_name,
+            etag=final_blob.etag,
+            size=final_blob.size,
+            storage_class=final_blob.storage_class,
+            # Composite objects don't carry a meaningful whole-object
+            # hash from GCS itself (no MD5; only CRC32C + component
+            # count) — the caller computes a real SHA-256 separately via
+            # `compute_object_checksum` if/when it needs one.
+            checksum="",
+        )
+
+    async def delete_many(self, object_names: list[str]) -> None:
+        """
+        Best-effort bulk cleanup. Deletes each object independently and
+        logs (never raises on) individual failures — used for temp
+        chunk/intermediate-compose objects AFTER the operation that
+        depended on them has already succeeded or independently failed;
+        a stray leftover temp object is a minor storage-cost issue, not
+        a correctness one, so it must never mask or replace the
+        caller's own success/failure outcome.
+        """
+        for name in object_names:
+            try:
+                await self.delete(name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("storage_bulk_delete_item_failed", object_name=name, error=str(exc))
+
+    async def compute_object_checksum(self, object_name: str) -> str:
+        """
+        Streams `object_name`'s full contents (bounded memory — reuses
+        the same chunked generator `stream_download` already uses) and
+        returns its SHA-256 hex digest.
+
+        Used exactly ONCE per chunked upload, at completion, to obtain a
+        platform-standard whole-file checksum for a freshly-composed
+        object — see `compose_objects`'s docstring for why GCS's own
+        Compose doesn't provide one. This is a deliberate, bounded
+        exception to "avoid routing bytes through the app": it's a
+        single read-through at the very end of an upload, not a proxy
+        for every byte transferred, and it never buffers more than one
+        `DEFAULT_CHUNK_SIZE` window in memory at a time.
+        """
+        hasher = hashlib.sha256()
+
+        def _read_all() -> None:
+            for chunk in self.stream_download(object_name):
+                hasher.update(chunk)
+
+        await asyncio.to_thread(_read_all)
+        return hasher.hexdigest()
