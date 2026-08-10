@@ -256,3 +256,83 @@ class IdempotencyKeyInProgressException(ConflictException):
 
     def __init__(self, detail: str = "A request with this Idempotency-Key is already being processed."):
         super().__init__(detail)
+
+
+# ---------------------------------------------------------------------
+# Chunked / Resumable Uploads (Phase 6)
+# ---------------------------------------------------------------------
+# Design note: every exception below deliberately subclasses an
+# ALREADY-REGISTERED base (NotFoundException, ConflictException,
+# ValidationException, NimbusFSException) rather than introducing new
+# ones. FastAPI/Starlette resolve exception handlers by walking the
+# raised type's MRO for the closest REGISTERED ancestor (see
+# app/main.py's registration order), so these get correct HTTP mapping
+# for free with zero new handler functions and zero main.py changes —
+# the same technique Phase 2's FolderNotFoundException/
+# DuplicateFolderException already relied on.
+class UploadSessionNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Upload session not found."):
+        super().__init__(detail)
+
+
+class ChunkNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Chunk not found."):
+        super().__init__(detail)
+
+
+class InvalidUploadStateTransitionException(NimbusFSException):
+    """Raised by `UploadStateMachine` when a requested state change isn't a valid transition."""
+
+    def __init__(self, detail: str = "This upload session cannot transition to the requested state."):
+        super().__init__(detail)
+
+
+class UploadSessionExpiredException(ConflictException):
+    def __init__(self, detail: str = "This upload session has expired."):
+        super().__init__(detail)
+
+
+class UploadAlreadyFinalizedException(ConflictException):
+    def __init__(self, detail: str = "This upload has already been completed."):
+        super().__init__(detail)
+
+
+class DuplicateChunkException(ConflictException):
+    """
+    Raised only for the narrow case of two genuinely concurrent requests
+    racing to write the SAME chunk number with DIFFERENT content — see
+    ChunkedUploadService. A retry of the SAME chunk number with
+    IDENTICAL content is treated as a safe no-op, not an error.
+    """
+
+    def __init__(self, detail: str = "This chunk is currently being written by another request."):
+        super().__init__(detail)
+
+
+class UploadIncompleteException(ValidationException):
+    def __init__(self, detail: str = "Cannot complete upload: one or more chunks are missing."):
+        super().__init__(detail)
+
+
+class ChunkSizeInvalidException(ValidationException):
+    def __init__(self, detail: str = "Chunk size is invalid for this upload session."):
+        super().__init__(detail)
+
+
+class ChunkNumberInvalidException(ValidationException):
+    def __init__(self, detail: str = "Chunk number is out of range for this upload session."):
+        super().__init__(detail)
+
+
+class ChunkChecksumMismatchException(ValidationException):
+    """A single chunk's content didn't match its declared checksum — a client/network data-integrity failure, not a storage backend fault."""
+
+    def __init__(self, detail: str = "Chunk content failed checksum verification."):
+        super().__init__(detail)
+
+
+class FinalChecksumMismatchException(ValidationException):
+    """The fully reassembled object didn't match the checksum declared at initiate time."""
+
+    def __init__(self, detail: str = "Reassembled file failed final checksum verification."):
+        super().__init__(detail)
