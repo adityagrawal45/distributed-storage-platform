@@ -206,6 +206,29 @@ class Settings(BaseSettings):
         alias="BLOCKED_EXTENSIONS",
     )
 
+    # ------------------------------------------------------------------
+    # Chunked / Resumable Uploads (Phase 6)
+    # ------------------------------------------------------------------
+    # These govern the LARGE-file path (`/api/v1/uploads/*`), distinct
+    # from `MAX_UPLOAD_SIZE_MB` above, which caps the simple single-shot
+    # path (`/api/v1/files/upload`, Phase 3) and is deliberately left
+    # unchanged — small uploads should stay simple and fast; large ones
+    # opt into chunking explicitly.
+    CHUNK_MIN_SIZE_BYTES: int = 1 * 1024 * 1024  # 1 MiB — below this, chunking overhead isn't worth it
+    CHUNK_MAX_SIZE_BYTES: int = 256 * 1024 * 1024  # 256 MiB — also the per-chunk in-memory buffering ceiling (see ChunkedUploadService)
+    CHUNK_DEFAULT_SIZE_BYTES: int = 8 * 1024 * 1024  # 8 MiB — used when a client omits chunk_size at initiate
+    MAX_CHUNKS_PER_UPLOAD: int = 10000  # sanity ceiling; also bounds GCS multi-stage compose recursion depth
+    MAX_CHUNKED_UPLOAD_SIZE_GB: int = 100
+    # How long an upload session may sit idle before it's treated as
+    # abandoned. Checked lazily on access (see ChunkedUploadService) —
+    # no background sweeper exists yet; that's future-phase work this
+    # design deliberately leaves room for (see README Phase 6 section).
+    UPLOAD_SESSION_EXPIRATION_MINUTES: int = 120
+
+    @property
+    def MAX_CHUNKED_UPLOAD_SIZE_BYTES(self) -> int:
+        return self.MAX_CHUNKED_UPLOAD_SIZE_GB * 1024 * 1024 * 1024
+
     @property
     def MAX_UPLOAD_SIZE_BYTES(self) -> int:
         return self.MAX_UPLOAD_SIZE_MB * 1024 * 1024
