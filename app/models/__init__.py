@@ -2,6 +2,8 @@ from app.models.file_metadata import FileMetadata, FileStatus
 from app.models.file_version import FileVersion
 from app.models.folder import Folder
 from app.models.refresh_token import RefreshToken
+from app.models.upload_chunk import UploadChunk
+from app.models.upload_session import UploadSession
 from app.models.user import User, UserRole
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "FileMetadata",
     "FileStatus",
     "FileVersion",
+    "UploadSession",
+    "UploadChunk",
 ]
