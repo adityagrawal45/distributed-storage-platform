@@ -694,9 +694,11 @@ the narrative/design layer on top. The step-by-step "how do I actually
 deploy this" runbook is [`k8s/README.md`](k8s/README.md).
 
 **Scope note**: this phase deploys the application tier only. Pub/Sub,
-background workers, chunked uploads, a monitoring/observability stack,
-CI/CD automation, multi-region deployment, and disaster recovery are
-all explicitly out of scope — see §21 "Future Roadmap".
+background workers, a monitoring/observability stack, CI/CD automation,
+multi-region deployment, and disaster recovery are all explicitly out
+of scope — see §22 "Future Roadmap". (Chunked uploads — listed here as
+out-of-scope when this section was originally written — shipped in
+Phase 6, §13.)
 
 ### Updated distributed architecture
 
@@ -1080,7 +1082,526 @@ See `k8s/README.md` §"Deploy" for exact invocation.
       CI/CD automation, multi-region, disaster recovery — explicitly
       deferred to later phases, not started
 
-## 13. Installation
+## 13. Large File, Chunked & Resumable Uploads *(Phase 6)*
+
+### Overview
+
+Phase 3's `/files/upload` works for small-to-medium files: the whole
+file streams through one request, hashed and validated in one pass.
+That breaks down for genuinely large files (multi-GB video, disk
+images, datasets) — a single HTTP request spanning minutes is fragile
+over real networks, wastes all progress on any failure, and gives a
+client no way to parallelize. Phase 6 adds a second, purpose-built
+upload path — `/api/v1/uploads/*` — for exactly this case: chunked,
+resumable, parallel-safe, and correct across the distributed,
+multi-pod backend Phases 4–5 already built. Phase 3's endpoint is
+untouched and remains the right choice for small files.
+
+### Current vs. new architecture
+
+Nothing about the Phase 4/5 distributed backend changes — this phase
+adds one more feature on top of it:
+
+```
+                     Client
+                       │
+                       ▼
+            Google Cloud Load Balancer / K8s Service   (Phase 5, unchanged)
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+     Pod 1           Pod 2          Pod 3            ← any pod, any request, any chunk
+        │              │              │
+        └──────────────┼──────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼                             ▼
+  PostgreSQL                       Redis
+  upload_sessions,                 per-session/per-chunk
+  upload_chunks                    coordination locks ONLY
+  (AUTHORITATIVE state)            (never authoritative)
+        │
+        ▼
+  Google Cloud Storage
+  temp chunk objects → Compose → final object   (AUTHORITATIVE bytes)
+```
+
+### Upload lifecycle
+
+```
+INITIATE  →  UPLOAD (N chunks, any order, any pod, parallel)  →  RESUME (as needed)  →  VERIFY  →  COMPLETE
+   │                        │                                        │                    │           │
+   ▼                        ▼                                        ▼                    ▼           ▼
+POST /uploads      PUT /uploads/{id}/chunks/{n}          GET /uploads/{id} → missing[]  (internal)  POST /uploads/{id}/complete
+creates             streams bytes → temp GCS object,                                    chunk +     Compose chunks → final object,
+UploadSession       SHA-256'd, stored as UploadChunk                                     final       whole-object SHA-256, create
+row, reserves       row (VERIFIED)                                                       checksum    FileMetadata + FileVersion,
+final object                                                                             checks      delete temp chunk objects
+key
+```
+
+A client can call `GET /uploads/{id}` at any point — after a crash,
+after switching networks, after the process restarted — and get back
+exactly which chunks landed and which didn't, from ANY pod, because
+Postgres (not the pod that handled earlier chunks) is what answers.
+
+### GCS upload architecture — why temp-object-per-chunk + Compose
+
+Researched before implementing, per the "prefer GCS-native mechanisms"
+requirement. Two GCS-native options exist:
+
+1. **A single `Blob.create_resumable_upload_session()`** — GCS's own
+   resumable-upload primitive. Gives resumability for free, but GCS
+   tracks ONE persisted-offset cursor per session: it is fundamentally
+   a sequential, single-writer stream. Concurrent or out-of-order
+   writes to the same session corrupt the upload (confirmed via GCS
+   client-library issue trackers). This satisfies "resumable" but
+   cannot satisfy "parallel chunk upload" — both required by this
+   phase.
+2. **Independent temp objects + Compose** (what this phase implements)
+   — each chunk uploads as its own ordinary, independent GCS object
+   (via the same `StorageService.upload()` Phase 3 already built — a
+   chunk is nothing special to GCS). N chunks genuinely upload in
+   parallel with zero shared state. At completion,
+   `StorageService.compose_objects()` uses GCS's native Compose
+   operation (`Blob.compose()`) to concatenate the ordered chunk
+   objects into the final object — capped at 32 sources per call, so
+   more than 32 chunks compose in batches, recursively, until one call
+   produces the final object. This is Google's own documented pattern
+   for "reassembling files uploaded as multiple segments
+   simultaneously," not an invented mechanism.
+
+**Where bytes flow**: the literal API this phase implements is
+`PUT /uploads/{id}/chunks/{n}` — the client PUTs chunk bytes to
+NimbusFS, not directly to a GCS-issued URL, because that's the
+requested endpoint contract. What IS avoided: buffering more than one
+bounded chunk (`CHUNK_MAX_SIZE_BYTES`, default 256 MiB ceiling) in
+memory at a time, and touching local disk at all — the route reads the
+raw ASGI request stream directly (`_read_body_bounded` in
+`app/api/v1/uploads/routes.py`), never via Starlette's `UploadFile`,
+whose default behavior can spool large uploads to a temp file on disk
+(unacceptable for stateless Kubernetes pods). The whole multi-GB file
+never exists in memory or on disk anywhere in the process at once —
+only ever one chunk's worth.
+
+### Database design
+
+```
+users ──┬──< upload_sessions >──┬── folders (nullable FK)
+         │        │              │
+         │        │ 1:N          └── file_metadata (nullable FK, set on completion)
+         │        ▼
+         │   upload_chunks
+         │   UNIQUE(upload_id, chunk_number)
+         └── (owner_id FK on both tables)
+```
+
+**`upload_sessions`**
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID (PK) | |
+| owner_id | UUID (FK → users.id, CASCADE) | indexed |
+| folder_id | UUID (FK → folders.id, SET NULL), nullable | |
+| file_id | UUID (FK → file_metadata.id, SET NULL), nullable | set only once COMPLETED |
+| filename, mime_type | VARCHAR | |
+| total_size, chunk_size, total_chunks | BIGINT / INT / INT | declared at initiate |
+| uploaded_bytes | BIGINT | written exactly once, atomically, at completion — **not** incremented per chunk (see Concurrency Control) |
+| status | ENUM (`upload_session_status`) | see State Machine below |
+| storage_bucket, storage_object | VARCHAR | final destination object key, reserved at initiate |
+| gcs_upload_id | VARCHAR, nullable | reserved for a possible future single-session fallback path; unused by the default Compose-based path |
+| checksum_algorithm, expected_checksum, actual_checksum | VARCHAR | SHA-256 |
+| idempotency_key | VARCHAR, nullable | audit only — replay logic lives in Redis via `IdempotencyService` |
+| expires_at, completed_at, cancelled_at | TIMESTAMPTZ | |
+| created_by/updated_by/created_at/updated_at | — | `AuditMixin` (not `SoftDeleteMixin` — see Design Decisions) |
+
+**`upload_chunks`**
+
+| Column | Type | Notes |
+|---|---|---|
+| id | UUID (PK) | |
+| upload_id | UUID (FK → upload_sessions.id, CASCADE) | indexed |
+| chunk_number | INTEGER | 1-indexed |
+| size, checksum | BIGINT / VARCHAR | |
+| status | ENUM (`upload_chunk_status`: pending/uploaded/verified/failed) | |
+| storage_reference | VARCHAR, nullable | the chunk's own temp GCS object key |
+| uploaded_at, created_at, updated_at | TIMESTAMPTZ | `updated_at` uses the same Python-side `onupdate` as `AuditMixin` — see its docstring on the real `MissingGreenlet` bug this avoids |
+
+`UniqueConstraint(upload_id, chunk_number)` is the actual
+duplicate-chunk guarantee — see Concurrency Control.
+
+Migration: `alembic/versions/0004_chunked_uploads_add_upload_sessions_and_chunks.py`.
+
+### Upload state machine
+
+```
+INITIATED ──► UPLOADING ──► COMPLETING ──► COMPLETED  (terminal)
+    │             │              │
+    │             │              └──► FAILED ──► UPLOADING | CANCELLED | EXPIRED
+    │             │
+    │             ├──► CANCELLED  (terminal)
+    │             └──► EXPIRED    (terminal)
+    │
+    ├──► CANCELLED  (terminal)
+    └──► EXPIRED    (terminal)
+```
+
+Enforced centrally by `app/core/upload_state_machine.py::UploadStateMachine`
+— every status change anywhere in `ChunkedUploadService` calls
+`assert_transition(current, target)` first; nothing mutates `.status`
+directly. `COMPLETED → CANCELLED` and `EXPIRED → COMPLETED` are simply
+absent from the transition graph (terminal states map to an empty
+transition set), so both are rejected by construction, not by a
+special-cased `if` somewhere. `FAILED` is deliberately non-terminal —
+a failed completion attempt (e.g. a transient compose error) can
+transition back to `UPLOADING` to retry, without the client needing to
+start an entirely new session.
+
+### Folder structure — new/modified files
+
+Extends the EXISTING layered structure (organized by technical layer —
+`api/`, `models/`, `repositories/`, `services/` — not by feature
+folder), matching every prior phase rather than introducing a new
+`upload/` package that would be inconsistent with the rest of the app:
+
+```
+app/
+  core/
+    upload_state_machine.py     NEW — centralized valid-transition graph (see above)
+    config/settings.py           +CHUNK_MIN/MAX/DEFAULT_SIZE_BYTES, MAX_CHUNKS_PER_UPLOAD,
+                                  MAX_CHUNKED_UPLOAD_SIZE_GB, UPLOAD_SESSION_EXPIRATION_MINUTES
+    enums.py                     +UploadSessionStatus, ChunkStatus
+  models/
+    upload_session.py            NEW — UploadSession (AuditMixin)
+    upload_chunk.py               NEW — UploadChunk (own Python-side updated_at onupdate)
+  repositories/
+    upload_session_repository.py NEW — get_owned (ownership-scoped fetch)
+    upload_chunk_repository.py   NEW — create_or_get_existing (SAVEPOINT-guarded insert),
+                                  sum_verified_bytes, list_verified_ordered, delete_all_for_upload
+    base.py                       +flush() helper (mutate-in-place persistence within a request)
+  services/
+    chunked_upload_service.py    NEW — the whole orchestration; see its module docstring for
+                                  the full design-decision writeup (GCS architecture, concurrency
+                                  model, idempotency, checksums, transaction boundaries)
+    storage_service.py            +compose_objects, delete_many, compute_object_checksum
+  schemas/
+    upload.py                     NEW — UploadInitiateRequest/Response, UploadProgressRead,
+                                  ChunkRead, ChunkUploadResponse, UploadCompleteResponse, UploadCancelResponse
+  api/v1/uploads/
+    routes.py                     NEW — /uploads/* routes (thin; see module docstring)
+  exceptions/custom_exceptions.py +9 Phase 6 exceptions, all subclassing already-registered
+                                  bases (NotFoundException/ConflictException/ValidationException/
+                                  NimbusFSException) — zero new handler functions, zero main.py
+                                  changes (see Error Handling below)
+  dependencies/providers.py      +UploadSessionRepositoryDep, UploadChunkRepositoryDep,
+                                  ChunkedUploadServiceDep
+  api/v1/router.py                mounts the new uploads router
+alembic/versions/0004_chunked_uploads_add_upload_sessions_and_chunks.py   NEW migration
+tests/
+  test_chunked_upload.py         NEW — 41 tests (see Testing below)
+  fakes/fake_gcs.py               +FakeBlob.compose() (real byte-concatenation, not a call-count mock)
+  conftest.py                     +CHUNK_MIN_SIZE_BYTES test-speed override (same pattern as RETRY_*)
+scripts/load-test/
+  k6-chunked-upload.js            NEW — k6 load test (recommended — native parallel-request support)
+  locustfile.py                   NEW — Locust alternative
+  README.md                       NEW — how to run, what to observe, what NOT to conclude
+```
+
+### API
+
+All under `/api/v1/uploads`, Bearer auth, standard `APIResponse[T]` envelope:
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/uploads` | Initiate a session (supports `Idempotency-Key`) |
+| GET | `/uploads/{id}` | Status/progress — `uploaded_chunks`, `missing_chunks`, `progress_percentage` |
+| GET | `/uploads/{id}/chunks` | List all chunk records |
+| PUT | `/uploads/{id}/chunks/{n}` | Upload one chunk (body = raw bytes; optional `X-Chunk-Checksum` header) |
+| POST | `/uploads/{id}/complete` | Finalize (supports `Idempotency-Key`; safe against duplicate calls regardless) |
+| POST | `/uploads/{id}/cancel` | Abort (idempotent) |
+| DELETE | `/uploads/{id}` | Cancel-if-active, then hard-delete the session record |
+
+**Example — initiate:**
+```json
+POST /api/v1/uploads
+{"filename": "large-video.mp4", "size": 10737418240, "mime_type": "video/mp4", "chunk_size": 104857600}
+
+201 →
+{"success": true, "data": {"upload_id": "...", "chunk_size": 104857600, "total_chunks": 103,
+                            "total_size": 10737418240, "expires_at": "...", "status": "initiated"}}
+```
+
+**Example — resume:** `GET /uploads/{id}` while chunks 1–50 have landed and 51–100 haven't:
+```json
+{"uploaded_chunks": [1,2,...,50], "missing_chunks": [51,52,...,100],
+ "uploaded_bytes": 5242880000, "progress_percentage": 50.0, "status": "uploading"}
+```
+The client uploads exactly the `missing_chunks` — nothing else.
+
+### Idempotency
+
+- `POST /uploads` and `POST /uploads/{id}/complete` both accept the
+  SAME `Idempotency-Key` header contract Phase 4 built for
+  `/files/upload` (`IdempotencyService`, reused unchanged) — a retried
+  initiate/complete with the same key replays the original response.
+- `PUT /uploads/{id}/chunks/{n}` uses a *different, more specific*
+  mechanism: the chunk number IS the natural idempotency key
+  structurally, so re-uploading the same chunk number with IDENTICAL
+  content (SHA-256 match) is a no-op (no re-upload, no duplicate GCS
+  object); re-uploading with DIFFERENT content overwrites it
+  (last-write-wins, serialized by a per-chunk lock). Layering the
+  generic `Idempotency-Key` header on top would be redundant here.
+- `POST /uploads/{id}/complete` is safe against duplicate requests
+  independent of whether a key was even sent: it acquires a per-session
+  lock, and if `status == COMPLETED` already, returns the existing
+  file rather than erroring or redoing work.
+
+### Concurrency control
+
+- **Duplicate chunk records**: a real DB `UniqueConstraint(upload_id,
+  chunk_number)` is the actual guarantee — `UploadChunkRepository
+  .create_or_get_existing` attempts the insert inside a SAVEPOINT so a
+  losing race doesn't abort the whole request's transaction. A
+  per-chunk Redis lock (`upload-chunk:{id}:{n}`) makes the race rare in
+  the first place; the DB constraint is what makes it SAFE even when
+  the lock doesn't prevent it (e.g. TTL expiry mid-upload).
+- **Incorrect uploaded byte count**: `uploaded_bytes` is never updated
+  via a concurrent read-modify-write increment — a textbook
+  lost-update race under parallel chunk uploads. Live progress is
+  instead a fresh `SUM(size)` aggregate over VERIFIED chunks, computed
+  on every read — slower per call, race-free by construction. The
+  column is written exactly once, atomically, at completion.
+- **Double finalization**: `complete_upload` holds a per-session Redis
+  lock for its entire duration; a second concurrent call blocks, then
+  observes `COMPLETED` and returns the existing result.
+- **Redis unavailable**: every WRITE operation (chunk upload,
+  completion, cancellation) fails closed with `503` — see
+  `ChunkedUploadService._guarded_lock`, which translates an
+  infrastructure failure at lock ACQUISITION into
+  `ServiceUnavailableException`, while letting whatever happens *inside*
+  a successfully-held lock raise its own real exception type unchanged.
+  Read-only endpoints (status, chunk listing) never touch a lock and
+  keep working with Redis down, since they only read Postgres.
+
+### Checksum strategy
+
+- **Per-chunk**: every chunk is SHA-256'd server-side on arrival,
+  compared against an optional client-supplied `X-Chunk-Checksum`
+  BEFORE the bytes are ever written to GCS — a corrupt chunk is
+  rejected without paying a storage write.
+- **Final**: GCS's Compose operation produces NO whole-object hash for
+  composite objects (no MD5, only CRC32C + component count) — so
+  `StorageService.compute_object_checksum` does one bounded, streamed
+  read-through of the composed object (reusing the same generator
+  `stream_download` already uses — constant memory) to obtain a real
+  SHA-256, done exactly once per upload, at completion. This is
+  compared against the client's `expected_checksum` (if supplied at
+  initiate) and always recorded as `actual_checksum`.
+- **Interaction with retries**: per-chunk checksums make a chunk retry
+  provably safe (see Idempotency) — the server can tell "same content,
+  safe no-op" from "different content, needs overwrite" without
+  guessing from size alone.
+
+### Error handling
+
+Every Phase 6 failure mode is a domain exception subclassing an
+ALREADY-REGISTERED base — `UploadSessionNotFoundException`/
+`ChunkNotFoundException` (→404), `UploadSessionExpiredException`/
+`UploadAlreadyFinalizedException`/`DuplicateChunkException` (→409),
+`UploadIncompleteException`/`ChunkSizeInvalidException`/
+`ChunkNumberInvalidException`/`ChunkChecksumMismatchException`/
+`FinalChecksumMismatchException` (→400),
+`InvalidUploadStateTransitionException` (→400 via the generic domain
+handler). FastAPI/Starlette resolve handlers by walking the raised
+type's MRO for the closest registered ancestor, so **none of these
+needed a new handler function or a `main.py` change** — the same
+technique `FolderNotFoundException`/`DuplicateFolderException` already
+relied on since Phase 2. GCS failures reuse Phase 3's
+`StorageException` hierarchy (→502/504); database failures reuse the
+existing `SQLAlchemyError` handler (→503); Redis/coordination failures
+map to `ServiceUnavailableException` (→503, see Concurrency Control).
+Transient GCS chunk-upload failures retry via `retry_async` (Phase 4);
+the Compose call at completion is instead wrapped in a `CircuitBreaker`
+(cheaper to fail fast on a multi-stage compose than to retry it
+wholesale) — a deliberate split of the two mechanisms across different
+operations, not both stacked everywhere.
+
+### Kubernetes behavior
+
+The scenario from the phase brief — chunk 1 → Pod 1, chunk 2 → Pod 3,
+chunk 3 → Pod 2, then Pod 2 crashes — completes correctly, because:
+1. Every chunk request is a complete, independent, stateless HTTP call
+   (Phase 4) — no pod holds any in-memory state about "this upload"
+   between requests.
+2. Each chunk's outcome (VERIFIED, with its temp object name and
+   checksum) is committed to Postgres before that request returns —
+   the fact "chunk 3 landed" survives Pod 2's crash intact, because it
+   was never Pod 2's memory that held it.
+3. `GET /uploads/{id}` on ANY surviving pod reconstructs the exact
+   same missing-chunks answer Pod 2 would have given, because it reads
+   the same Postgres rows.
+4. Completion, whenever it happens (on whatever pod), only needs
+   Postgres (chunk metadata) and GCS (chunk bytes) — never "the pod
+   that handled chunk 3."
+
+### Testing
+
+`tests/test_chunked_upload.py` — 41 tests against the same hermetic
+fakes the rest of the suite uses (SQLite, `FakeGCSClient` +
+`FakeBlob.compose()`, `FakeRedisClient`): initiate, first/multiple
+chunk upload, out-of-order chunk upload, safe chunk retry vs. real
+overwrite, invalid chunk (size/number/checksum/oversized), missing-chunk
+completion rejection, resume (partial upload → correct missing-chunks
+→ complete), expiration (lazy, via direct `expires_at` manipulation),
+cancellation (idempotent, temp-object cleanup, blocked once completed),
+byte-exact completion + download round-trip, temp-object cleanup after
+compose, duplicate/idempotent completion requests, concurrent
+completion (never two files), ownership scoping (404, not 403, for a
+non-owned session), invalid state transitions, simulated database/GCS/
+Redis failures (503/502/503 respectively, never a raw leaked
+exception), large declared file size, invalid file size, chunk-count
+ceiling. A dedicated `CHUNK_MIN_SIZE_BYTES=1024` test-only override
+(`tests/conftest.py`, same pattern as the existing `RETRY_*` overrides)
+keeps the suite fast without weakening what's actually exercised.
+
+### Load testing
+
+`scripts/load-test/` — see its own `README.md` for full instructions,
+metrics to watch, and explicit "what NOT to conclude" caveats. Summary:
+a k6 script (recommended) and an equivalent Locust script both simulate
+100 concurrent users each running the full initiate → parallel chunk
+upload → (sometimes) simulated-drop-and-resume → complete →
+download-verify lifecycle, with configurable deliberate chunk
+corruption to exercise retry paths.
+
+### Design decisions
+
+- **Temp-object-per-chunk + Compose over a single GCS resumable
+  session** — the only GCS-native option that supports genuine
+  parallel chunk upload; see "GCS upload architecture" above for the
+  full reasoning and the corruption risk that rules out the
+  alternative.
+- **Chunk bytes still transit FastAPI** (not a client-direct-to-GCS
+  handoff) — dictated by this phase's own `PUT /uploads/{id}/chunks/{n}`
+  endpoint contract; the memory-safety requirement is satisfied by
+  never buffering more than one bounded chunk, not by bypassing the
+  app entirely.
+- **`AuditMixin`, not `SoftDeleteMixin`, on `UploadSession`** — an
+  abandoned/expired session isn't "trash" a user restores; its own
+  `status` enum already captures that lifecycle more precisely.
+  `UploadChunk` gets neither mixin — an immutable, short-lived,
+  high-write fact needs no audit/soft-delete semantics beyond its FK.
+- **Lazy expiration, not a background sweeper** — checked on every
+  access (`_apply_expiration_if_needed`), exactly as the phase brief
+  specifies ("design cleanup so it can later be handled by a background
+  worker" — background workers are explicitly out of scope this phase).
+- **Progress computed by live aggregate query, never a maintained
+  counter** — the direct fix for the "incorrect uploaded byte count
+  under concurrency" requirement; see Concurrency Control.
+- **No content-dedup extension to the chunked path** — Phase 3's
+  checksum-based whole-file dedup (`FileMetadataRepository
+  .get_by_checksum`) is deliberately NOT applied to freshly-composed
+  chunked-upload objects this phase, to keep the already-large surface
+  area testable; `actual_checksum` is still computed and stored,
+  leaving this as a clean, low-risk future addition rather than an
+  untested one shipped speculatively.
+- **`retry_async` for chunk uploads, `CircuitBreaker` for Compose** —
+  different failure shapes: a single chunk PUT is cheap to retry a
+  couple of times; a multi-stage Compose across dozens of parts is not
+  — failing fast once GCS is clearly unhealthy is the better fit there.
+
+### Performance analysis
+
+- **CPU**: SHA-256 hashing (per chunk, and once more for the final
+  composed object) is the main CPU cost — bounded per chunk by
+  `CHUNK_MAX_SIZE_BYTES`, and the final hash is one streamed pass, not
+  proportional to chunk count.
+- **Memory**: bounded to one chunk's worth at a time (`_read_body_bounded`
+  enforces this at the ASGI-stream level, not just via a
+  `Content-Length` check) — a Pod handling a 100 GB chunked upload
+  never holds more than `CHUNK_MAX_SIZE_BYTES` (default 256 MiB
+  ceiling) of file content in memory at once, regardless of total file
+  size.
+- **Network**: chunk bytes traverse client → Pod → GCS once each (no
+  double-hop); the Compose step is GCS-internal (server-side
+  concatenation), so reassembly does NOT re-transfer chunk bytes over
+  the network a second time — only the one checksum-verification
+  read-through at completion does.
+- **Database**: one row read + one row write per chunk (light) — see
+  the "Transaction boundaries" note in `ChunkedUploadService`'s module
+  docstring: no transaction is ever held open across a slow GCS call.
+  Connection pool math is the same as Phase 5's documented ceiling
+  (`app/database/session.py`) — chunked uploads don't change it, since
+  each chunk request is its own short-lived connection checkout.
+- **GCS**: N parallel chunk PUTs = N concurrent GCS write requests;
+  Compose is capped at 32 sources per call (recursed for more), so
+  completion cost scales as `O(log₃₂(total_chunks))` GCS calls, not
+  `O(total_chunks)`.
+- **Concurrency**: parallel chunk upload throughput is bounded by GCS's
+  own per-object/per-bucket write throughput and the Pod's own HPA
+  ceiling (Phase 5), not by any NimbusFS-side global lock — the only
+  locks are scoped per-chunk or per-session, never upload-wide.
+
+### Failure scenarios
+
+| Scenario | What happens |
+|---|---|
+| Pod crashes mid-chunk-upload | That one HTTP request fails (client sees a connection error); no state is corrupted (the chunk row either committed or didn't — no partial row); client retries the SAME chunk number against any surviving pod |
+| GCS unavailable during a chunk PUT | `retry_async` retries transiently, then `502`/`504` (translated `StorageException`) if still down; chunk row is never created for a failed upload — the chunk_number stays free for retry |
+| GCS unavailable during Compose | `CircuitBreaker` opens after repeated failures (fast-fail on subsequent attempts); session transitions to `FAILED` (not stuck in `COMPLETING`); client retries `POST .../complete` once GCS recovers |
+| Database unavailable | Any DB-touching call surfaces `503` via the existing `SQLAlchemyError` handler (Phase 1) |
+| Network disconnects mid-upload | Client simply resumes later — `GET /uploads/{id}` reports exactly what's missing, from any pod, at any time up to `expires_at` |
+| A chunk fails validation (wrong size/checksum) | Rejected with `400` BEFORE any GCS write — no wasted storage cost, chunk_number stays free for a corrected retry |
+| Client retries a chunk it already sent | Detected as identical (checksum match) → no-op `200`, no duplicate object, no duplicate row |
+| Completion request repeated | Detected via `status == COMPLETED` → same result returned, no re-compose, no duplicate `FileMetadata` |
+
+### Interview questions
+
+**Beginner**
+- *Why can't you just PUT the whole file in one request for a 50 GB file?* — Network reliability over minutes-long single requests is poor, there's no way to parallelize, and any failure loses all progress; chunking bounds each request's blast radius and enables resuming from exactly where it left off.
+- *What does "resumable" actually require the server to track?* — Which pieces (chunks) of the file have durably landed, so a client reconnecting can ask "what's left?" instead of restarting.
+
+**Intermediate**
+- *Why is a single GCS resumable session not enough for "parallel chunk upload"?* — It's a single-writer, single-offset-cursor stream; concurrent writes to it race and corrupt the upload. Independent temp objects + Compose is the GCS-native way to get true parallelism.
+- *How do you prevent two concurrent requests from both writing chunk 5?* — A DB unique constraint on `(upload_id, chunk_number)` is the ultimate guarantee (via a SAVEPOINT-guarded insert so a losing race doesn't abort the whole transaction), backed by a per-chunk Redis lock that makes the race rare in the first place.
+- *Why not increment `uploaded_bytes` as each chunk lands?* — Concurrent read-modify-write increments from parallel chunk uploads is a classic lost-update race; computing progress via a live `SUM()` aggregate is race-free by construction, at the cost of a slightly more expensive read.
+
+**Advanced**
+- *Walk through what happens if the pod handling `POST .../complete` crashes mid-Compose.* — The session is left in `COMPLETING` (not `COMPLETED`) since the status flip to `COMPLETED` only happens after Compose, checksum verification, and `FileMetadata` creation all succeed. A later `complete` call re-acquires the session lock, observes non-terminal `COMPLETING` state... — and this is worth being honest about as a real edge case: `COMPLETING` is not in `UploadStateMachine`'s valid-transition SOURCE set for re-entry to `COMPLETING` itself (only `UPLOADING`/`FAILED` can transition TO `COMPLETING`), so a genuinely stuck `COMPLETING` session (crash mid-compose, no exception ever reached the `except Exception: status = FAILED` handler because the PROCESS died, not just the request) requires operator intervention or a future phase's background reconciliation job to detect and reset — a real, acknowledged limitation of "no background workers this phase," not a silently swept-under-the-rug one.
+- *How would you extend this to bypass FastAPI entirely for chunk bytes?* — Swap the chunk-PUT handler for one that calls `Blob.create_resumable_upload_session()` (or issues a per-chunk signed URL) and hands the URI/URL to the client instead of accepting bytes directly — the `UploadSession`/`UploadChunk` schema and state machine don't need to change, only how a chunk's bytes physically travel; the completion/compose logic is unaffected either way.
+
+### Phase 6 completion checklist
+
+- [x] Upload session creation, chunking math (server-computed
+      `total_chunks`, last-chunk-size handling)
+- [x] Chunk upload, tracking, resume, missing-chunk detection
+- [x] Parallel chunk upload support (independent temp objects, no
+      shared cursor)
+- [x] Chunk retry (checksum-based safe no-op vs. overwrite)
+- [x] Per-chunk and final checksums (SHA-256, verified before/after storage writes)
+- [x] Upload progress (live aggregate, race-free under concurrency)
+- [x] Upload completion (Compose, multi-stage for >32 chunks, final
+      checksum, FileMetadata/FileVersion creation, temp cleanup)
+- [x] Upload cancellation (idempotent, blocks `COMPLETED → CANCELLED`)
+- [x] Upload expiration (lazy, on-access — no background sweeper this phase)
+- [x] Explicit upload state machine, centralized, not scattered in routes
+- [x] Idempotency (`Idempotency-Key` for initiate/complete; checksum-based for chunks)
+- [x] Concurrent-upload protection (DB unique constraint + SAVEPOINT, per-chunk/per-session Redis locks)
+- [x] Failure recovery (retry for chunks, circuit breaker for Compose, FAILED→retry state transition)
+- [x] GCS integration (temp objects + Compose, no invented storage mechanism)
+- [x] Kubernetes/multi-pod compatibility (Postgres-authoritative state, verified via the failure-scenario table above)
+- [x] Full REST API, RESTful status codes, OpenAPI-documented
+- [x] Database migration (`0004_chunked_uploads...`), reversible
+- [x] 41 tests (unit + integration), hermetic fakes only
+- [x] k6 + Locust load tests, with documented metrics and "what NOT to conclude" caveats
+- [x] README + this design-decision writeup
+- [ ] Pub/Sub, background workers, full Redis caching, disaster
+      recovery, multi-region storage, CI/CD, full observability stack,
+      AI features, a real virus-scanning service, advanced enterprise
+      security, advanced deduplication — explicitly out of scope,
+      deferred to later phases
+
+## 14. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -1089,7 +1610,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 14. Environment Variables
+## 15. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -1115,6 +1636,10 @@ See `.env.example` for the full list. Key variables:
 | `RETRY_MAX_ATTEMPTS` / `RETRY_BASE_DELAY_SECONDS` / `RETRY_MAX_DELAY_SECONDS` | Backoff policy for transient DB/Redis/Storage failures (Phase 4) |
 | `FAIL_FAST_ON_STARTUP` | Refuse to finish startup if a critical dependency is unreachable after retrying (Phase 4) |
 | `SHUTDOWN_GRACE_PERIOD_SECONDS` | Ceiling on graceful shutdown; match/exceed with uvicorn's `--timeout-graceful-shutdown` (Phase 4) |
+| `CHUNK_MIN_SIZE_BYTES` / `CHUNK_MAX_SIZE_BYTES` / `CHUNK_DEFAULT_SIZE_BYTES` | Allowed chunk-size range for `/uploads/*`; max also bounds per-chunk in-memory buffering (Phase 6) |
+| `MAX_CHUNKS_PER_UPLOAD` | Sanity ceiling on chunk count per upload session; also bounds GCS multi-stage Compose recursion depth (Phase 6) |
+| `MAX_CHUNKED_UPLOAD_SIZE_GB` | Hard cap on declared total file size for the chunked-upload path — separate from, and larger than, `MAX_UPLOAD_SIZE_MB` (Phase 6) |
+| `UPLOAD_SESSION_EXPIRATION_MINUTES` | How long an idle upload session survives before lazy expiration (Phase 6) |
 
 ### Google Cloud Storage Setup
 
@@ -1149,7 +1674,7 @@ GKE service account to the IAM service account via Workload Identity, leave
 Default Credentials automatically — this is what makes `app/database/gcs.py`
 work unchanged across environments.
 
-## 16. Running Locally (without Docker)
+## 17. Running Locally (without Docker)
 
 Requires a local PostgreSQL and Redis instance matching your `.env`.
 
@@ -1161,7 +1686,7 @@ alembic upgrade head
 
 API available at `http://localhost:8000`, docs at `http://localhost:8000/docs`.
 
-## 17. Running with Docker
+## 18. Running with Docker
 
 ```bash
 cp .env.example .env
@@ -1175,7 +1700,7 @@ network. Apply migrations inside the running container:
 docker compose exec api alembic upgrade head
 ```
 
-## 18. Database Migrations (Alembic)
+## 19. Database Migrations (Alembic)
 
 ```bash
 # Generate a new migration from model changes
@@ -1194,8 +1719,10 @@ Migrations so far:
 - `0003_storage` — adds `storage_provider`, `bucket_name`, `object_name`,
   `public_url`, `storage_class`, `etag`, `upload_status`, `uploaded_at` to
   `file_metadata`
+- `0004_chunked_uploads` — creates `upload_sessions`, `upload_chunks`
+  (Phase 6)
 
-## 19. API Documentation
+## 20. API Documentation
 
 - Swagger UI: `GET /docs`
 - ReDoc: `GET /redoc`
@@ -1203,7 +1730,7 @@ Migrations so far:
 
 (Docs are automatically disabled when `ENVIRONMENT=production`.)
 
-## 20. Testing
+## 21. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
 services required.
@@ -1252,19 +1779,41 @@ Coverage includes:
   `/health`/`/ready` intentionally check *real* DB/Redis connectivity
   (not the SQLite/fake overrides) — see `tests/conftest.py` for how the
   suite keeps that fast and deterministic without requiring real infra.
+- **Phase 6** (`tests/test_chunked_upload.py`, 41 tests, against
+  `FakeGCSClient` + `FakeBlob.compose()` + `FakeRedisClient`): initiate,
+  first/multiple/out-of-order chunk upload, safe chunk retry (identical
+  content, no-op) vs. real overwrite (different content), invalid chunk
+  (wrong size, out-of-range number, over the server's bounded-read cap,
+  checksum mismatch), missing-chunk completion rejection, resume
+  (partial upload -> correct `missing_chunks` -> complete), lazy
+  expiration, cancellation (idempotent, temp-object cleanup, blocked
+  once completed), byte-exact completion + download round-trip,
+  temp-object cleanup after Compose, duplicate/idempotent completion
+  requests (with and without `Idempotency-Key`), concurrent completion
+  (never two files), ownership scoping (404, not 403), invalid state
+  transitions, simulated database/GCS/Redis failures (503/502/503,
+  never a raw leaked exception), large declared file size, invalid file
+  size, and the chunk-count ceiling.
 
-## 21. Future Roadmap (Phases 6–15, not yet built)
+Total: **145 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
+41 Phase 6 — Phase 5 shipped infrastructure/manifests, not application
+tests).
 
-Chunked/resumable uploads, sharing & permissions between users, virus
-scanning integration, thumbnail generation, full-text content search,
-Pub/Sub-driven background workers, real rate limiting, Redis metadata
-caching, CI/CD via GitHub Actions, Terraform IaC, Cloud Armor, Cloud
-CDN, observability (Cloud Monitoring/Logging dashboards, OpenTelemetry
-tracing), multi-region deployment, disaster recovery. Kubernetes/GKE
-deployment and autoscaling (HPA) — previously listed here — shipped in
-Phase 5; see §12.
+## 22. Future Roadmap (Phases 7–15, not yet built)
 
-## 22. Contribution Guide
+Sharing & permissions between users, virus scanning integration,
+thumbnail generation, full-text content search, Pub/Sub-driven
+background workers (including reconciliation of stuck
+`COMPLETING`-state upload sessions — see Phase 6 §13's "Advanced"
+interview question), real rate limiting, Redis metadata caching,
+content-dedup extension to the chunked-upload path, CI/CD via GitHub
+Actions, Terraform IaC, Cloud Armor, Cloud CDN, observability (Cloud
+Monitoring/Logging dashboards, OpenTelemetry tracing), multi-region
+deployment, disaster recovery. Kubernetes/GKE deployment and
+autoscaling (HPA) shipped in Phase 5 (§12); chunked/resumable uploads
+shipped in Phase 6 (§13) — both previously listed here.
+
+## 23. Contribution Guide
 
 1. Create a feature branch from `main`.
 2. Keep business logic in `services/`, persistence in `repositories/` — never
