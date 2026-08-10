@@ -76,6 +76,26 @@ class FakeBlob:
             raise gcs_exceptions.NotFound(f"{self.name} not found")
         return f"https://storage.fake.test/{self._bucket.name}/{self.name}?signature=fake&method={method}"
 
+    def compose(self, sources: list["FakeBlob"], client=None) -> None:
+        """
+        Fakes GCS's native Compose operation (Phase 6): concatenates
+        `sources`' stored bytes, IN THE GIVEN ORDER, into this blob's
+        object — mirrors `google.cloud.storage.Blob.compose()`'s real
+        behavior closely enough for `StorageService.compose_objects` to
+        be tested against real round-trip bytes, not just call
+        assertions (see module docstring).
+        """
+        pieces = []
+        for source in sources:
+            stored = self._bucket.store.get(source.name)
+            if stored is None:
+                raise gcs_exceptions.NotFound(f"{source.name} not found")
+            pieces.append(stored.data)
+
+        etag = f"etag-compose-{len(self._bucket.store)}-{self.name}"
+        stored = _StoredObject(data=b"".join(pieces), content_type=self.content_type, metadata=dict(self.metadata), etag=etag)
+        self._bucket.store[self.name] = stored
+
 
 class _FakeReadHandle:
     def __init__(self, data: bytes):
