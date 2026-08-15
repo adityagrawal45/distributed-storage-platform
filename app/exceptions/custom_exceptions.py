@@ -336,3 +336,110 @@ class FinalChecksumMismatchException(ValidationException):
 
     def __init__(self, detail: str = "Reassembled file failed final checksum verification."):
         super().__init__(detail)
+
+
+# ---------------------------------------------------------------------
+# Distributed Caching & Coordination (Phase 7)
+# ---------------------------------------------------------------------
+# Design note (same convention Phase 6 established): every exception below
+# subclasses an ALREADY-REGISTERED base so FastAPI's MRO-walking handler
+# resolution gives it correct HTTP mapping with no new handler function —
+# with exactly ONE deliberate exception, `RateLimitExceeded`, which needs
+# a 429 status AND a `Retry-After` header that no existing handler can
+# produce. That is the only new handler + main.py registration this phase
+# adds.
+#
+# Note also that CacheError and friends are, in normal operation, NEVER
+# raised out of a request: `CacheService` catches every Redis failure,
+# logs it, and degrades to Postgres. They exist so cache internals can
+# signal precisely *what* went wrong to the layer that decides to swallow
+# it (and so tests can assert on the specific failure mode), not so route
+# handlers can 500 because a cache was unavailable.
+class CacheError(NimbusFSException):
+    """Base for every cache-layer failure. Degraded to a cache miss by CacheService."""
+
+    def __init__(self, detail: str = "A cache error occurred."):
+        super().__init__(detail)
+
+
+class CacheConnectionError(CacheError):
+    """Redis was unreachable, timed out, or the connection pool was exhausted."""
+
+    def __init__(self, detail: str = "The cache backend is unreachable."):
+        super().__init__(detail)
+
+
+class CacheSerializationError(CacheError):
+    """
+    A value could not be encoded to, or decoded from, the JSON cache
+    envelope — including the "envelope schema version is not the one this
+    build understands" case, which is treated as a miss rather than an
+    application failure (see app/core/cache/serializer.py).
+    """
+
+    def __init__(self, detail: str = "Cache value could not be serialized or deserialized."):
+        super().__init__(detail)
+
+
+class DistributedLockError(NimbusFSException):
+    """
+    Base for distributed-lock failures that are NOT simply "someone else
+    holds it" (that stays `LockAcquisitionException`, Phase 4, mapped to
+    409). This covers infrastructure-level lock faults: Redis unreachable
+    during acquire/release, or a release attempted without ownership.
+    """
+
+    def __init__(self, detail: str = "A distributed lock error occurred."):
+        super().__init__(detail)
+
+
+class LockAcquisitionTimeout(LockAcquisitionException):
+    """
+    Raised when a bounded, retrying acquire (`DistributedLockService.
+    acquire`, with `timeout_seconds`) gave up. Subclasses Phase 4's
+    `LockAcquisitionException` on purpose: to a client, "I waited and
+    still could not get the lock" and "I could not get the lock" are the
+    same 409, and the existing handler already says so correctly.
+    """
+
+    def __init__(self, detail: str = "Timed out waiting to acquire the required distributed lock."):
+        super().__init__(detail)
+
+
+class LockOwnershipError(DistributedLockError):
+    """Raised when a caller tries to release/extend a lock it does not (or no longer) holds."""
+
+    def __init__(self, detail: str = "This lock is not held by the caller."):
+        super().__init__(detail)
+
+
+class RateLimitExceeded(NimbusFSException):
+    """
+    Raised by `RateLimiter` when a caller's token bucket is empty.
+
+    Carries `retry_after_seconds` (and the budget/remaining figures) so
+    the dedicated handler can emit RFC-compliant `Retry-After` and
+    `X-RateLimit-*` headers — the one Phase 7 exception that genuinely
+    needs its own handler rather than reusing an existing one.
+    """
+
+    def __init__(
+        self,
+        detail: str = "Rate limit exceeded. Please retry later.",
+        *,
+        retry_after_seconds: int = 1,
+        limit: int | None = None,
+        remaining: int = 0,
+        category: str | None = None,
+    ):
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        self.limit = limit
+        self.remaining = remaining
+        self.category = category
+        super().__init__(detail)
+
+
+# Backwards-friendly alias: the spec names this exception both
+# `RateLimitExceeded` and `RateLimitExceededException` in different
+# places; both names refer to the same class so neither import breaks.
+RateLimitExceededException = RateLimitExceeded

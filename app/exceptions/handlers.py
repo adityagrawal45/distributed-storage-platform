@@ -26,6 +26,7 @@ from app.exceptions.custom_exceptions import (
     LockAcquisitionException,
     NimbusFSException,
     NotFoundException,
+    RateLimitExceeded,
     ServiceUnavailableException,
     StorageException,
     StorageObjectNotFoundException,
@@ -39,7 +40,9 @@ from app.schemas.response import APIResponse
 logger = get_logger(__name__)
 
 
-def _envelope(request: Request, status_code: int, message: str, errors=None) -> JSONResponse:
+def _envelope(
+    request: Request, status_code: int, message: str, errors=None, headers: dict[str, str] | None = None
+) -> JSONResponse:
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     body = APIResponse(
         success=False,
@@ -48,7 +51,7 @@ def _envelope(request: Request, status_code: int, message: str, errors=None) -> 
         errors=errors,
         request_id=request_id,
     )
-    return JSONResponse(status_code=status_code, content=body.model_dump(mode="json"))
+    return JSONResponse(status_code=status_code, content=body.model_dump(mode="json"), headers=headers)
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -155,6 +158,37 @@ async def idempotency_key_in_progress_exception_handler(
 ) -> JSONResponse:
     logger.info("idempotency_key_in_progress", detail=exc.detail, path=str(request.url))
     return _envelope(request, status.HTTP_409_CONFLICT, exc.detail)
+
+
+async def rate_limit_exceeded_exception_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """
+    The ONE new exception handler Phase 7 required (see the design note in
+    `custom_exceptions.py`): every other new exception subclasses an
+    already-registered base and is mapped correctly for free.
+
+    It exists because a 429 is not just a status code — a well-behaved API
+    tells the client exactly when to come back. `Retry-After` is computed
+    by the token bucket from the real token deficit, not guessed, so a
+    client that honors it will succeed on its first retry instead of
+    hammering and re-triggering the limit.
+    """
+    logger.warning(
+        "rate_limit_rejected_response",
+        category=exc.category,
+        limit=exc.limit,
+        remaining=exc.remaining,
+        retry_after_seconds=exc.retry_after_seconds,
+        path=str(request.url),
+    )
+    headers = {
+        "Retry-After": str(exc.retry_after_seconds),
+        "X-RateLimit-Remaining": str(exc.remaining),
+    }
+    if exc.limit is not None:
+        headers["X-RateLimit-Limit"] = str(exc.limit)
+    if exc.category:
+        headers["X-RateLimit-Category"] = exc.category
+    return _envelope(request, status.HTTP_429_TOO_MANY_REQUESTS, exc.detail, headers=headers)
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
