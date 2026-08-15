@@ -1601,7 +1601,593 @@ corruption to exercise retry paths.
       security, advanced deduplication — explicitly out of scope,
       deferred to later phases
 
-## 14. Installation
+## 14. Distributed Redis Caching & Coordination *(Phase 7)*
+
+Phase 4 built the Redis *plumbing* (a pool, distributed locks,
+idempotency-key storage, health checks) and deliberately stopped there.
+Phase 7 makes Redis a real distributed **caching and coordination layer**:
+cache-aside reads with stampede protection, centralized invalidation, a
+production distributed-lock facade, and real rate limiting replacing the
+Phase 4 no-op placeholder.
+
+The full engineering rationale — race analysis, failure catalogue,
+interview Q&A — lives in **[`docs/PHASE_7_REDIS_DESIGN.md`](docs/PHASE_7_REDIS_DESIGN.md)**.
+This section is the walkthrough.
+
+### 14.1 The invariant everything follows from
+
+> **PostgreSQL owns metadata. GCS owns bytes. Redis owns nothing.**
+> Flushing Redis entirely, at any moment, must cost only latency.
+
+```
+   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+   │  Pod 1       │   │  Pod 2       │   │  Pod N       │   stateless replicas
+   │ CacheService │   │ CacheService │   │ CacheService │   (Phase 4/5)
+   │ RateLimiter  │   │ RateLimiter  │   │ RateLimiter  │
+   │ DistLock     │   │ DistLock     │   │ DistLock     │
+   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+          └──────────────────┼──────────────────┘
+                             ▼
+          ┌──────────────────────────────────────────┐
+          │  REDIS / Memorystore  —  shared, ephemeral│
+          │  cache · locks · rate-limit buckets       │
+          │  *** never authoritative, never bytes *** │
+          └──────────────────┬───────────────────────┘
+                     miss    │
+                             ▼
+          ┌──────────────────────────────────────────┐
+          │  PostgreSQL — AUTHORITATIVE for metadata  │
+          └──────────────────────────────────────────┘
+```
+
+Two consequences enforced in code, not just documented:
+
+1. `CacheSerializer.encode` **raises** if handed `bytes`. File content
+   physically cannot be written to Redis by this codebase.
+2. Every `CacheService` method catches every Redis exception, **logs it**,
+   and returns the "as if the cache did not exist" answer. A cache failure
+   degrades performance; it can never fail a request. There is a test that
+   kills Redis mid-suite and asserts the API keeps answering.
+
+### 14.2 New modules
+
+```
+app/core/cache/
+  keys.py             CacheKeyBuilder   — WHAT a key is called
+  serializer.py       CacheSerializer   — HOW a value is encoded
+  policy.py           CachePolicy       — HOW LONG a value lives
+app/core/
+  rate_limiter.py     RateLimiter       — token bucket in atomic Lua
+  distributed_lock.py + DistributedLockService  (extends Phase 4)
+app/services/
+  cache_service.py    CacheService      — the ONLY gateway to Redis-as-cache
+  cache_invalidator.py CacheInvalidator — operation → key-set fan-out
+app/dependencies/
+  rate_limit.py       rate_limit(category) dependency + provider
+app/middleware/
+  rate_limit.py       RateLimitHeadersMiddleware (was the Phase 4 no-op)
+```
+
+`redis.asyncio` is imported by exactly three modules: the pool
+(`app/database/redis.py`), `CacheService`, and `RateLimiter`. No route
+handler and no other service talks to Redis directly — the single most
+important structural rule of this phase, because scattered Redis calls are
+how a *cache* outage becomes an *application* outage.
+
+### 14.3 Cache-aside, and why not write-through
+
+```
+   READ                                   WRITE
+   GET key ──hit──► return                UPDATE row in Postgres
+      │                                          │
+     miss                                        ▼
+      ▼                                   DELETE key (+ related)
+   SELECT from Postgres                   ── never "UPDATE key"
+      ▼
+   SET key with TTL ──► return
+```
+
+| Strategy | Why not |
+|---|---|
+| Write-through | Every write pays cache latency for data often never re-read — and it is a stale-data source under concurrency: two writers can apply *cache* updates in the opposite order to their *database* commits, leaving the cache permanently wrong with no TTL-independent way to notice. |
+| Write-behind | Makes Redis authoritative for a window. Violates the invariant. |
+| Read-through | Puts SQL behind the caching abstraction, inverting the dependency. |
+| **Cache-aside** ✅ | The cache is purely opportunistic. Empty, partial, or absent — the system is still correct. |
+
+Invalidation always **deletes**, never updates: delete is idempotent and
+order-independent, so the loser of any race just causes one extra read.
+
+### 14.4 Cache key strategy
+
+```
+nimbusfs : <entity> : <id> [ : <derived> ] [ : <fingerprint> ]
+```
+
+| Key | Entity |
+|---|---|
+| `nimbusfs:user:{user_id}` | user profile |
+| `nimbusfs:folder:{folder_id}` | folder metadata |
+| `nimbusfs:folder:{folder_id}:children:{fp}` | children listing, per sort/filter variant |
+| `nimbusfs:folder:root:{owner_id}:children:{fp}` | top-level listing |
+| `nimbusfs:folder:{folder_id}:breadcrumbs` | breadcrumb trail |
+| `nimbusfs:file:{file_id}` | file metadata |
+| `nimbusfs:file:{file_id}:versions` | version history |
+| `nimbusfs:search:{owner_id}:{fp}` | one search result page |
+| `nimbusfs:ratelimit:{category}:{identity}` | token bucket |
+
+Collision safety: the entity type is always the second segment, so
+`folder:<uuid>` and `file:<uuid>` cannot alias. Variable-length or
+user-supplied components (search filters, listing sort params) are never
+interpolated raw — they are canonicalized to sorted `k=v` pairs and
+SHA-256'd, which keeps keys fixed-length and removes any chance of a value
+containing `:` and forging a different key shape. `None` encodes as
+`~none`, never `"None"`, so a folder literally named `None` cannot alias
+the root.
+
+**Authorization is never cached.** Resources are. Folder/file/user entries
+are keyed *by resource*, and the cached payload carries `owner_id`; the
+service re-applies exactly the ownership + not-deleted filter the
+repository's `WHERE` clause would have applied, raising the same **404**
+(never a 403 — IDs must stay unguessable). Search is the one entity where
+per-caller keying is correct rather than a pessimization, because a result
+set has no single owner field to re-check — so its key is caller-scoped.
+There is a test where user B tries to read a folder user A just warmed
+into the cache and gets a 404.
+
+### 14.5 TTL strategy
+
+| Entity | Default | Reasoning |
+|---|---|---|
+| user | 900s | Changes are rare and administrative. **Not on the auth path** — `get_current_user` still reads Postgres every request so deactivation stays immediate (Phase 1's decision, deliberately preserved). |
+| folder | 300s | Explicit invalidation is the mechanism; TTL is the backstop. |
+| folder children | 300s | Highest-churn folder key — also the most invalidation call sites. |
+| folder breadcrumbs | 300s | Changes only on an *ancestor* rename/move. |
+| file | 300s | Mirrors folder metadata. |
+| file versions | 300s | Append-only in practice. |
+| search | 90s | A derived view over many rows that cannot be invalidated precisely. Shortest by design. |
+
+TTL is a **correctness** knob wearing a performance costume: it is the hard
+ceiling on staleness if invalidation is ever missed, dropped, or raced.
+Every value comes from `Settings.CACHE_TTL_*` via `CachePolicy` — nothing
+is hardcoded at a call site.
+
+### 14.6 Invalidation strategy
+
+| Operation | Keys cleared |
+|---|---|
+| folder create / rename / trash / restore / purge | `folder:{id}*`, parent's `children:*` |
+| folder move | `folder:{id}*`, **old** parent's `children:*`, **new** parent's `children:*` |
+| folder trash/restore of a subtree | the above **for every descendant individually** (each has its own `is_deleted` flag cached) |
+| file create / update / rename / trash / restore / purge / new version | `file:{id}*`, folder's `children:*`, `search:{owner}:*` |
+| file move | the above, plus the destination folder's `children:*` |
+
+Pattern deletes use `SCAN`, **never `KEYS`** — `KEYS` is O(N) over the
+whole keyspace and blocks Redis's single command thread, which on a
+production instance is a self-inflicted outage.
+
+**The race we accept, stated plainly.** Invalidation runs inside the
+request's transaction (`get_db` commits at the request boundary), so
+between a writer's `DEL` and its `COMMIT` a concurrent reader can miss,
+read the still-old committed row, and write it back. Bounded three ways:
+the window is the remainder of one transaction (sub-millisecond in
+practice); staleness is capped at the entity TTL, not unbounded; and
+`CACHE_WRITE_GUARD_SECONDS > 0` (**1.5s, ON by default**) closes it
+entirely with a post-invalidation tombstone that rejects the stale write —
+implemented and tested; set to `0.0` to disable if the extra round trip
+matters more than the race for a given deployment. The airtight fix —
+invalidating in a SQLAlchemy `after_commit` hook — still needs a
+transaction-lifecycle hook the current per-request Unit of Work does not
+expose to services, so the guard is the pragmatic close, not the
+architectural one. Documented as a real limitation, not hidden.
+
+**Descendant breadcrumbs (precisely invalidated, not just bounded by
+TTL):** renaming or moving a folder changes every descendant's
+materialized `path`, and therefore every descendant's breadcrumb cache.
+`FolderRepository.list_descendants()` already existed (soft-delete cascade
+uses it), so `rename_folder`/`move_folder` capture the descendant ID list
+*before* `cascade_rename` rewrites paths (IDs are stable across the
+rewrite) and pass it to `CacheInvalidator.descendant_breadcrumbs_changed()`,
+which deletes each descendant's exact `breadcrumbs` key. No SCAN, no new
+Redis index — O(descendant count) exact deletes, the same shape
+`cascade_rename` already pays in Postgres for the same operation.
+
+### 14.7 Stampede protection (single-flight with a bounded wait)
+
+When a hot key expires under load, plain cache-aside makes *every*
+concurrent request miss simultaneously — one query becomes hundreds
+against an already-busy database. That is a cache stampede.
+
+```
+ request ──► GET key ──hit──► return          (hot path: no locking at all)
+               │
+              miss
+               ▼
+       SET NX  nimbusfs:lock:cache:{hash}  TTL 5s
+               │
+      ┌────────┴─────────┐
+   won│                  │lost
+      ▼                  ▼
+  re-GET (double-check)  poll GET every 20ms, up to 500ms
+      │ hit ► return      │
+     miss             ┌───┴────┐
+      ▼          published    timeout
+  SELECT + SET       │          │
+      ▼              ▼          ▼
+  release, return  return   SELECT from Postgres  ◄─ read through; never block forever
+```
+
+Four properties worth naming:
+
+- The **double-check after winning** is what makes this correct rather
+  than merely lucky — someone may have published while we acquired.
+- The **follower fallthrough is the important choice.** No request ever
+  blocks indefinitely on another request's work. Unbounded waiting turns
+  one slow query into worker-pool exhaustion and then a total outage —
+  strictly worse than the stampede it prevents. The guarantee is
+  deliberately *"far fewer DB hits than requests"*, not *"exactly one"*.
+- A **crashed winner self-heals** via the 5s lock TTL.
+- **Coordination failure is non-fatal**: if Redis errors during lock
+  acquisition, it is logged and everyone degrades to plain cache-aside.
+  The lock is a performance optimization here, not a correctness mechanism.
+
+Tested with 50 concurrent requests for one uncached key: fewer than 10 may
+reach the source, and every caller must still get a correct answer.
+
+### 14.8 Distributed locking
+
+The algorithm is Phase 4's, unchanged, because it was already correct:
+
+```
+ACQUIRE:  SET lock:<key> <uuid4-token> NX PX <ttl_ms>     (atomic claim-or-fail)
+RELEASE:  EVAL  if redis.call("get",KEYS[1]) == ARGV[1]
+                then return redis.call("del",KEYS[1]) else return 0 end
+```
+
+The Lua-guarded release prevents the classic **lost-lock** bug: if A's work
+outlives its TTL, the lock expires, B acquires it, and A's later `DEL`
+would delete *B's* lock. The token check makes that impossible — and it
+must be atomic, which is why it is a script and not `GET` then `DEL`.
+
+Phase 7 adds around that unchanged core: `acquire_with_timeout()` (bounded,
+**jittered** retry — never "wait forever"), `owns()` (authoritative
+ownership check vs. `is_held`'s local belief), `release(strict=True)`
+(raises `LockOwnershipError` instead of silently no-op'ing), and
+`DistributedLockService`, a facade whose real value is refusing to conflate
+two failure modes:
+
+| Failure | Meaning | Outcome |
+|---|---|---|
+| Contention | Someone else holds it | `LockAcquisitionTimeout` → 409 (existing Phase 4 handler) |
+| Redis down at **acquire** | Exclusivity cannot be proven | `DistributedLockError` — **never** "the lock is free" |
+| Redis down at **release** | Work already happened; TTL frees it | Logged and swallowed |
+
+TTL-based expiry, **not** renewal/Redlock: a crashed holder blocks others
+for at most `ttl_seconds`. Redlock is deliberately out of scope — it is
+contested in the literature, and NimbusFS's locks never carry the *final*
+correctness guarantee. Real guarantees live in Postgres constraints (Phase
+6's `UniqueConstraint(upload_id, chunk_number)` is what actually prevents
+duplicate chunks; the lock only makes the race rare).
+
+### 14.9 Rate limiting — algorithm choice
+
+| Algorithm | Verdict |
+|---|---|
+| Fixed window counter | Cheapest, and wrong at the boundary: full budget at the end of one window plus full budget at the start of the next = **2x** the intended rate in a sub-second span. On a login endpoint that doubling lands exactly where it hurts. |
+| Sliding window log | Exact, but memory linear in request rate — one sorted-set member per request per window, plus O(log N) trims. |
+| Sliding window counter | Bounded memory, no boundary doubling, but an *approximation* that cannot express burst separately from sustained rate. |
+| **Token bucket** ✅ | Two numbers per key: O(1) memory and time. Burst (`capacity`) and sustained rate (`capacity/window`) are separate tunables. And it yields an **exact** `Retry-After` from the token deficit, where the counter approaches can only guess — a client told precisely when to return does not poll. |
+
+```
+capacity ┤ ████████████                     ████████
+         │ ████████████                 ████████████
+ tokens  │ ██████                 ██████████████████
+       0 ┼─────┬──────────────────┬───────────────────► time
+           burst drains it        refill at N/W per sec
+                                  (capped — no banking)
+```
+
+Executed as **one atomic Lua script**: read-modify-write from N pods is a
+lost-update race (two replicas both read "1 token left", both allow).
+Redis runs Lua atomically on its single command thread, making
+refill→check→decrement indivisible. `WATCH`/`MULTI`/`EXEC` would need
+optimistic-retry loops that peak exactly when the limiter is hottest.
+
+**Independent budgets per category** so exhausting search cannot starve an
+in-flight upload:
+
+| Category | Default | Applied to |
+|---|---|---|
+| `login` | 10 / 60s | `POST /auth/login` |
+| `register` | 5 / 300s | `POST /auth/register` |
+| `metadata` | 300 / 60s | `/folders/*` and `/metadata/*` (router-level) |
+| `search` | 60 / 60s | `GET /metadata/search` (stacked on top of `metadata`) |
+| `upload_initiate` | 60 / 60s | `POST /uploads` |
+| `upload_complete` | 60 / 60s | `POST /uploads/{id}/complete` |
+| `default` | 600 / 60s | fallback |
+
+Per-**chunk** `PUT /uploads/{id}/chunks/{n}` is deliberately **not**
+limited: one large upload legitimately issues thousands of parallel chunk
+PUTs (the entire point of Phase 6), so a per-request budget there would
+throttle correct behavior rather than abuse.
+
+**Why a dependency, not middleware.** Middleware sees only a method and a
+path string, so classification means a path-pattern table that rots the
+moment a route is renamed. A dependency lives next to the endpoint, moves
+with it, shows up in OpenAPI, runs before the handler body (a rejected
+request costs no DB/GCS work), and is overridable in tests. `/folders` and
+`/metadata` apply the budget at **router** level so a newly-added route
+cannot silently be unprotected.
+
+**Identity:** the JWT `sub` claim when a valid Bearer token is present
+(decoded locally, signature-verified, **no DB round trip**), else the
+client IP from `TrustedProxyMiddleware`. An invalid token is limited by IP
+— correct, since an attacker brute-forcing tokens has no identity. **No
+authorization happens here**: the token is an identity hint for bucketing
+only; every route still runs `CurrentUser` and its own ownership checks.
+
+**The 429 contract:**
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 6
+X-RateLimit-Limit: 10
+X-RateLimit-Remaining: 0
+X-RateLimit-Category: login
+
+{"success": false, "message": "Rate limit exceeded for 'login': ...",
+ "data": null, "errors": null, "timestamp": "...", "request_id": "..."}
+```
+
+Successful responses carry the same `X-RateLimit-*` headers, and unlimited
+routes still report `unlimited` rather than omitting them — so the Phase 4
+placeholder's client contract is *honored*, not broken, now that limits are
+real. That was the entire point of shipping the placeholder.
+
+### 14.10 Failure-handling / degradation matrix
+
+| Scenario | Behavior | User impact |
+|---|---|---|
+| Redis crashes / unreachable | Every cache op catches, logs `cache_error`, returns miss/no-op; reads fall through to Postgres; rate limiter fails open; locks at acquire raise `DistributedLockError` | **None functionally.** Higher latency, higher DB load |
+| Redis slow (not down) | `socket_timeout=2s` converts slow into an error → same path. The tight timeout is the point: a *slow* cache is worse than an *absent* one | ≤ +2s on the first affected command |
+| Connection pool exhausted | Treated exactly like an outage | As above. Sizing: `REDIS_MAX_CONNECTIONS` (20) × replicas; HPA max 10 → 200 against Memorystore |
+| Cache stale | Bounded by explicit invalidation + per-entity TTL + optional write guard | ≤ TTL of wrong data, worst case |
+| Stampede lock expires mid-populate | Another request becomes the winner; both write the same DB-derived value | None — a duplicate query, not a correctness problem |
+| Lock owner crashes | TTL expiry frees it; no shutdown hook required (`kill -9` never runs one) | Others wait ≤ lock TTL |
+| Rate limiter unreachable | Fail-open (default): allow + log at ERROR. Fail-closed: 429. Both implemented and tested | Fail-open: none. Fail-closed: total 429 |
+| Multiple pods, same key, same instant | Reads collapse via single-flight; writes are last-writer-wins on identical values; `DEL` is idempotent; rate-limit buckets are ONE atomic bucket shared by all pods | None |
+| Rolling deploy, two schema versions live | Envelope `v` mismatch reads as a **miss**; both builds repopulate in their own format | One cold period, never a crash |
+| Oversized value | Logged `cache_skipped_too_large`, write skipped, request succeeds from Postgres | None |
+| Redis memory pressure | Early eviction is indistinguishable from TTL lapse. **Ops:** set `maxmemory-policy allkeys-lru`; `noeviction` would turn a full cache into write errors | None |
+
+### 14.11 Local dev vs production Memorystore
+
+| | Local (`docker-compose.yml`) | Production |
+|---|---|---|
+| Instance | `redis:7-alpine`, no auth | Cloud Memorystore, **Standard tier** (HA + automatic failover) |
+| Address | `REDIS_HOST=redis` | Private Service Access IP (e.g. `10.0.0.4`), never public |
+| Auth / TLS | none | AUTH string in the Secret; in-transit encryption on |
+| Persistence | none needed | **none needed** — Redis holds nothing that matters |
+| Eviction | default | `allkeys-lru` |
+| Failure drill | `docker compose stop redis`, watch the API keep serving | The same behavior, exercised by a real failover |
+
+### 14.12 Kubernetes / GKE compatibility
+
+Nothing in Phase 7 weakens the statelessness Phase 4 established or the
+manifests Phase 5 wrote:
+
+- **No pod-local cache, no sticky sessions.** All cache state lives in
+  Memorystore, shared identically by every replica, so a request may land
+  on any pod. Scaling 3→10 or evicting a pod changes nothing.
+- **Rate limits are genuinely global.** Buckets are shared, so the
+  effective limit is per-user, not per-user-per-pod. An in-process limiter
+  would have silently multiplied every budget by the replica count — the
+  reason `slowapi` and friends are unusable here.
+- **Locks are TTL-based**, so a `SIGKILL`ed pod self-heals with no
+  shutdown hook — matching the PodDisruptionBudget/rolling-update model.
+- **Only one manifest changed**: additive keys in `k8s/05-configmap.yaml`,
+  consumed by the existing `envFrom`, so `07-deployment.yaml` was not
+  touched. `11-networkpolicy.yaml` already allows egress to the
+  Memorystore CIDR — still a placeholder that must be replaced with the
+  real range before a real deploy (unchanged Phase 5 caveat).
+
+### 14.13 Observability
+
+Structured `structlog` events only — a full Prometheus/OpenTelemetry stack
+is explicitly out of scope. The events are written to be *trivially*
+scrapable into metrics later: stable names, flat key/value pairs, numeric
+`duration_ms` on everything.
+
+`cache_hit` · `cache_miss` · `cache_set` · `cache_delete` ·
+`cache_invalidated` · `cache_error` · `cache_skipped_too_large` ·
+`cache_stampede_leader` / `_follower_served` / `_follower_read_through` ·
+`lock_acquired` / `lock_contended` / `lock_acquire_timeout` /
+`lock_released` / `lock_release_not_owned` / `lock_redis_error` ·
+`rate_limit_allowed` / `rate_limit_rejected` / `rate_limit_degraded`
+
+`request_id` / `correlation_id` / `trace_id` / `server_id` are never passed
+explicitly — `RequestContextMiddleware` binds them into structlog
+contextvars for the whole request, so they land on every line above
+automatically, including across `await` boundaries.
+
+**Rate-limit identities are hashed, never logged raw** (they are a user ID
+or a client IP — personal data with no business in a log aggregator). The
+hash is stable, so "this caller keeps getting limited" stays answerable.
+
+**Silence and fallback are different things.** Every degradation path logs
+before it degrades. A cache failing silently for a week while the app
+serves from Postgres at higher latency is a far worse incident than a loud
+one.
+
+### 14.14 Performance testing
+
+`scripts/benchmark/benchmark_cache.py` measures with-cache vs
+without-cache latency (p50/p90/p99) for three read paths:
+`GET /folders/{id}` (the *floor* — how much is pure network/serialization),
+`GET /folders/breadcrumb` (one query **per ancestor** uncached — the
+largest expected win), and `GET /metadata/search` (query + COUNT).
+
+```bash
+pip install httpx
+
+# Arm 1 — cache ON
+CACHE_ENABLED=true RATE_LIMIT_ENABLED=false uvicorn app.main:app --port 8000
+python scripts/benchmark/benchmark_cache.py --label cached --out cached.json
+
+# Arm 2 — restart with CACHE_ENABLED=false, then
+python scripts/benchmark/benchmark_cache.py --label uncached --out uncached.json
+
+python scripts/benchmark/benchmark_cache.py --compare cached.json uncached.json
+```
+
+`CACHE_ENABLED` is read once per process (`get_settings()` is `lru_cache`d),
+so the two arms need two server starts — deliberate, since a benchmark that
+flipped the flag mid-run would be measuring a half-warm process.
+
+> **No benchmark numbers are published anywhere in this repository.** A
+> speedup figure measured on someone else's laptop against a different
+> Postgres with a different working-set size is worse than no figure at
+> all. See `scripts/benchmark/README.md` for the runbook and, more
+> importantly, for what **not** to conclude — chiefly that this measures
+> latency at concurrency 1, while a cache's primary job is shedding load
+> under concurrency.
+
+### 14.15 Phase 7 Design Decisions
+
+- **JSON, never pickle**, for cache values. Three independent
+  disqualifiers: `pickle.loads` on a shared, network-reachable,
+  multi-writer datastore is arbitrary code execution; pickle encodes class
+  paths so a routine rename breaks every entry *mid-rolling-deploy*; and
+  pickle is unreadable from `redis-cli` during an incident.
+- **Every cached value carries a schema version**, and an unrecognized
+  version is treated as a **cache miss**, not an error. This is what makes
+  a cache-format change safe to deploy: during a rolling deploy both builds
+  read the same Redis, and the worst outcome is one cold period instead of
+  a partial outage.
+- **Postgres stays authoritative, and the code enforces it** —
+  `CacheSerializer.encode` raises on `bytes`, and every Redis exception is
+  caught, logged, and degraded to a miss. Cache failures cost latency,
+  never correctness or availability.
+- **One Redis pool, not two.** Phase 7 reuses Phase 4's
+  `app/database/redis.py` pool rather than creating a cache-specific one:
+  one place to size, one place to observe, one bounded connection ceiling
+  against Memorystore.
+- **All Redis access funnels through `CacheService`/`RateLimiter`.**
+  Scattered `await redis.get(...)` calls are how a cache outage becomes an
+  application outage — every call site would have to independently get
+  error handling right, and they never all do.
+- **Delete on write, never update.** Delete is idempotent and
+  order-independent; write-through cache updates can be applied in the
+  opposite order to their database commits, leaving the cache permanently
+  wrong with no TTL-independent way to detect it.
+- **Single-flight stampede protection with a bounded follower wait**, and
+  an explicit *"far fewer DB hits than requests"* guarantee rather than
+  *"exactly one"*. Unbounded waiting converts one slow query into
+  worker-pool exhaustion — strictly worse than the stampede.
+- **Resource-scoped cache keys plus an ownership re-check**, not
+  caller-scoped keys, for folders/files/users — except search, where a
+  result set has no owner field to re-check, so caller-scoping is the
+  correct answer. Authorization is re-derived on every cached read; a
+  decision is never cached. A non-owner gets a **404**, not a 403, so IDs
+  stay unguessable.
+- **The user cache is deliberately not on the auth path.**
+  `get_current_user` still reads Postgres on every request, preserving
+  Phase 1's "deactivation takes effect immediately" property. Caching the
+  profile endpoint is safe; caching the authorization lookup would have
+  silently undone a security decision.
+- **Token bucket over sliding window**, in one atomic Lua script: O(1)
+  memory and time, burst and sustained rate as separate tunables, and an
+  exact `Retry-After` from the token deficit rather than a guess.
+- **Rate limiting as a route dependency, not middleware** — the budget
+  lives next to the endpoint it governs, moves with it, and appears in
+  OpenAPI, instead of in a path-pattern table that rots on the next rename.
+- **Fail-open by default on rate limiting**, loudly logged and
+  configurable. This is abuse mitigation behind GCLB, not an authorization
+  control; failing closed would turn a Redis blip into a fleet-wide 429
+  storm for users mid-upload. `RATE_LIMIT_FAIL_OPEN=false` is implemented
+  and tested for deployments where the trade-off inverts.
+- **`SCAN`, never `KEYS`**, for pattern invalidation — `KEYS` is O(N) over
+  the whole keyspace and blocks Redis's single command thread.
+- **`DistributedLockService` is a facade, not a second lock
+  implementation.** Phase 4's `SET NX PX` + Lua-checked release was already
+  correct; what was missing was centralized timeout policy, ownership
+  introspection, and — most importantly — refusing to conflate *contention*
+  (409) with *Redis unreachable* (never "the lock is free").
+- **Exactly one new exception handler.** `RateLimitExceeded` needs a 429
+  with `Retry-After` that no existing handler can produce; every other new
+  Phase 7 exception subclasses an already-registered base and is mapped
+  correctly for free via FastAPI's MRO walk — the technique Phase 6
+  established.
+- **Search caching is deliberately the most conservative**: shortest TTL
+  (90s), a hard row-count ceiling, a byte ceiling, and coarse per-user
+  invalidation on every file write. A result set is a derived view that
+  cannot be invalidated precisely without a reverse index from row to
+  query — a search-engine feature, not a cache feature.
+- **Known, acknowledged gaps** (documented rather than hidden): invalidation
+  is not post-commit (§14.6's race), narrowed but not eliminated by the
+  now-default-on `CACHE_WRITE_GUARD_SECONDS` tombstone; no negative caching
+  (a hot 404 hits Postgres every time — deliberate, since caching it would
+  make a just-created resource 404 for a full TTL); no probabilistic early
+  expiration; no cache warming and no metrics backend. Descendant
+  breadcrumb staleness on ancestor rename, previously in this list, is
+  fixed — see §14.6.
+- **Out of scope this phase, unchanged:** Pub/Sub, background workers,
+  disaster recovery, multi-region, a Prometheus/OpenTelemetry stack, CI/CD,
+  AI features, virus scanning, advanced dedup.
+
+### 14.16 Testing
+
+`tests/test_caching.py` (72 tests) and `tests/test_rate_limiting.py` (29
+tests) — **101 new tests, 246/246 passing, zero regressions** against the
+pre-existing 145.
+
+Neither touches a real Redis. `tests/fakes/fake_redis.py` was **extended**
+(not replaced) with hash storage, `SCAN`, `INCR`, `EXPIRE`, `TTL`, real
+token-bucket arithmetic mirroring the Lua, a **controllable clock**
+(`FakeClock` — so "the lock expires after 30s" and "the bucket refills
+after the window" are instant, deterministic assertions rather than
+`sleep`s), and **failure injection** (`start_failing(*commands, after=N)`)
+— which is what makes every degradation assertion genuine rather than
+aspirational.
+
+Coverage: key naming/collision-safety/fingerprint stability · serializer
+round-tripping, schema versioning, bytes refusal · get/set/delete/exists/
+expire/increment/TTL/size limits/disabled switch · cache-aside population
+and the 50-concurrent-request stampede assertion · lock release on loader
+exception · Redis failure degradation on *every* operation · invalidator
+fan-out per operation and per-user search scoping · the opt-in write guard
+· lock acquisition, contention, expiry, ownership, the lost-lock
+Lua-release guard, strict release, timeout, and "Redis down is never
+mistaken for a free lock" · rate limits within/over budget, exact
+`Retry-After`, refill over controlled time, capacity capping, 20-concurrent
+single-bucket enforcement, identity and category isolation, reset, peek,
+fail-open and fail-closed, forged-token IP fallback · and end-to-end
+cache/DB consistency through the real HTTP API across
+create/read/rename/move/trash/restore/delete/version/search, plus the
+cross-user 404 authorization test and a full "Redis is dead, the API keeps
+working" test.
+
+### 14.17 Completion checklist
+
+- [x] Redis pool reused (not duplicated), config-driven timeouts/retry/health-check, graceful shutdown
+- [x] `CacheKeyBuilder` — centralized, collision-safe, predictable, with SCAN patterns
+- [x] `CacheSerializer` — JSON not pickle, versioned envelope, unknown version = miss
+- [x] `CacheService` — get/set/delete/exists/expire/increment/get_or_set/invalidate, every failure logged + degraded
+- [x] `CachePolicy` — per-entity TTLs, all config-driven
+- [x] `CacheInvalidator` — operation-named fan-out, delete-never-update
+- [x] Cache-aside with single-flight stampede protection and bounded follower wait
+- [x] `DistributedLockService` — bounded acquire, ownership validation, strict release, contention vs infrastructure separation
+- [x] `RateLimiter` — atomic Lua token bucket, per-category budgets, fail-open/closed configurable
+- [x] Real rate limiting replacing the Phase 4 no-op, wired to auth / metadata / folders / upload initiate+complete / search as dependencies
+- [x] Service integration: user, folder metadata/children/breadcrumbs, file metadata, versions, search
+- [x] Authorization preserved and re-derived on every cached read, analyzed per entity type
+- [x] All settings in `Settings` + `.env.example` + `k8s/05-configmap.yaml`
+- [x] Structured, metrics-ready logs for every cache/lock/rate-limit event; identities hashed
+- [x] 101 new tests, 246/246 passing, `FakeRedisClient` extended with failure injection + controllable clock
+- [x] Benchmark script + runbook with **no fabricated numbers**
+- [x] `docs/PHASE_7_REDIS_DESIGN.md`, this section, `CONTEXT.md`
+- [ ] Post-commit invalidation, descendant-breadcrumb fan-out, negative caching, probabilistic early expiration, cache warming, metrics backend — known gaps, deferred
+
+## 15. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -1610,7 +2196,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 15. Environment Variables
+## 16. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -1640,6 +2226,16 @@ See `.env.example` for the full list. Key variables:
 | `MAX_CHUNKS_PER_UPLOAD` | Sanity ceiling on chunk count per upload session; also bounds GCS multi-stage Compose recursion depth (Phase 6) |
 | `MAX_CHUNKED_UPLOAD_SIZE_GB` | Hard cap on declared total file size for the chunked-upload path — separate from, and larger than, `MAX_UPLOAD_SIZE_MB` (Phase 6) |
 | `UPLOAD_SESSION_EXPIRATION_MINUTES` | How long an idle upload session survives before lazy expiration (Phase 6) |
+| `CACHE_ENABLED` | Master cache kill switch; `false` makes the app behave exactly as it did in Phases 1-6 (Postgres-only) (Phase 7) |
+| `CACHE_KEY_PREFIX` | Global key namespace, so a shared Redis can be co-tenanted and `SCAN nimbusfs:*` is a full inventory (Phase 7) |
+| `CACHE_TTL_*_SECONDS` | Per-entity TTLs (user/folder/children/breadcrumbs/file/versions/search) — the hard ceiling on staleness if invalidation is ever missed (Phase 7) |
+| `CACHE_MAX_VALUE_BYTES` / `CACHE_SEARCH_MAX_ITEMS` | Refuse to cache oversized values / oversized search pages, so one huge entry cannot evict the hot working set (Phase 7) |
+| `CACHE_STAMPEDE_*` | Single-flight thundering-herd protection: lock TTL, bounded follower wait, poll interval (Phase 7) |
+| `CACHE_WRITE_GUARD_SECONDS` | Opt-in post-invalidation tombstone closing the invalidate-before-commit race; `0` = off (Phase 7) |
+| `REDIS_SOCKET_*_TIMEOUT_SECONDS` / `REDIS_RETRY_ON_TIMEOUT` / `REDIS_HEALTH_CHECK_INTERVAL_SECONDS` | Redis pool timeouts — deliberately tighter than DB/GCS, because a *slow* cache is worse than an absent one (Phase 7) |
+| `RATE_LIMIT_ENABLED` | Master rate-limit switch (Phase 7) |
+| `RATE_LIMIT_FAIL_OPEN` | `true` (default): Redis unreachable => allow + log loudly. `false` fails closed with 429 (Phase 7) |
+| `RATE_LIMIT_<CATEGORY>_REQUESTS` / `_WINDOW_SECONDS` | Per-category token-bucket budgets: login, register, metadata, search, upload_initiate, upload_complete, default (Phase 7) |
 
 ### Google Cloud Storage Setup
 
@@ -1733,7 +2329,8 @@ Migrations so far:
 ## 21. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
-services required.
+services required. **246/246 passing** (145 from Phases 1-6, 101 added by
+Phase 7).
 
 ```bash
 pytest -v
@@ -1794,10 +2391,37 @@ Coverage includes:
   transitions, simulated database/GCS/Redis failures (503/502/503,
   never a raw leaked exception), large declared file size, invalid file
   size, and the chunk-count ceiling.
+- **Phase 7** (`tests/test_caching.py` 72 tests + `tests/test_rate_limiting.py`
+  29 tests, against the *extended* `FakeRedisClient` — hashes, `SCAN`,
+  `INCR`, `EXPIRE`, `TTL`, real token-bucket arithmetic, a controllable
+  clock, and **failure injection**, never real Redis): key naming,
+  cross-entity collision safety and fingerprint stability; serializer
+  round-tripping of datetime/UUID/Decimal/Enum/set/BaseModel, unknown
+  schema version treated as a miss, refusal to cache raw bytes;
+  get/set/delete/exists/expire/increment, TTL lapse via the controllable
+  clock, oversized-value refusal, and the disabled-cache no-op; cache-aside
+  population plus the **50-concurrent-request stampede assertion** (fewer
+  than 10 may reach the source) and stampede-lock release when the loader
+  raises; graceful degradation on *every* cache operation with Redis
+  injected-failing, including "Redis dies mid-request"; invalidator
+  fan-out per operation and per-user search scoping; the opt-in write
+  guard; lock acquisition, contention, self-expiry, ownership, the
+  lost-lock Lua-release guard, strict release, bounded-timeout acquire,
+  and "Redis unreachable is never mistaken for a free lock"; rate limits
+  within and over budget, an exact `Retry-After`, refill over controlled
+  time, capacity capping (no banking), **20 concurrent requests sharing
+  ONE bucket**, identity and category isolation, reset/peek, fail-open and
+  fail-closed, and forged-token IP fallback; and end-to-end cache/DB
+  consistency through the real HTTP API across
+  create/read/rename/move/trash/restore/delete/version/search, a
+  cross-user **404** authorization test proving the cache is not an
+  authorization bypass, and a full "Redis is dead, the API keeps working"
+  test.
 
-Total: **145 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
-41 Phase 6 — Phase 5 shipped infrastructure/manifests, not application
-tests).
+Total: **246 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
+41 Phase 6 + 101 Phase 7 — Phase 5 shipped infrastructure/manifests, not
+application tests). Zero regressions: all 145 pre-Phase-7 tests still pass
+unchanged.
 
 ## 22. Future Roadmap (Phases 7–15, not yet built)
 
@@ -1805,13 +2429,19 @@ Sharing & permissions between users, virus scanning integration,
 thumbnail generation, full-text content search, Pub/Sub-driven
 background workers (including reconciliation of stuck
 `COMPLETING`-state upload sessions — see Phase 6 §13's "Advanced"
-interview question), real rate limiting, Redis metadata caching,
-content-dedup extension to the chunked-upload path, CI/CD via GitHub
-Actions, Terraform IaC, Cloud Armor, Cloud CDN, observability (Cloud
-Monitoring/Logging dashboards, OpenTelemetry tracing), multi-region
-deployment, disaster recovery. Kubernetes/GKE deployment and
-autoscaling (HPA) shipped in Phase 5 (§12); chunked/resumable uploads
-shipped in Phase 6 (§13) — both previously listed here.
+interview question), content-dedup extension to the chunked-upload path,
+CI/CD via GitHub Actions, Terraform IaC, Cloud Armor, Cloud CDN,
+observability (Cloud Monitoring/Logging dashboards, OpenTelemetry
+tracing), multi-region deployment, disaster recovery. Kubernetes/GKE
+deployment and autoscaling (HPA) shipped in Phase 5 (§12);
+chunked/resumable uploads shipped in Phase 6 (§13); **real rate limiting
+and Redis metadata caching shipped in Phase 7 (§14)** — all three
+previously listed here.
+
+Phase 7's own known gaps (post-commit invalidation, descendant-breadcrumb
+invalidation fan-out, negative caching, probabilistic early expiration,
+cache warming, a metrics backend) are catalogued in §14.15 and
+`docs/PHASE_7_REDIS_DESIGN.md`.
 
 ## 23. Contribution Guide
 
