@@ -165,6 +165,7 @@ from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
 from app.repositories.upload_chunk_repository import UploadChunkRepository
 from app.repositories.upload_session_repository import UploadSessionRepository
+from app.services.cache_invalidator import CacheInvalidator
 from app.services.file_validation_service import FileValidationService
 from app.services.storage_service import StorageService
 
@@ -197,6 +198,7 @@ class ChunkedUploadService:
         storage_service: StorageService,
         validator: FileValidationService,
         lock_factory: DistributedLockFactory,
+        invalidator: CacheInvalidator | None = None,
     ):
         self._sessions = upload_session_repository
         self._chunks = upload_chunk_repository
@@ -206,6 +208,11 @@ class ChunkedUploadService:
         self._storage = storage_service
         self._validator = validator
         self._locks = lock_factory
+        # Phase 7: optional (keeps every existing direct construction
+        # working); completing an upload creates a real FileMetadata row,
+        # so the folder's children listing and the owner's search pages
+        # must be invalidated exactly as they are for a Phase 3 upload.
+        self._invalidator = invalidator
         self._settings = get_settings()
 
     # ------------------------------------------------------------------
@@ -654,6 +661,9 @@ class ChunkedUploadService:
         session.completed_at = datetime.now(timezone.utc)
         session.updated_by = actor_id
         await self._sessions.flush()
+
+        if self._invalidator is not None:
+            await self._invalidator.file_changed(file.id, file.owner_id, file.folder_id)
 
         logger.info("upload_completed", upload_id=str(session.id), file_id=str(file.id), size=compose_result.size)
         return file

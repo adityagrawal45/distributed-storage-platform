@@ -47,6 +47,7 @@ from app.models.file_metadata import FileMetadata, FileStatus, UploadStatus
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
+from app.services.cache_invalidator import CacheInvalidator
 from app.services.file_validation_service import FileValidationService
 from app.services.storage_service import StorageService
 
@@ -64,12 +65,23 @@ class FileUploadService:
         version_repository: FileVersionRepository,
         storage_service: StorageService,
         validator: FileValidationService,
+        *,
+        invalidator: CacheInvalidator | None = None,
     ):
         self._files = file_repository
         self._folders = folder_repository
         self._versions = version_repository
         self._storage = storage_service
         self._validator = validator
+        # Phase 7: optional so every existing direct construction of this
+        # service (including in tests) keeps working unchanged; when
+        # present, file writes clear the file/folder-listing/search caches.
+        self._invalidator = invalidator
+
+    async def _invalidate_file(self, file: FileMetadata) -> None:
+        if self._invalidator is not None:
+            await self._invalidator.file_changed(file.id, file.owner_id, file.folder_id)
+            await self._invalidator.file_versions_changed(file.id)
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -205,6 +217,7 @@ class FileUploadService:
                 await self._rollback_object(object_name)
             raise
 
+        await self._invalidate_file(file)
         logger.info("upload_completed", file_id=str(file.id), object_name=object_name, is_duplicate=is_duplicate)
         return file, is_duplicate
 
@@ -309,6 +322,7 @@ class FileUploadService:
         if old_object_name and not await self._object_still_referenced(old_object_name, exclude_id=file.id):
             await self._storage.delete(old_object_name)
 
+        await self._invalidate_file(file)
         logger.info("replace_completed", file_id=str(file.id), object_name=new_object_name)
         return file
 
@@ -330,7 +344,12 @@ class FileUploadService:
             raise ValidationException("File must be moved to trash before it can be permanently deleted.")
 
         object_name = file.object_name
+        owner = file.owner_id
+        folder = file.folder_id
         await self._files.delete(file)
+
+        if self._invalidator is not None:
+            await self._invalidator.file_changed(file_id, owner, folder)
 
         if object_name and not await self._object_still_referenced(object_name):
             await self._storage.delete(object_name)
