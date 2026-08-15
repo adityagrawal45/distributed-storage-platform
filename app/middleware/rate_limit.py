@@ -1,46 +1,63 @@
 """
-Rate limiting placeholder (Phase 4).
+Rate-limit response headers (Phase 4 placeholder -> Phase 7 real).
 
-Design decisions:
-- Explicitly a NO-OP placeholder, not a real limiter — actual rate
-  limiting (token bucket / sliding window, backed by the shared Redis
-  every replica already has, keyed by user ID or client IP) is
-  deliberately deferred to a future phase per this phase's scope.
-- Wired into the middleware stack now, in its final position in the
-  chain, so:
-    1. The request/response contract it will eventually need (a
-       `429 Too Many Requests` short-circuit, `Retry-After` header) is
-       decided and documented here before it's implemented, not bolted
-       on later wherever happens to be convenient.
-    2. Every response already carries an `X-RateLimit-*` header
-       placeholder shape, so API consumers integrating against NimbusFS
-       today won't need a breaking client change when real limits land.
-- Reads `request.state.client_ip` (populated by `TrustedProxyMiddleware`,
-  which must run before this one) as the future rate-limit key, proving
-  out that the two middlewares compose correctly even though this one
-  doesn't act on it yet.
+What changed in Phase 7
+-----------------------
+Phase 4 shipped `RateLimitPlaceholderMiddleware`, an explicit no-op that
+stamped `X-RateLimit-Limit: unlimited` on every response purely to reserve
+the response contract. That contract is now honored for real: enforcement
+happens in `app/core/rate_limiter.py`, invoked per route by the
+`rate_limit(...)` dependency in `app/dependencies/rate_limit.py` (see that
+module for why a dependency beats middleware for the *decision*).
+
+This middleware keeps exactly one job — reporting. It reads whatever the
+dependency stashed on `request.state` and reflects it back as headers, so:
+
+  * routes that opted into a budget report their real remaining budget,
+  * routes that did not are still explicitly labelled `unlimited` rather
+    than silently omitting the headers, which would leave a client unable
+    to distinguish "no limit" from "limit headers not implemented",
+  * the header names and semantics are identical to what Phase 4
+    published, so no client integrating against NimbusFS needs a breaking
+    change now that limits are real — which was the entire point of
+    shipping the placeholder in its final position in the chain.
+
+The rejection path (429) does NOT flow through here: it is raised as
+`RateLimitExceeded` inside the dependency and rendered by
+`app/exceptions/handlers.py::rate_limit_exceeded_exception_handler`, which
+attaches `Retry-After` plus the same `X-RateLimit-*` headers to the error
+response. Handling headers in two places is deliberate — an exception
+short-circuits before the middleware's response object exists.
 """
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
 
+UNLIMITED = "unlimited"
 
-class RateLimitPlaceholderMiddleware(BaseHTTPMiddleware):
-    """
-    No-op today. Documents the seam a real limiter will occupy:
-    - Would reject over-limit requests with 429 + `Retry-After` before
-      `call_next` runs (fail fast, don't waste a DB/GCS round trip).
-    - Would decrement/check a Redis-backed counter keyed on
-      `request.state.client_ip` (unauthenticated) or `current_user.id`
-      (authenticated), scoped per-route-group so `/files/upload` and
-      `/auth/login` get independent budgets.
-    """
+
+class RateLimitHeadersMiddleware(BaseHTTPMiddleware):
+    """Reflects the per-route rate-limit decision as `X-RateLimit-*` headers."""
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
-        # Placeholder values only — no counting happens yet. Real limits
-        # will replace these with the actual budget/remaining/reset.
-        response.headers.setdefault("X-RateLimit-Limit", "unlimited")
-        response.headers.setdefault("X-RateLimit-Remaining", "unlimited")
+
+        limit = getattr(request.state, "rate_limit_limit", None)
+        remaining = getattr(request.state, "rate_limit_remaining", None)
+        category = getattr(request.state, "rate_limit_category", None)
+
+        response.headers.setdefault("X-RateLimit-Limit", str(limit) if limit is not None else UNLIMITED)
+        response.headers.setdefault(
+            "X-RateLimit-Remaining", str(remaining) if remaining is not None else UNLIMITED
+        )
+        if category:
+            response.headers.setdefault("X-RateLimit-Category", category)
+
         return response
+
+
+# Phase 4 name kept as an alias so any external import (or an operator's
+# muscle memory) does not break on the rename. It is the same middleware:
+# the placeholder's contract was designed to become this.
+RateLimitPlaceholderMiddleware = RateLimitHeadersMiddleware

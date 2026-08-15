@@ -39,6 +39,7 @@ from app.exceptions.custom_exceptions import (
     LockAcquisitionException,
     NimbusFSException,
     NotFoundException,
+    RateLimitExceeded,
     ServiceUnavailableException,
     StorageException,
     StorageObjectNotFoundException,
@@ -58,6 +59,7 @@ from app.exceptions.handlers import (
     idempotency_key_replayed_exception_handler,
     lock_acquisition_exception_handler,
     not_found_exception_handler,
+    rate_limit_exceeded_exception_handler,
     service_unavailable_exception_handler,
     sqlalchemy_exception_handler,
     storage_exception_handler,
@@ -70,7 +72,7 @@ from app.exceptions.handlers import (
 )
 from app.logging.logger import configure_logging, get_logger
 from app.middleware.proxy_headers import TrustedProxyMiddleware
-from app.middleware.rate_limit import RateLimitPlaceholderMiddleware
+from app.middleware.rate_limit import RateLimitHeadersMiddleware
 from app.middleware.request_context import RequestContextMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 
@@ -219,7 +221,9 @@ def create_application() -> FastAPI:
     #                               IDs, binds structlog context, logs
     #                               start/completion (needs the above
     #                               already resolved)
-    #   RateLimitPlaceholderMiddleware -> future rate-limit seam
+    #   RateLimitHeadersMiddleware -> reflects the per-route rate-limit
+    #                               decision (made by the `rate_limit(...)`
+    #                               dependency) as X-RateLimit-* headers
     #   SecurityHeadersMiddleware
     #   TrustedHostMiddleware
     #   CORSMiddleware
@@ -233,7 +237,7 @@ def create_application() -> FastAPI:
     )
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.ALLOWED_HOSTS)
     application.add_middleware(SecurityHeadersMiddleware)
-    application.add_middleware(RateLimitPlaceholderMiddleware)
+    application.add_middleware(RateLimitHeadersMiddleware)
     application.add_middleware(RequestContextMiddleware)
     application.add_middleware(TrustedProxyMiddleware)
 
@@ -259,6 +263,7 @@ def create_application() -> FastAPI:
     application.add_exception_handler(LockAcquisitionException, lock_acquisition_exception_handler)
     application.add_exception_handler(CircuitBreakerOpenException, circuit_breaker_open_exception_handler)
     application.add_exception_handler(ServiceUnavailableException, service_unavailable_exception_handler)
+    application.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_exception_handler)
     application.add_exception_handler(NimbusFSException, domain_exception_handler)
     application.add_exception_handler(SQLAlchemyError, sqlalchemy_exception_handler)
     application.add_exception_handler(Exception, unhandled_exception_handler)
