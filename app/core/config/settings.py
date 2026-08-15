@@ -111,6 +111,18 @@ class Settings(BaseSettings):
     REDIS_DB: int = 0
     REDIS_PASSWORD: str | None = None
     REDIS_MAX_CONNECTIONS: int = 20
+    # Phase 7: explicit socket timeouts on the shared pool. A hung Redis
+    # call must fail fast so a request can degrade to Postgres instead of
+    # pinning an event-loop task forever. These are deliberately SHORTER
+    # than the DB/GCS timeouts: Redis is a cache, and a cache that is slow
+    # is worse than a cache that is absent.
+    REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS: float = 2.0
+    REDIS_SOCKET_TIMEOUT_SECONDS: float = 2.0
+    # Retry a dropped connection once at the client-library level. Bounded
+    # deliberately — application-level fallback (serve from Postgres) is
+    # the real resilience mechanism, not unbounded client retries.
+    REDIS_RETRY_ON_TIMEOUT: bool = True
+    REDIS_HEALTH_CHECK_INTERVAL_SECONDS: int = 30
 
     # ------------------------------------------------------------------
     # Logging
@@ -224,6 +236,92 @@ class Settings(BaseSettings):
     # no background sweeper exists yet; that's future-phase work this
     # design deliberately leaves room for (see README Phase 6 section).
     UPLOAD_SESSION_EXPIRATION_MINUTES: int = 120
+
+    # ------------------------------------------------------------------
+    # Distributed Caching (Phase 7)
+    # ------------------------------------------------------------------
+    # Master switch. When false, `CacheService` short-circuits every
+    # operation into a miss/no-op — the app behaves exactly as it did in
+    # Phases 1-6 (Postgres-only). This is the operational kill switch for
+    # "the cache is doing something weird, turn it off and stay up".
+    CACHE_ENABLED: bool = True
+    # Global key namespace. Every key this app writes starts with it, so a
+    # shared Redis instance can host other tenants/apps without collision,
+    # and `SCAN nimbusfs:*` is a complete inventory of what we own.
+    CACHE_KEY_PREFIX: str = "nimbusfs"
+
+    # Per-entity TTLs. Config-driven, never hardcoded at call sites — see
+    # app/core/cache/policy.py for the reasoning behind each default.
+    CACHE_TTL_USER_SECONDS: int = 900  # 15 min — user rows change rarely
+    CACHE_TTL_FOLDER_SECONDS: int = 300  # 5 min
+    CACHE_TTL_FOLDER_CHILDREN_SECONDS: int = 300  # 5 min
+    CACHE_TTL_FOLDER_BREADCRUMBS_SECONDS: int = 300  # 5 min
+    CACHE_TTL_FILE_SECONDS: int = 300  # 5 min
+    CACHE_TTL_FILE_VERSIONS_SECONDS: int = 300  # 5 min
+    CACHE_TTL_SEARCH_SECONDS: int = 90  # 1.5 min — search results go stale fastest
+
+    # Refuse to cache anything larger than this. Redis is a shared,
+    # memory-resident, single-threaded service: one 50 MB value evicts
+    # thousands of useful small ones and blocks the server while it is
+    # serialized over the wire. Oversized values are logged and skipped
+    # (the request still succeeds, straight from Postgres).
+    CACHE_MAX_VALUE_BYTES: int = 256 * 1024  # 256 KiB
+    # Ceiling on how many rows a single search page may contain before it
+    # is considered "not worth caching" (see SearchService).
+    CACHE_SEARCH_MAX_ITEMS: int = 100
+
+    # Cache-stampede (thundering herd) protection — see
+    # app/services/cache_service.py::CacheService.get_or_set.
+    CACHE_STAMPEDE_PROTECTION_ENABLED: bool = True
+    CACHE_STAMPEDE_LOCK_TTL_SECONDS: float = 5.0  # ceiling on how long one populator may hold the right to populate
+    CACHE_STAMPEDE_WAIT_SECONDS: float = 0.5  # bounded wait for followers before they read through to Postgres
+    CACHE_STAMPEDE_POLL_INTERVAL_SECONDS: float = 0.02
+
+    # Post-invalidation write guard (delayed-double-delete style). When
+    # > 0, invalidating a key also plants a short-lived tombstone that
+    # suppresses cache *writes* for that key, closing the narrow race
+    # where a concurrent reader repopulates the cache with pre-commit data
+    # between a writer's DELETE and its COMMIT. Costs one extra round trip
+    # per cache population and leaves the key deliberately cold for this
+    # many seconds after every write.
+    #
+    # ON by default as of the Phase 7 follow-up: 1.5s is comfortably above
+    # a request transaction's typical commit latency (sub-millisecond to a
+    # few ms locally; still well under a second across an AZ on GKE), so it
+    # closes the race in the common case while costing at most one extra
+    # Postgres read per key per write — cheap next to serving stale data.
+    # Set to 0.0 to disable (e.g. if the extra round trip matters more than
+    # the race for a given deployment). See docs/PHASE_7_REDIS_DESIGN.md.
+    CACHE_WRITE_GUARD_SECONDS: float = 1.5
+
+    # ------------------------------------------------------------------
+    # Rate Limiting (Phase 7)
+    # ------------------------------------------------------------------
+    RATE_LIMIT_ENABLED: bool = True
+    # Fail-open (default): if Redis is unreachable, ALLOW the request and
+    # log loudly at ERROR. For a file-storage platform, availability beats
+    # strict limiting — a Redis outage must not become a total outage.
+    # Set false to fail closed (reject with 429) for deployments where
+    # abuse protection outranks availability.
+    RATE_LIMIT_FAIL_OPEN: bool = True
+
+    # Per-category budgets: `<N> requests per <W> seconds`, enforced as a
+    # token bucket of capacity N refilling at N/W tokens per second (so N
+    # is also the maximum instantaneous burst).
+    RATE_LIMIT_LOGIN_REQUESTS: int = 10
+    RATE_LIMIT_LOGIN_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_REGISTER_REQUESTS: int = 5
+    RATE_LIMIT_REGISTER_WINDOW_SECONDS: int = 300
+    RATE_LIMIT_METADATA_REQUESTS: int = 300
+    RATE_LIMIT_METADATA_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_UPLOAD_INITIATE_REQUESTS: int = 60
+    RATE_LIMIT_UPLOAD_INITIATE_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_UPLOAD_COMPLETE_REQUESTS: int = 60
+    RATE_LIMIT_UPLOAD_COMPLETE_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_SEARCH_REQUESTS: int = 60
+    RATE_LIMIT_SEARCH_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_DEFAULT_REQUESTS: int = 600
+    RATE_LIMIT_DEFAULT_WINDOW_SECONDS: int = 60
 
     @property
     def MAX_CHUNKED_UPLOAD_SIZE_BYTES(self) -> int:
