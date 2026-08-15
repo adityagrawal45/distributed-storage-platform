@@ -15,11 +15,15 @@ from fastapi import Depends
 from google.cloud import storage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache.keys import CacheKeyBuilder
+from app.core.cache.policy import CachePolicy
 from app.core.config import get_settings
-from app.core.distributed_lock import DistributedLockFactory
+from app.core.distributed_lock import DistributedLockFactory, DistributedLockService
+from app.core.rate_limiter import RateLimiter
 from app.database.gcs import get_storage_client
 from app.database.redis import get_redis
 from app.database.session import get_db
+from app.dependencies.rate_limit import RateLimiterDep, get_rate_limiter
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
@@ -28,6 +32,8 @@ from app.repositories.upload_chunk_repository import UploadChunkRepository
 from app.repositories.upload_session_repository import UploadSessionRepository
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
+from app.services.cache_invalidator import CacheInvalidator
+from app.services.cache_service import CacheService
 from app.services.chunked_upload_service import ChunkedUploadService
 from app.services.file_upload_service import FileUploadService
 from app.services.file_validation_service import FileValidationService
@@ -56,6 +62,72 @@ def get_idempotency_service(client: RedisClientDep) -> IdempotencyService:
 
 DistributedLockFactoryDep = Annotated[DistributedLockFactory, Depends(get_distributed_lock_factory)]
 IdempotencyServiceDep = Annotated[IdempotencyService, Depends(get_idempotency_service)]
+
+
+def get_distributed_lock_service(factory: DistributedLockFactoryDep) -> DistributedLockService:
+    """Phase 7: the bounded-wait/observable facade over the Phase 4 lock factory."""
+    settings = get_settings()
+    return DistributedLockService(
+        factory,
+        default_timeout_seconds=settings.LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        retry_interval_seconds=settings.LOCK_RETRY_INTERVAL_SECONDS,
+    )
+
+
+DistributedLockServiceDep = Annotated[DistributedLockService, Depends(get_distributed_lock_service)]
+
+
+# ---------------------------------------------------------------------
+# Caching (Phase 7)
+# ---------------------------------------------------------------------
+def get_cache_key_builder() -> CacheKeyBuilder:
+    return CacheKeyBuilder(get_settings().CACHE_KEY_PREFIX)
+
+
+def get_cache_policy() -> CachePolicy:
+    return CachePolicy(get_settings())
+
+
+def get_cache_service(
+    client: RedisClientDep,
+    lock_factory: DistributedLockFactoryDep,
+) -> CacheService:
+    """
+    One `CacheService` per request.
+
+    Request-scoped rather than process-scoped on purpose: it carries
+    per-request hit/miss counters, and it binds the same Redis client the
+    rest of the request uses — which is what lets `tests/conftest.py`
+    swap in `FakeRedisClient` through the single existing `get_redis`
+    override rather than needing a second, cache-specific override.
+    """
+    settings = get_settings()
+    return CacheService(
+        client,
+        CachePolicy(settings),
+        CacheKeyBuilder(settings.CACHE_KEY_PREFIX),
+        enabled=settings.CACHE_ENABLED,
+        lock_factory=lock_factory,
+    )
+
+
+CacheServiceDep = Annotated[CacheService, Depends(get_cache_service)]
+
+
+def get_cache_invalidator(cache: CacheServiceDep) -> CacheInvalidator:
+    return CacheInvalidator(cache)
+
+
+CacheInvalidatorDep = Annotated[CacheInvalidator, Depends(get_cache_invalidator)]
+
+# Rate limiting (Phase 7). `RateLimiterDep`/`get_rate_limiter` are defined
+# in `app/dependencies/rate_limit.py` — the `rate_limit(...)` dependency
+# factory there needs the limiter, and route modules import both, so
+# defining the provider there keeps the import graph acyclic. They are
+# re-exported under these names so every DI symbol stays discoverable from
+# this one module, matching the convention used above.
+RateLimiterProvider = get_rate_limiter
+RateLimiterDependency = RateLimiterDep
 
 
 def get_gcs_client() -> storage.Client:
@@ -116,24 +188,36 @@ def get_auth_service(
     return AuthService(user_repository, refresh_token_repository)
 
 
-def get_user_service(user_repository: UserRepositoryDep) -> UserService:
-    return UserService(user_repository)
+def get_user_service(
+    user_repository: UserRepositoryDep,
+    cache: CacheServiceDep,
+    invalidator: CacheInvalidatorDep,
+) -> UserService:
+    return UserService(user_repository, cache=cache, invalidator=invalidator)
 
 
-def get_folder_service(folder_repository: FolderRepositoryDep) -> FolderService:
-    return FolderService(folder_repository)
+def get_folder_service(
+    folder_repository: FolderRepositoryDep,
+    cache: CacheServiceDep,
+    invalidator: CacheInvalidatorDep,
+) -> FolderService:
+    return FolderService(folder_repository, cache=cache, invalidator=invalidator)
 
 
 def get_metadata_service(
     file_repository: FileMetadataRepositoryDep,
     version_repository: FileVersionRepositoryDep,
     folder_repository: FolderRepositoryDep,
+    cache: CacheServiceDep,
+    invalidator: CacheInvalidatorDep,
 ) -> MetadataService:
-    return MetadataService(file_repository, version_repository, folder_repository)
+    return MetadataService(
+        file_repository, version_repository, folder_repository, cache=cache, invalidator=invalidator
+    )
 
 
-def get_search_service(file_repository: FileMetadataRepositoryDep) -> SearchService:
-    return SearchService(file_repository)
+def get_search_service(file_repository: FileMetadataRepositoryDep, cache: CacheServiceDep) -> SearchService:
+    return SearchService(file_repository, cache=cache)
 
 
 def get_trash_service(
@@ -143,9 +227,12 @@ def get_trash_service(
 
 
 def get_version_service(
-    version_repository: FileVersionRepositoryDep, file_repository: FileMetadataRepositoryDep
+    version_repository: FileVersionRepositoryDep,
+    file_repository: FileMetadataRepositoryDep,
+    cache: CacheServiceDep,
+    invalidator: CacheInvalidatorDep,
 ) -> VersionService:
-    return VersionService(version_repository, file_repository)
+    return VersionService(version_repository, file_repository, cache=cache, invalidator=invalidator)
 
 
 def get_storage_service(client: GCSClientDep) -> StorageService:
@@ -166,8 +253,12 @@ def get_file_upload_service(
     version_repository: FileVersionRepositoryDep,
     storage_service: StorageServiceDep,
     validator: FileValidationServiceDep,
+    invalidator: CacheInvalidatorDep,
 ) -> FileUploadService:
-    return FileUploadService(file_repository, folder_repository, version_repository, storage_service, validator)
+    return FileUploadService(
+        file_repository, folder_repository, version_repository, storage_service, validator,
+        invalidator=invalidator,
+    )
 
 
 FileUploadServiceDep = Annotated[FileUploadService, Depends(get_file_upload_service)]
@@ -182,6 +273,7 @@ def get_chunked_upload_service(
     storage_service: StorageServiceDep,
     validator: FileValidationServiceDep,
     lock_factory: DistributedLockFactoryDep,
+    invalidator: CacheInvalidatorDep,
 ) -> ChunkedUploadService:
     return ChunkedUploadService(
         upload_session_repository,
@@ -192,6 +284,7 @@ def get_chunked_upload_service(
         storage_service,
         validator,
         lock_factory,
+        invalidator,
     )
 
 
