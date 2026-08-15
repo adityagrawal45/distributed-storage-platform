@@ -17,13 +17,15 @@ model, idempotency, checksum strategy).
 
 import uuid
 
-from fastapi import APIRouter, Header, Path, Request, status
+from fastapi import APIRouter, Depends, Header, Path, Request, status
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
 from app.core.enums import UploadSessionStatus
+from app.core.rate_limiter import RateLimitCategory
 from app.dependencies.auth import CurrentUser
 from app.dependencies.providers import ChunkedUploadServiceDep, IdempotencyServiceDep
+from app.dependencies.rate_limit import rate_limit
 from app.exceptions.custom_exceptions import ChunkSizeInvalidException
 from app.schemas.file_metadata import FileMetadataRead
 from app.schemas.response import APIResponse
@@ -73,6 +75,13 @@ async def _read_body_bounded(request: Request, max_bytes: int) -> bytes:
     response_model=APIResponse[UploadInitiateResponse],
     status_code=status.HTTP_201_CREATED,
     summary="Start a new chunked/resumable upload session",
+    # Phase 7: initiate and complete are rate-limited; the per-CHUNK PUT
+    # deliberately is NOT. A single large upload legitimately issues
+    # thousands of chunk PUTs in parallel (that is the entire point of
+    # Phase 6), so a per-request budget there would throttle correct
+    # behavior rather than abuse. Session creation and finalization are
+    # the natural, low-cardinality choke points to limit instead.
+    dependencies=[Depends(rate_limit(RateLimitCategory.UPLOAD_INITIATE))],
     description=(
         "Supports an optional `Idempotency-Key` header: retrying the same "
         "initiate call with the same key replays the original session "
@@ -221,6 +230,7 @@ async def upload_chunk(
     "/{upload_id}/complete",
     response_model=APIResponse[UploadCompleteResponse],
     summary="Finalize an upload: compose chunks, verify integrity, create the file",
+    dependencies=[Depends(rate_limit(RateLimitCategory.UPLOAD_COMPLETE))],
     description=(
         "Safe against duplicate requests: calling this again after a "
         "successful completion returns the same result rather than "

@@ -12,8 +12,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.core.rate_limiter import RateLimitCategory
 from app.dependencies.auth import CurrentUser
 from app.dependencies.providers import FolderServiceDep
+from app.dependencies.rate_limit import rate_limit
 from app.schemas.folder import (
     BreadcrumbItem,
     BreadcrumbResponse,
@@ -26,7 +28,16 @@ from app.schemas.folder import (
 from app.schemas.response import APIResponse
 from app.schemas.search import FolderListParams
 
-router = APIRouter(prefix="/folders", tags=["Folders"])
+# Phase 7: the METADATA budget is applied at the ROUTER level rather than
+# per-route. Every endpoint here is a metadata operation on the same
+# logical resource class, so one shared budget is the honest model — and a
+# router-level dependency cannot be forgotten when a route is added later,
+# which a per-route one can.
+router = APIRouter(
+    prefix="/folders",
+    tags=["Folders"],
+    dependencies=[Depends(rate_limit(RateLimitCategory.METADATA))],
+)
 
 
 @router.post("", response_model=APIResponse[FolderRead], status_code=status.HTTP_201_CREATED, summary="Create a folder")
@@ -44,10 +55,8 @@ async def list_folders(
     params: Annotated[FolderListParams, Depends()],
     parent_folder_id: uuid.UUID | None = Query(default=None, description="Null lists top-level folders."),
 ) -> APIResponse[list[FolderRead]]:
-    folders = await folder_service.list_children(current_user.id, parent_folder_id, params)
-    return APIResponse(
-        message="Folders retrieved successfully.", data=[FolderRead.model_validate(f) for f in folders]
-    )
+    folders = await folder_service.list_children_cached(current_user.id, parent_folder_id, params)
+    return APIResponse(message="Folders retrieved successfully.", data=folders)
 
 
 @router.get("/tree", response_model=APIResponse[list[FolderTreeNode]], summary="Get the folder tree")
@@ -68,7 +77,7 @@ async def get_breadcrumb(
     folder_service: FolderServiceDep,
     folder_id: uuid.UUID = Query(..., description="The folder to build a breadcrumb trail for."),
 ) -> APIResponse[BreadcrumbResponse]:
-    items = await folder_service.get_breadcrumb(folder_id, current_user.id)
+    items = await folder_service.get_breadcrumb_cached(folder_id, current_user.id)
     return APIResponse(message="Breadcrumb retrieved successfully.", data=BreadcrumbResponse(items=items))
 
 
@@ -86,8 +95,8 @@ async def list_folder_trash(
 async def get_folder(
     folder_id: uuid.UUID, current_user: CurrentUser, folder_service: FolderServiceDep
 ) -> APIResponse[FolderRead]:
-    folder = await folder_service.get_folder(folder_id, current_user.id)
-    return APIResponse(message="Folder retrieved successfully.", data=FolderRead.model_validate(folder))
+    folder = await folder_service.get_folder_cached(folder_id, current_user.id)
+    return APIResponse(message="Folder retrieved successfully.", data=folder)
 
 
 @router.put("/{folder_id}", response_model=APIResponse[FolderRead], summary="Rename a folder")

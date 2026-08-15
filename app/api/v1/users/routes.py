@@ -41,5 +41,8 @@ async def get_user_by_id(
     _admin: Annotated[User, Depends(require_role(UserRole.ADMIN))],
 ) -> APIResponse[UserRead]:
     """Restricted to ADMIN role via the `require_role` dependency factory."""
-    user = await user_service.get_by_id(user_id)
-    return APIResponse(message="User retrieved successfully.", data=UserRead.model_validate(user))
+    # Phase 7: cache-aside. The ADMIN check above still runs on every
+    # request — the cache holds the user resource, never the authorization
+    # decision (see UserService's module docstring).
+    profile = await user_service.get_profile(user_id)
+    return APIResponse(message="User retrieved successfully.", data=profile)

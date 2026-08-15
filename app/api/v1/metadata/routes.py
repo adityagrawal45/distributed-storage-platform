@@ -10,8 +10,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.core.rate_limiter import RateLimitCategory
 from app.dependencies.auth import CurrentUser
 from app.dependencies.providers import MetadataServiceDep, SearchServiceDep, VersionServiceDep
+from app.dependencies.rate_limit import rate_limit
 from app.schemas.file_metadata import (
     FileMetadataCreate,
     FileMetadataRead,
@@ -24,7 +26,16 @@ from app.schemas.pagination import Page, PaginationParams
 from app.schemas.response import APIResponse
 from app.schemas.search import FileSearchParams
 
-router = APIRouter(prefix="/metadata", tags=["File Metadata"])
+# Phase 7: router-level METADATA budget (see folders/routes.py for the
+# rationale). `/metadata/search` additionally carries the tighter SEARCH
+# budget — search is materially more expensive per call than a keyed read,
+# so it gets its own bucket on top of the shared one rather than
+# competing for the same tokens.
+router = APIRouter(
+    prefix="/metadata",
+    tags=["File Metadata"],
+    dependencies=[Depends(rate_limit(RateLimitCategory.METADATA))],
+)
 
 
 @router.post(
@@ -38,21 +49,20 @@ async def create_metadata(
     return APIResponse(message="File metadata created successfully.", data=FileMetadataRead.model_validate(file))
 
 
-@router.get("/search", response_model=APIResponse[Page[FileMetadataRead]], summary="Search files")
+@router.get(
+    "/search",
+    response_model=APIResponse[Page[FileMetadataRead]],
+    summary="Search files",
+    dependencies=[Depends(rate_limit(RateLimitCategory.SEARCH))],
+)
 async def search_files(
     current_user: CurrentUser,
     search_service: SearchServiceDep,
     search_params: Annotated[FileSearchParams, Depends()],
     pagination: Annotated[PaginationParams, Depends()],
 ) -> APIResponse[Page[FileMetadataRead]]:
-    items, total = await search_service.search_files(
-        current_user.id, search_params, pagination.offset, pagination.limit
-    )
-    page = Page.create(
-        items=[FileMetadataRead.model_validate(f) for f in items],
-        total=total,
-        page=pagination.page,
-        page_size=pagination.page_size,
+    page = await search_service.search_files_page(
+        current_user.id, search_params, pagination.page, pagination.page_size
     )
     return APIResponse(message="Search completed successfully.", data=page)
 
@@ -71,8 +81,8 @@ async def list_file_trash(
 async def get_metadata(
     file_id: uuid.UUID, current_user: CurrentUser, metadata_service: MetadataServiceDep
 ) -> APIResponse[FileMetadataRead]:
-    file = await metadata_service.get_metadata(file_id, current_user.id)
-    return APIResponse(message="File metadata retrieved successfully.", data=FileMetadataRead.model_validate(file))
+    file = await metadata_service.get_metadata_cached(file_id, current_user.id)
+    return APIResponse(message="File metadata retrieved successfully.", data=file)
 
 
 @router.put("/{file_id}", response_model=APIResponse[FileMetadataRead], summary="Update file metadata")
@@ -136,7 +146,5 @@ async def permanent_delete_file(
 async def get_file_versions(
     file_id: uuid.UUID, current_user: CurrentUser, version_service: VersionServiceDep
 ) -> APIResponse[list[FileVersionRead]]:
-    versions = await version_service.list_versions(file_id, current_user.id)
-    return APIResponse(
-        message="Version history retrieved successfully.", data=[FileVersionRead.model_validate(v) for v in versions]
-    )
+    versions = await version_service.list_versions_cached(file_id, current_user.id)
+    return APIResponse(message="Version history retrieved successfully.", data=versions)
