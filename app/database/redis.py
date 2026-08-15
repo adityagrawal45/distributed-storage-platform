@@ -6,11 +6,18 @@ Design decisions:
   the lifetime of the process; individual `Redis` client instances are
   cheap views over that pool, so we hand out a fresh client per request
   via dependency injection without re-establishing TCP connections.
-- No *metadata* caching logic lives here yet (explicitly deferred past
-  Phase 4). This module provides the shared-state plumbing three other
-  Phase 4 features build on: distributed locks
-  (`app/core/distributed_lock.py`), idempotency-key storage
-  (`app/services/idempotency_service.py`), and health/readiness checks.
+- This module owns the process's ONLY Redis connection pool. Phase 7 adds
+  caching and rate limiting on top of it and deliberately does NOT create
+  a second pool: one pool means one place to size, one place to observe,
+  and one bounded ceiling on connections against Memorystore
+  (`REDIS_MAX_CONNECTIONS` per replica x replica count). A dedicated
+  "cache pool" would double that ceiling for no benefit, since all of
+  these workloads are short, non-blocking commands on the same server.
+- Consumers: distributed locks (`app/core/distributed_lock.py`),
+  idempotency-key storage (`app/services/idempotency_service.py`),
+  health/readiness checks, and — Phase 7 — `CacheService`
+  (`app/services/cache_service.py`) and `RateLimiter`
+  (`app/core/rate_limiter.py`).
 - `decode_responses=True` so callers get native `str` back instead of
   `bytes`, matching typical Python ergonomics.
 - `socket_connect_timeout`/`socket_timeout` are set explicitly rather
@@ -36,8 +43,17 @@ redis_pool: redis.ConnectionPool = redis.ConnectionPool.from_url(
     settings.REDIS_URL,
     max_connections=settings.REDIS_MAX_CONNECTIONS,
     decode_responses=True,
-    socket_connect_timeout=5,
-    socket_timeout=5,
+    # Phase 7: these were hardcoded 5s literals; they are now
+    # config-driven and tightened to 2s. Redis is on the critical path of
+    # every cached read now, so a slow Redis must fail fast enough that
+    # falling back to Postgres is still cheaper than waiting.
+    socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+    socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+    retry_on_timeout=settings.REDIS_RETRY_ON_TIMEOUT,
+    # Proactively PING idle pooled connections rather than discovering a
+    # silently-dropped connection (Memorystore maintenance, a NAT idle
+    # timeout) on a user's request.
+    health_check_interval=settings.REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
 )
 
 
