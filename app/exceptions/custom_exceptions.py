@@ -443,3 +443,77 @@ class RateLimitExceeded(NimbusFSException):
 # `RateLimitExceeded` and `RateLimitExceededException` in different
 # places; both names refer to the same class so neither import breaks.
 RateLimitExceededException = RateLimitExceeded
+
+# ---------------------------------------------------------------------
+# Event-driven architecture (Phase 8)
+# ---------------------------------------------------------------------
+# These are WORKER-side exceptions: they are raised inside background
+# consumers, never inside an HTTP request, so — unlike every Phase 6/7
+# exception — they deliberately need no HTTP status mapping and no
+# handler registration. They still subclass `NimbusFSException` so that a
+# blanket `except NimbusFSException` anywhere in shared service code
+# keeps behaving predictably, and so they are recognizably ours in a log.
+#
+# The retryable/non-retryable split is the single most important
+# classification a consumer makes, because it decides ACK vs NACK:
+#   * NACK  -> Pub/Sub redelivers with backoff, and after
+#              MAX_DELIVERY_ATTEMPTS routes the message to the DLQ.
+#   * ACK   -> the message is gone forever.
+# Getting it backwards is expensive in both directions: NACKing a
+# permanently-broken message burns the DLQ budget and crash-loops the
+# worker on every redelivery, while ACKing a transient failure silently
+# drops real work.
+class EventProcessingError(NimbusFSException):
+    """Base for anything that goes wrong while consuming a domain event."""
+
+    def __init__(self, detail: str = "Event processing failed."):
+        super().__init__(detail)
+
+
+class RetryableEventError(EventProcessingError):
+    """
+    A transient failure — GCS timeout, database blip, dependency 503.
+
+    The consumer NACKs, and Pub/Sub redelivers per the subscription's
+    backoff policy. This is also the DEFAULT classification: any
+    unexpected exception escaping `process()` is treated as retryable,
+    because "try again" is the safe failure mode when we do not know what
+    went wrong.
+    """
+
+    def __init__(self, detail: str = "A transient error occurred while processing this event."):
+        super().__init__(detail)
+
+
+class NonRetryableEventError(EventProcessingError):
+    """
+    A permanent failure — a malformed envelope, an unsupported content
+    type, a referenced entity that no longer exists.
+
+    The consumer records `ProcessedEvent(status=FAILED, error=...)` and
+    **ACKs**. It deliberately does NOT route to the dead-letter topic:
+    the DLQ exists for messages whose *retryable* attempts were
+    exhausted and which a human may want to replay after a fix. A file
+    whose MIME type this build will never support does not become
+    supported by being redelivered five more times — sending it to the
+    DLQ would just move noise from one queue to another while hiding the
+    real reason in a delivery-attempt counter. The `ProcessedEvent` row
+    is the durable, queryable record instead.
+    """
+
+    def __init__(self, detail: str = "This event can never be processed successfully."):
+        super().__init__(detail)
+
+
+class EventPublishError(NimbusFSException):
+    """
+    Raised when handing a message to Pub/Sub fails.
+
+    On the outbox-publisher path this is caught per row and converted
+    into `mark_failed` + backoff, so one poisoned row never blocks its
+    siblings; the row stays in the outbox and is retried, which is
+    exactly the durability the outbox pattern exists to provide.
+    """
+
+    def __init__(self, detail: str = "Failed to publish an event to Pub/Sub."):
+        super().__init__(detail)

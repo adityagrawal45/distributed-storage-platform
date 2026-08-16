@@ -24,9 +24,12 @@ from app.database.gcs import get_storage_client
 from app.database.redis import get_redis
 from app.database.session import get_db
 from app.dependencies.rate_limit import RateLimiterDep, get_rate_limiter
+from app.events.publisher import EventPublisher
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
+from app.repositories.outbox_repository import OutboxRepository
+from app.repositories.processed_event_repository import ProcessedEventRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.upload_chunk_repository import UploadChunkRepository
 from app.repositories.upload_session_repository import UploadSessionRepository
@@ -172,6 +175,48 @@ def get_upload_chunk_repository(session: DbSession) -> UploadChunkRepository:
     return UploadChunkRepository(session)
 
 
+# ---------------------------------------------------------------------
+# Event-driven architecture (Phase 8)
+# ---------------------------------------------------------------------
+def get_outbox_repository(session: DbSession) -> OutboxRepository:
+    """
+    Bound to the SAME request-scoped session as every other repository —
+    which is the entire mechanism behind the transactional outbox.
+
+    Because `get_db` owns the only `session.commit()` in the codebase,
+    an outbox row inserted by a service during a request commits in the
+    same transaction as the business row it describes. No new
+    transaction-management code exists anywhere in Phase 8; the existing
+    Unit of Work already provides the atomicity, and the outbox pattern
+    is the technique for exploiting it.
+    """
+    return OutboxRepository(session)
+
+
+def get_processed_event_repository(session: DbSession) -> ProcessedEventRepository:
+    return ProcessedEventRepository(session)
+
+
+def get_event_publisher() -> EventPublisher:
+    """
+    Process-level publisher, resolved per request via DI.
+
+    Kept as its own provider (rather than being constructed inside a
+    service) for the same reason `get_gcs_client` is: it is the seam a
+    test overrides to inject `FakePublisherClient` without faking any
+    business logic. Note the API itself does NOT publish directly —
+    services write to the outbox and the outbox worker publishes. This
+    provider exists for worker-side use and for any future endpoint that
+    legitimately needs a direct publish.
+    """
+    return EventPublisher()
+
+
+OutboxRepositoryDep = Annotated[OutboxRepository, Depends(get_outbox_repository)]
+ProcessedEventRepositoryDep = Annotated[ProcessedEventRepository, Depends(get_processed_event_repository)]
+EventPublisherDep = Annotated[EventPublisher, Depends(get_event_publisher)]
+
+
 UserRepositoryDep = Annotated[UserRepository, Depends(get_user_repository)]
 RefreshTokenRepositoryDep = Annotated[RefreshTokenRepository, Depends(get_refresh_token_repository)]
 FolderRepositoryDep = Annotated[FolderRepository, Depends(get_folder_repository)]
@@ -200,8 +245,9 @@ def get_folder_service(
     folder_repository: FolderRepositoryDep,
     cache: CacheServiceDep,
     invalidator: CacheInvalidatorDep,
+    outbox: OutboxRepositoryDep,
 ) -> FolderService:
-    return FolderService(folder_repository, cache=cache, invalidator=invalidator)
+    return FolderService(folder_repository, cache=cache, invalidator=invalidator, outbox=outbox)
 
 
 def get_metadata_service(
@@ -210,9 +256,15 @@ def get_metadata_service(
     folder_repository: FolderRepositoryDep,
     cache: CacheServiceDep,
     invalidator: CacheInvalidatorDep,
+    outbox: OutboxRepositoryDep,
 ) -> MetadataService:
     return MetadataService(
-        file_repository, version_repository, folder_repository, cache=cache, invalidator=invalidator
+        file_repository,
+        version_repository,
+        folder_repository,
+        cache=cache,
+        invalidator=invalidator,
+        outbox=outbox,
     )
 
 
@@ -254,10 +306,12 @@ def get_file_upload_service(
     storage_service: StorageServiceDep,
     validator: FileValidationServiceDep,
     invalidator: CacheInvalidatorDep,
+    outbox: OutboxRepositoryDep,
 ) -> FileUploadService:
     return FileUploadService(
         file_repository, folder_repository, version_repository, storage_service, validator,
         invalidator=invalidator,
+        outbox=outbox,
     )
 
 
@@ -274,6 +328,7 @@ def get_chunked_upload_service(
     validator: FileValidationServiceDep,
     lock_factory: DistributedLockFactoryDep,
     invalidator: CacheInvalidatorDep,
+    outbox: OutboxRepositoryDep,
 ) -> ChunkedUploadService:
     return ChunkedUploadService(
         upload_session_repository,
@@ -285,6 +340,7 @@ def get_chunked_upload_service(
         validator,
         lock_factory,
         invalidator,
+        outbox=outbox,
     )
 
 
