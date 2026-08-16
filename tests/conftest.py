@@ -48,9 +48,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.database.redis import get_redis
 from app.database.session import Base, get_db
-from app.dependencies.providers import get_gcs_client
+from app.dependencies.providers import get_event_publisher, get_gcs_client
+from app.events.publisher import EventPublisher
 from app.main import app
 from tests.fakes.fake_gcs import FakeGCSClient
+from tests.fakes.fake_pubsub import FakePublisherClient
 from tests.fakes.fake_redis import FakeRedisClient
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -83,9 +85,26 @@ def fake_redis_client() -> FakeRedisClient:
     return FakeRedisClient()
 
 
+@pytest.fixture
+def fake_pubsub_client() -> FakePublisherClient:
+    """
+    A fresh in-memory fake Pub/Sub publisher per test — see
+    tests/fakes/fake_pubsub.py.
+
+    Note the API itself never publishes directly (services write to the
+    transactional outbox instead), so this override exists mainly so that
+    no test can ever reach real Pub/Sub even by accident, and so worker
+    tests can share one construction path with HTTP-level tests.
+    """
+    return FakePublisherClient()
+
+
 @pytest_asyncio.fixture
 async def client(
-    db_session: AsyncSession, fake_gcs_client: FakeGCSClient, fake_redis_client: FakeRedisClient
+    db_session: AsyncSession,
+    fake_gcs_client: FakeGCSClient,
+    fake_redis_client: FakeRedisClient,
+    fake_pubsub_client: FakePublisherClient,
 ) -> AsyncGenerator[AsyncClient, None]:
     async def _override_get_db():
         yield db_session
@@ -96,6 +115,12 @@ async def client(
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_gcs_client] = lambda: fake_gcs_client
     app.dependency_overrides[get_redis] = _override_get_redis
+    # Phase 8: `enabled=True` forces the real publish path through the
+    # fake, so a test that DOES publish exercises the executor/wrap_future
+    # bridge rather than the PUBSUB_ENABLED=False no-op branch.
+    app.dependency_overrides[get_event_publisher] = lambda: EventPublisher(
+        fake_pubsub_client, enabled=True
+    )
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
