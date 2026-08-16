@@ -323,6 +323,88 @@ class Settings(BaseSettings):
     RATE_LIMIT_DEFAULT_REQUESTS: int = 600
     RATE_LIMIT_DEFAULT_WINDOW_SECONDS: int = 60
 
+    # ------------------------------------------------------------------
+    # Pub/Sub / Event-Driven Architecture (Phase 8)
+    # ------------------------------------------------------------------
+    # GCP project that owns the topics/subscriptions. Distinct from
+    # `GCS_PROJECT_ID` on purpose: nothing forces bytes and events to live
+    # in the same project, and pinning them together in config would make
+    # splitting them later a code change rather than a config change.
+    GCP_PROJECT_ID: str = "nimbusfs-dev"
+
+    # Master kill switch, mirroring `CACHE_ENABLED`'s role for Phase 7.
+    # DEFAULT FALSE, deliberately: a brand-new outbound integration should
+    # land dark. With it off, `EventPublisher` becomes a logged no-op and
+    # the API behaves exactly as it did in Phases 1-7 — outbox rows are
+    # still written (they are just Postgres rows in the same transaction),
+    # they simply never leave the database until this is flipped on.
+    PUBSUB_ENABLED: bool = False
+    # When set (e.g. "localhost:8085"), the google-cloud-pubsub client
+    # talks to the local emulator instead of real GCP. Exported into the
+    # process environment by the publisher/subscriber factories.
+    PUBSUB_EMULATOR_HOST: str | None = None
+
+    # Three domain topics, not one firehose and not one-per-event-type:
+    # a topic is a fan-out boundary, and these are the three boundaries
+    # that actually have distinct consumer sets today.
+    FILE_EVENTS_TOPIC: str = "nimbusfs-file-events"
+    UPLOAD_EVENTS_TOPIC: str = "nimbusfs-upload-events"
+    NOTIFICATION_EVENTS_TOPIC: str = "nimbusfs-notification-events"
+
+    # Per-worker subscriptions, named `{topic}-{consumer}-sub`. Separate
+    # settings (not one shared name) because each worker is scaled,
+    # ack-deadline-tuned and DLQ-routed independently.
+    FILE_WORKER_SUBSCRIPTION: str = "nimbusfs-file-events-file-worker-sub"
+    THUMBNAIL_WORKER_SUBSCRIPTION: str = "nimbusfs-file-events-thumbnail-worker-sub"
+    NOTIFICATION_WORKER_SUBSCRIPTION: str = "nimbusfs-notification-events-notification-worker-sub"
+
+    # Delivery attempts before Pub/Sub routes a message to the subscription's
+    # dead-letter topic. Configured on the SUBSCRIPTION in GCP; mirrored here
+    # so workers can log "this is attempt N of M" meaningfully.
+    MAX_DELIVERY_ATTEMPTS: int = 5
+    # Ack deadline (seconds). Must exceed the p99 processing time of the
+    # slowest consumer (thumbnailing) or Pub/Sub redelivers work that is
+    # still in flight.
+    PUBSUB_ACK_DEADLINE: int = 60
+
+    # Transactional outbox publisher loop.
+    OUTBOX_BATCH_SIZE: int = 100
+    OUTBOX_POLL_INTERVAL: float = 2.0
+    # Exponential backoff applied to a failed outbox row's `next_attempt_at`:
+    # delay = min(BASE * 2**(attempt_count - 1), MAX).
+    OUTBOX_RETRY_BASE_DELAY_SECONDS: float = 2.0
+    OUTBOX_RETRY_MAX_DELAY_SECONDS: float = 300.0
+
+    # Worker runtime.
+    WORKER_CONCURRENCY: int = 10
+    WORKER_HEARTBEAT_INTERVAL_SECONDS: float = 10.0
+    # Liveness-probe target. A background heartbeat task touches this file
+    # on a timer INDEPENDENT of message arrival — an idle worker with an
+    # empty subscription is healthy, not dead, so a probe keyed on "did we
+    # process a message recently" would restart perfectly good pods.
+    WORKER_HEARTBEAT_FILE_PATH: str = "/tmp/healthy"
+    WORKER_SHUTDOWN_GRACE_SECONDS: float = 30.0
+
+    # Thumbnails (Phase 8).
+    THUMBNAIL_MAX_DIMENSION_PX: int = 512
+    # Explicit allow-list. Anything outside it is a NonRetryableEventError
+    # raised BEFORE any decode is attempted — Pillow must never be handed
+    # bytes of an unknown format on the strength of a client-declared MIME
+    # type. Same list-env-var technique as CORS_ALLOWED_ORIGINS_RAW.
+    THUMBNAIL_SUPPORTED_CONTENT_TYPES_RAW: str = Field(
+        default="image/jpeg,image/png,image/webp,image/gif",
+        alias="THUMBNAIL_SUPPORTED_CONTENT_TYPES",
+    )
+    THUMBNAIL_OBJECT_PREFIX: str = "thumbnails"
+
+    @property
+    def THUMBNAIL_SUPPORTED_CONTENT_TYPES(self) -> List[str]:
+        return [
+            item.strip().lower()
+            for item in self.THUMBNAIL_SUPPORTED_CONTENT_TYPES_RAW.split(",")
+            if item.strip()
+        ]
+
     @property
     def MAX_CHUNKED_UPLOAD_SIZE_BYTES(self) -> int:
         return self.MAX_CHUNKED_UPLOAD_SIZE_GB * 1024 * 1024 * 1024
