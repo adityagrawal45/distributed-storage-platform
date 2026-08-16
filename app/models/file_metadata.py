@@ -115,6 +115,18 @@ class FileMetadata(Base, AuditMixin, SoftDeleteMixin):
     etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ------------------------------------------------------------------
+    # Thumbnail (Phase 8). Nullable, and written ONLY by the asynchronous
+    # thumbnail worker — never on the upload request path. A null value
+    # means one of three things, all normal: the file is not an image, the
+    # thumbnail has not been generated yet (the event is still in flight),
+    # or generation permanently failed (in which case the reason is a
+    # `ProcessedEvent(status=FAILED)` row). No API contract changes: the
+    # column is additive and any client that does not know about it is
+    # unaffected.
+    # ------------------------------------------------------------------
+    thumbnail_object_name: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+
     upload_status: Mapped[UploadStatus] = mapped_column(
         SAEnum(
             UploadStatus,
