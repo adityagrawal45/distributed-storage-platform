@@ -51,6 +51,8 @@ import uuid
 from datetime import datetime, timezone
 
 from app.core.cache.policy import CacheEntity
+from app.events.emitter import OutboxEmitterMixin
+from app.events.envelope import EventType
 from app.exceptions.custom_exceptions import (
     CircularReferenceException,
     DuplicateFolderException,
@@ -59,6 +61,7 @@ from app.exceptions.custom_exceptions import (
 )
 from app.models.folder import Folder
 from app.repositories.folder_repository import FolderRepository
+from app.repositories.outbox_repository import OutboxRepository
 from app.schemas.folder import BreadcrumbItem, FolderRead, FolderTreeNode
 from app.schemas.search import FolderListParams
 from app.services.cache_invalidator import CacheInvalidator
@@ -66,17 +69,21 @@ from app.services.cache_service import CacheService
 from app.utils.path_utils import build_child_path, is_same_or_descendant_path
 
 
-class FolderService:
+class FolderService(OutboxEmitterMixin):
     def __init__(
         self,
         folder_repository: FolderRepository,
         *,
         cache: CacheService | None = None,
         invalidator: CacheInvalidator | None = None,
+        outbox: OutboxRepository | None = None,
     ):
         self._folders = folder_repository
         self._cache = cache
         self._invalidator = invalidator
+        # Phase 8: keyword-only, None-default — unset means no events, so
+        # every pre-existing construction keeps working unchanged.
+        self._outbox = outbox
 
     # ------------------------------------------------------------------
     # Cache helpers (Phase 7)
@@ -150,6 +157,19 @@ class FolderService:
         )
         folder = await self._folders.add(folder)
         await self._invalidate_folder(folder)
+        await self._emit_event(
+            EventType.FOLDER_CREATED,
+            aggregate_type="folder",
+            aggregate_id=folder.id,
+            user_id=owner_id,
+            payload={
+                "folder_id": str(folder.id),
+                "name": folder.name,
+                "path": folder.path,
+                "level": folder.level,
+                "parent_folder_id": str(parent_folder_id) if parent_folder_id else None,
+            },
+        )
         return folder
 
     async def get_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> Folder:
@@ -325,6 +345,28 @@ class FolderService:
         await self._invalidate_folder(folder)
         for node in descendants:
             await self._invalidate_folder(node)
+
+        # ONE event for the top-level folder the user actually deleted —
+        # not one per descendant. A recursive soft-delete of a 5,000-folder
+        # subtree is a single user intent; fanning it out per node would
+        # publish 5,000 messages describing one action, blow the outbox
+        # batch size, and force every consumer to re-derive that they were
+        # all part of the same operation. The descendant IDs ride along in
+        # the payload, so a consumer that genuinely needs them has them.
+        await self._emit_event(
+            EventType.FOLDER_DELETED,
+            aggregate_type="folder",
+            aggregate_id=folder.id,
+            user_id=owner_id,
+            payload={
+                "folder_id": str(folder.id),
+                "name": folder.name,
+                "path": folder.path,
+                "soft_delete": True,
+                "descendant_folder_ids": [str(node.id) for node in descendants],
+                "descendant_count": len(descendants),
+            },
+        )
 
     async def restore_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> Folder:
         folder = await self._folders.get_any_by_id(folder_id, owner_id)

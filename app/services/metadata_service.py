@@ -32,6 +32,8 @@ import uuid
 from datetime import datetime, timezone
 
 from app.core.cache.policy import CacheEntity
+from app.events.emitter import OutboxEmitterMixin
+from app.events.envelope import EventType
 from app.exceptions.custom_exceptions import (
     DuplicateFileException,
     FileNotFoundException,
@@ -42,12 +44,13 @@ from app.models.file_metadata import FileMetadata
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
+from app.repositories.outbox_repository import OutboxRepository
 from app.schemas.file_metadata import FileMetadataCreate, FileMetadataRead, FileMetadataUpdate
 from app.services.cache_invalidator import CacheInvalidator
 from app.services.cache_service import CacheService
 
 
-class MetadataService:
+class MetadataService(OutboxEmitterMixin):
     def __init__(
         self,
         file_repository: FileMetadataRepository,
@@ -56,12 +59,31 @@ class MetadataService:
         *,
         cache: CacheService | None = None,
         invalidator: CacheInvalidator | None = None,
+        outbox: OutboxRepository | None = None,
     ):
         self._files = file_repository
         self._versions = version_repository
         self._folders = folder_repository
         self._cache = cache
         self._invalidator = invalidator
+        # Phase 8: same keyword-only/None-default technique Phase 7 used
+        # for `invalidator`. Unset => no events, so every pre-existing
+        # construction and test keeps working verbatim.
+        self._outbox = outbox
+
+    async def _emit_file_event(
+        self, event_type: EventType, file: FileMetadata, payload: dict | None = None
+    ) -> None:
+        """Local convenience wrapper — every metadata event shares the same aggregate/user derivation."""
+        base = {"file_id": str(file.id), "filename": file.original_filename}
+        base.update(payload or {})
+        await self._emit_event(
+            event_type,
+            aggregate_type="file",
+            aggregate_id=file.id,
+            user_id=file.owner_id,
+            payload=base,
+        )
 
     # ------------------------------------------------------------------
     # Cache helpers (Phase 7)
@@ -186,6 +208,12 @@ class MetadataService:
         await self._invalidate_file(file)
         if content_changed and self._invalidator is not None:
             await self._invalidator.file_versions_changed(file.id)
+        if content_changed:
+            await self._emit_file_event(
+                EventType.FILE_VERSION_CREATED,
+                file,
+                {"version": file.version, "checksum": file.checksum, "size": file.size},
+            )
         return file
 
     async def rename_file(
@@ -199,10 +227,12 @@ class MetadataService:
         if await self._files.name_exists_in_folder(owner_id, file.folder_id, new_name, exclude_id=file.id):
             raise DuplicateFileException()
 
+        old_name = file.original_filename
         file.original_filename = new_name
         file.extension = self._split_extension(new_name)
         file.updated_by = actor_id
         await self._invalidate_file(file)
+        await self._emit_file_event(EventType.FILE_RENAMED, file, {"old_filename": old_name, "new_filename": new_name})
         return file
 
     async def move_file(
@@ -225,6 +255,14 @@ class MetadataService:
         file.updated_by = actor_id
         if self._invalidator is not None:
             await self._invalidator.file_moved(file.id, file.owner_id, old_folder_id, new_folder_id)
+        await self._emit_file_event(
+            EventType.FILE_MOVED,
+            file,
+            {
+                "old_folder_id": str(old_folder_id) if old_folder_id else None,
+                "new_folder_id": str(new_folder_id) if new_folder_id else None,
+            },
+        )
         return file
 
     async def delete_file(self, file_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> None:
@@ -234,6 +272,14 @@ class MetadataService:
         file.deleted_by = actor_id
         file.updated_by = actor_id
         await self._invalidate_file(file)
+        # Soft delete: the bytes are untouched and the file is restorable
+        # (see Phase 3 design decisions), so consumers must treat this as
+        # "moved to trash", not "purged".
+        await self._emit_file_event(
+            EventType.FILE_DELETED,
+            file,
+            {"soft_delete": True, "folder_id": str(file.folder_id) if file.folder_id else None},
+        )
 
     async def restore_file(self, file_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> FileMetadata:
         file = await self._files.get_any_by_id(file_id, owner_id)
@@ -245,6 +291,11 @@ class MetadataService:
         file.deleted_by = None
         file.updated_by = actor_id
         await self._invalidate_file(file)
+        await self._emit_file_event(
+            EventType.FILE_RESTORED,
+            file,
+            {"folder_id": str(file.folder_id) if file.folder_id else None},
+        )
         return file
 
     async def permanent_delete_file(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> None:

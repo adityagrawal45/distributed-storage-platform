@@ -137,6 +137,8 @@ from app.core.distributed_lock import DistributedLockFactory
 from app.core.enums import ChunkStatus, UploadSessionStatus
 from app.core.retry import RetryExhaustedError, retry_async
 from app.core.upload_state_machine import UploadStateMachine
+from app.events.emitter import OutboxEmitterMixin
+from app.events.envelope import EventType
 from app.exceptions.custom_exceptions import (
     ChunkChecksumMismatchException,
     ChunkNumberInvalidException,
@@ -163,6 +165,7 @@ from app.models.upload_session import UploadSession
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
+from app.repositories.outbox_repository import OutboxRepository
 from app.repositories.upload_chunk_repository import UploadChunkRepository
 from app.repositories.upload_session_repository import UploadSessionRepository
 from app.services.cache_invalidator import CacheInvalidator
@@ -187,7 +190,7 @@ class UploadProgress:
     uploaded_bytes: int
 
 
-class ChunkedUploadService:
+class ChunkedUploadService(OutboxEmitterMixin):
     def __init__(
         self,
         upload_session_repository: UploadSessionRepository,
@@ -199,6 +202,8 @@ class ChunkedUploadService:
         validator: FileValidationService,
         lock_factory: DistributedLockFactory,
         invalidator: CacheInvalidator | None = None,
+        *,
+        outbox: OutboxRepository | None = None,
     ):
         self._sessions = upload_session_repository
         self._chunks = upload_chunk_repository
@@ -213,6 +218,10 @@ class ChunkedUploadService:
         # so the folder's children listing and the owner's search pages
         # must be invalidated exactly as they are for a Phase 3 upload.
         self._invalidator = invalidator
+        # Phase 8: keyword-only, None-default (same technique Phase 7 used
+        # for `invalidator`) so every pre-existing construction — including
+        # all 41 Phase 6 tests — keeps working with no events emitted.
+        self._outbox = outbox
         self._settings = get_settings()
 
     # ------------------------------------------------------------------
@@ -650,6 +659,28 @@ class ChunkedUploadService:
         file = await self._files.add(file)
         await self._versions.create(file_id=file.id, version=1, checksum=actual_checksum, size=compose_result.size)
 
+        # Phase 8, event #1 of 2: `file.completed` describes the FILE that
+        # now exists — the same shape `file.uploaded` has for Phase 3's
+        # single-shot path, so a downstream consumer (thumbnailing,
+        # notification) handles both upload paths through one code path.
+        await self._emit_event(
+            EventType.FILE_COMPLETED,
+            aggregate_type="file",
+            aggregate_id=file.id,
+            user_id=session.owner_id,
+            payload={
+                "file_id": str(file.id),
+                "upload_id": str(session.id),
+                "folder_id": str(session.folder_id) if session.folder_id else None,
+                "filename": session.filename,
+                "content_type": mime_type,
+                "size": compose_result.size,
+                "checksum": actual_checksum,
+                "bucket_name": compose_result.bucket_name,
+                "object_name": compose_result.object_name,
+            },
+        )
+
         # Best-effort cleanup of the now-redundant per-chunk temp
         # objects — never fails the request; see StorageService.delete_many.
         await self._storage.delete_many(source_object_names)
@@ -664,6 +695,27 @@ class ChunkedUploadService:
 
         if self._invalidator is not None:
             await self._invalidator.file_changed(file.id, file.owner_id, file.folder_id)
+
+        # Phase 8, event #2 of 2: `upload.completed` describes the UPLOAD
+        # SESSION reaching a terminal state — a different aggregate, a
+        # different topic (UPLOAD_EVENTS_TOPIC), and a different audience
+        # (anything tracking session lifecycle/quota, rather than anything
+        # that cares about the resulting file). Emitted after the session
+        # row is flushed COMPLETED so the event and the state agree.
+        await self._emit_event(
+            EventType.UPLOAD_COMPLETED,
+            aggregate_type="upload_session",
+            aggregate_id=session.id,
+            user_id=session.owner_id,
+            payload={
+                "upload_id": str(session.id),
+                "file_id": str(file.id),
+                "filename": session.filename,
+                "total_size": compose_result.size,
+                "total_chunks": session.total_chunks,
+                "checksum": actual_checksum,
+            },
+        )
 
         logger.info("upload_completed", upload_id=str(session.id), file_id=str(file.id), size=compose_result.size)
         return file

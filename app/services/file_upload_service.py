@@ -42,11 +42,14 @@ from app.exceptions.custom_exceptions import (
     RollbackFailedException,
     ValidationException,
 )
+from app.events.emitter import OutboxEmitterMixin
+from app.events.envelope import EventType
 from app.logging.logger import get_logger
 from app.models.file_metadata import FileMetadata, FileStatus, UploadStatus
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
+from app.repositories.outbox_repository import OutboxRepository
 from app.services.cache_invalidator import CacheInvalidator
 from app.services.file_validation_service import FileValidationService
 from app.services.storage_service import StorageService
@@ -57,7 +60,7 @@ _HASH_CHUNK_SIZE = 256 * 1024
 _SNIFF_BYTES = 8192
 
 
-class FileUploadService:
+class FileUploadService(OutboxEmitterMixin):
     def __init__(
         self,
         file_repository: FileMetadataRepository,
@@ -67,6 +70,7 @@ class FileUploadService:
         validator: FileValidationService,
         *,
         invalidator: CacheInvalidator | None = None,
+        outbox: OutboxRepository | None = None,
     ):
         self._files = file_repository
         self._folders = folder_repository
@@ -77,6 +81,10 @@ class FileUploadService:
         # service (including in tests) keeps working unchanged; when
         # present, file writes clear the file/folder-listing/search caches.
         self._invalidator = invalidator
+        # Phase 8: same keyword-only/None-default technique, now for the
+        # transactional outbox. Bound to the request's session, so the
+        # event row commits in the same transaction as the file row.
+        self._outbox = outbox
 
     async def _invalidate_file(self, file: FileMetadata) -> None:
         if self._invalidator is not None:
@@ -212,6 +220,28 @@ class FileUploadService:
             )
             file = await self._files.add(file)
             await self._versions.create(file_id=file.id, version=1, checksum=checksum, size=size)
+            # Phase 8: emitted INSIDE the same try/transaction as the
+            # metadata write, so the event exists if and only if the file
+            # row does. If the rollback path below runs, the outbox row is
+            # rolled back with everything else — no consumer ever sees an
+            # event for a file that was never created.
+            await self._emit_event(
+                EventType.FILE_UPLOADED,
+                aggregate_type="file",
+                aggregate_id=file.id,
+                user_id=owner_id,
+                payload={
+                    "file_id": str(file.id),
+                    "folder_id": str(folder_id) if folder_id else None,
+                    "filename": validated_filename,
+                    "content_type": mime_type,
+                    "size": size,
+                    "checksum": checksum,
+                    "bucket_name": bucket_name,
+                    "object_name": object_name,
+                    "is_duplicate": is_duplicate,
+                },
+            )
         except Exception:
             if uploaded_object_this_call:
                 await self._rollback_object(object_name)
@@ -315,6 +345,22 @@ class FileUploadService:
             file.uploaded_at = datetime.now(timezone.utc)
             file.updated_by = actor_id
             await self._versions.create(file_id=file.id, version=file.version, checksum=checksum, size=size)
+            await self._emit_event(
+                EventType.FILE_VERSION_CREATED,
+                aggregate_type="file",
+                aggregate_id=file.id,
+                user_id=owner_id,
+                payload={
+                    "file_id": str(file.id),
+                    "version": file.version,
+                    "content_type": mime_type,
+                    "size": size,
+                    "checksum": checksum,
+                    "bucket_name": result.bucket_name,
+                    "object_name": new_object_name,
+                    "previous_object_name": old_object_name,
+                },
+            )
         except Exception:
             await self._rollback_object(new_object_name)
             raise
