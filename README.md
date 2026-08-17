@@ -696,7 +696,7 @@ deploy this" runbook is [`k8s/README.md`](k8s/README.md).
 **Scope note**: this phase deploys the application tier only. Pub/Sub,
 background workers, a monitoring/observability stack, CI/CD automation,
 multi-region deployment, and disaster recovery are all explicitly out
-of scope — see §22 "Future Roadmap". (Chunked uploads — listed here as
+of scope — see §23 "Future Roadmap". (Chunked uploads — listed here as
 out-of-scope when this section was originally written — shipped in
 Phase 6, §13.)
 
@@ -2187,7 +2187,539 @@ working" test.
 - [x] `docs/PHASE_7_REDIS_DESIGN.md`, this section, `CONTEXT.md`
 - [ ] Post-commit invalidation, descendant-breadcrumb fan-out, negative caching, probabilistic early expiration, cache warming, metrics backend — known gaps, deferred
 
-## 15. Installation
+## 15. Event-Driven Architecture: Pub/Sub + Transactional Outbox *(Phase 8)*
+
+Through Phase 7, every consequence of an upload happened *inside* the
+upload request. Phase 8 moves the non-critical consequences out: the API
+records that something happened and returns; separate worker processes
+decide what to do about it.
+
+The full engineering rationale — sequence diagrams, the dual-write hazard
+analysis, ack-timing, the DLQ runbook, ordering and versioning, an
+eleven-scenario failure catalogue — lives in
+**[`docs/event-driven-architecture.md`](docs/event-driven-architecture.md)**.
+This section is the walkthrough.
+
+### 15.1 The problem this phase exists to solve
+
+Thumbnailing an image takes seconds. Sending a notification depends on a
+third party. Neither is something the user's upload should wait for, and
+neither is something an upload should *fail* for. But the naive fix —
+publishing a message at the end of the request handler — introduces a
+worse bug than the one it solves:
+
+```python
+# The dual write. Do not do this.
+await session.commit()          # (1) Postgres says the file exists
+await publisher.publish(event)  # (2) ...and then the process dies
+```
+
+There is no transaction spanning Postgres and Pub/Sub. Crash between (1)
+and (2) and the file exists forever with no thumbnail and no
+notification, and **nothing anywhere knows**. Swap the order and you get
+the mirror-image bug: a `thumbnail.requested` for a file that was never
+committed, which every consumer will fail on permanently.
+
+The transactional outbox removes the second write entirely. The event is
+inserted as a **row in the same database transaction as the business
+data**. One commit, one atomic outcome. A separate process reads those
+rows and publishes them.
+
+> The outbox does not make delivery reliable. It makes the *decision to
+> deliver* atomic with the business fact. Delivery is then a separate,
+> retryable problem — which is a problem with a known solution, unlike
+> "we lost the fact that this happened."
+
+### 15.2 Architecture
+
+```
+   HTTP request
+        │
+        ▼
+  ┌───────────────────────────────────────────────────┐
+  │  FastAPI (Phases 1-7, unchanged)                  │
+  │                                                   │
+  │   ┌────────────── ONE TRANSACTION ─────────────┐  │
+  │   │  INSERT file_metadata  ...                 │  │
+  │   │  INSERT file_versions  ...                 │  │
+  │   │  INSERT outbox_events (status=PENDING) ◄───┼──┼── the only new write
+  │   └──────────────────┬─────────────────────────┘  │
+  │                   COMMIT                          │
+  └───────────────────────┼───────────────────────────┘
+                          ▼
+              ┌───────────────────────┐
+              │  PostgreSQL           │  outbox_events
+              │  (authoritative)      │  processed_events
+              └───────────┬───────────┘  notifications
+                          │ poll (FOR UPDATE SKIP LOCKED)
+                          ▼
+              ┌───────────────────────┐
+              │ outbox-publisher      │  publish → mark PUBLISHED → commit
+              └───────────┬───────────┘  (per row, never per batch)
+                          ▼
+   ┌──────────────────────────────────────────────────────┐
+   │                  Google Cloud Pub/Sub                 │
+   │   file-events        upload-events    notification-   │
+   │                                        events         │
+   └────┬──────────────────────┬──────────────────┬────────┘
+        │                      │                  │
+        ▼                      ▼                  ▼
+  ┌───────────────┐   ┌─────────────────┐  ┌──────────────────┐
+  │ file-worker   │   │ thumbnail-worker│  │ notification-    │
+  │ verify bytes  │   │ Pillow decode   │  │ worker           │
+  │ fan out ──────┼──►│ write thumbnail │  │ render + persist │
+  │               │   │ update metadata │  │ (stub delivery)  │
+  └───────┬───────┘   └─────────────────┘  └──────────────────┘
+          └──── publishes thumbnail.requested / notification.requested
+               DIRECTLY (worker-to-worker, no outbox — see §15.6)
+```
+
+Every worker is the **same container image** as the API, started with a
+different `python -m app.workers.<name>` command. One build, one
+dependency set, one copy of the SQLAlchemy models that read the same
+tables.
+
+### 15.3 The event flow, end to end
+
+1. `POST /files/upload` writes `FileMetadata`, `FileVersion` and an
+   `OutboxEvent(file.uploaded, PENDING)` — one transaction, one commit.
+2. `outbox-publisher` polls, publishes the row to `file-events`, marks it
+   `PUBLISHED`, commits. Per row, not per batch.
+3. `file-processing-worker` consumes it, does one cheap GCS metadata HEAD
+   to confirm the bytes really landed, cross-checks size/content-type
+   against what the event claimed, and publishes `thumbnail.requested`
+   (images only) plus `notification.requested`.
+4. `thumbnail-worker` downloads, decodes, resizes, writes
+   `thumbnails/{file_id}.png`, then sets
+   `FileMetadata.thumbnail_object_name`. In that order — see §15.9.
+5. `notification-worker` renders a subject/body and writes a
+   `Notification` row.
+
+Each consumer records a `ProcessedEvent(event_id, consumer_name)` in the
+same transaction as its work. That row is what makes a redelivery a
+no-op.
+
+`tests/test_events_integration.py` drives exactly this chain, stage by
+stage, through the real components.
+
+### 15.4 Event catalog
+
+| Event | Producer | Topic | Emitted from |
+|---|---|---|---|
+| `file.uploaded` | api | file-events | `FileUploadService.upload_file` |
+| `file.completed` | api | file-events | `ChunkedUploadService._finalize` |
+| `upload.completed` | api | upload-events | `ChunkedUploadService._finalize` |
+| `file.version.created` | api | file-events | `FileUploadService.replace_file`, `MetadataService.update_metadata` |
+| `file.deleted` | api | file-events | `MetadataService.delete_file` |
+| `file.restored` | api | file-events | `MetadataService.restore_file` |
+| `file.moved` | api | file-events | `MetadataService.move_file` |
+| `file.renamed` | api | file-events | `MetadataService.rename_file` |
+| `folder.created` | api | file-events | `FolderService.create_folder` |
+| `folder.deleted` | api | file-events | `FolderService.delete_folder` |
+| `thumbnail.requested` | file-worker | file-events | fan-out, direct publish |
+| `notification.requested` | file-worker | notification-events | fan-out, direct publish |
+
+Names are `{aggregate}.{past-tense-verb}`: events describe what **has
+already happened**, never a command. The two `*.requested` values are the
+deliberate exception — they are worker-to-worker work requests, and the
+name makes that visible in a log line without knowing the publisher.
+
+**Three topics, not one firehose and not twelve.** One topic would force
+every worker to receive and discard everything, coupling a slow thumbnail
+consumer to notification latency. Twelve would make adding an event type
+a Terraform change for no isolation benefit. Three is the number of
+genuinely distinct fan-out boundaries today — and `notification-events`
+is separate specifically because it is an **egress** boundary: a wedged
+email provider must never apply backpressure to file processing.
+
+The envelope (`app/events/envelope.py`) carries `event_id`,
+`event_type`, `event_version`, `occurred_at`, `producer`,
+`correlation_id`, `causation_id`, `tenant_id` (reserved, always null),
+`user_id`, and a free-form `payload`. Everything a consumer *framework*
+needs is a typed envelope field; everything a specific *handler* needs is
+in the payload. That split is what lets `BaseWorker` parse, deduplicate,
+log and route a message whose semantics it knows nothing about.
+
+`correlation_id` and `causation_id` are different things and both matter:
+correlation ties the whole tree back to one client operation (read from
+the same `structlog.contextvars` `RequestContextMiddleware` already
+binds, so a worker's logs join the user's original HTTP request with no
+manual threading); causation is one **edge** in that tree — the event
+that directly caused this one.
+
+### 15.5 Why an outbox, and what it does *not* buy
+
+`OutboxRepository.add_event` is deliberately boring: `session.add()` +
+`flush()`, exactly like every other repository here. No commit, no
+transaction of its own. That is the whole trick — the repository is built
+from the request-scoped session, and the only `session.commit()` in the
+entire application is in `app/database/session.py::get_db`. Phase 8 added
+**no transaction-management code at all**; it exploits the Unit of Work
+that was already there.
+
+Alternatives considered and rejected:
+
+- **Publish inside the request after commit** — the dual write above.
+- **Publish before commit** — publishes events for transactions that then
+  roll back. Strictly worse: now consumers act on facts that never
+  happened.
+- **Postgres logical decoding / Debezium CDC** — genuinely the more
+  scalable answer at high volume, and genuinely more operational surface
+  (a connector to run, schema-evolution coupling, a replication slot that
+  can silently fill your disk if a consumer stalls). For one service at
+  this volume, a polled table is the right size of solution.
+
+What the outbox does **not** buy: exactly-once delivery. It cannot. If
+the publisher dies after Pub/Sub accepts a message but before
+`mark_published` commits, the row stays `PENDING` and is republished next
+poll. That is deliberate — the alternative (mark published *before*
+publishing) trades a harmless duplicate for a silently lost event. The
+whole system is at-least-once, and idempotent consumers are the
+counterpart that makes it correct.
+
+### 15.6 Why the fan-out bypasses the outbox
+
+`thumbnail.requested` and `notification.requested` are published
+**directly** by the file worker, not through an outbox row. This looks
+inconsistent until you ask what the outbox is for: making a Postgres
+write atomic with a publish. At that point in the chain there is **no
+competing Postgres write** — the file worker validates and forwards, it
+mutates no business data. With nothing to be atomic with, an outbox row
+would add a table write, a poll interval of latency and a second
+process's involvement, and buy nothing.
+
+The failure mode is bounded and already handled: a failed fan-out publish
+NACKs the whole message, Pub/Sub redelivers, and the fan-out re-runs.
+
+### 15.7 Idempotency: the part that is easy to get subtly wrong
+
+Pub/Sub is at-least-once. Duplicates are not an edge case, they are the
+contract. Three mechanisms, in order of how load-bearing they are:
+
+1. **`ProcessedEvent`'s `UniqueConstraint(event_id, consumer_name)` is
+   the real guarantee.** The `has_processed` pre-check is an
+   *optimization only*. Two replicas can both pass the pre-check
+   concurrently; only one can win the insert. The loser catches
+   `IntegrityError`, logs a duplicate, and **still ACKs** — a NACK there
+   would request work that is definitionally already done.
+2. **Keyed per `(event_id, consumer_name)`, not per `event_id`.** Three
+   consumers legitimately process the same event. A ledger keyed on
+   `event_id` alone would let whichever worker arrived first block the
+   other two.
+3. **Derived event IDs are deterministic** — UUIDv5 over
+   `(parent_event_id, child_event_type)`. This is the subtle one. A
+   `uuid4()` there would give every retry of the fan-out a fresh
+   identity, so downstream deduplication would never fire and every
+   redelivery would regenerate the thumbnail forever. Nothing downstream
+   would notice; it would just cost money. There is a test whose only job
+   is to catch that regression.
+
+Work and ledger row commit **together**, in one transaction owned by
+`BaseWorker._handle` — the same "one commit at the boundary" discipline
+`get_db` enforces for the API. A consumer that committed its own work
+separately could crash between the two and re-notify a user.
+
+### 15.8 Retries, ack timing, and the dead-letter queue
+
+`BaseWorker` makes the ack/nack decision in exactly one place. If each
+worker made it for itself they would drift, and an inconsistent ack
+policy is how events get silently dropped.
+
+| Outcome | `ProcessedEvent` | Settle |
+|---|---|---|
+| pre-check hit (already processed) | (exists) | ACK |
+| `process()` returns | SUCCEEDED | ACK |
+| `NonRetryableEventError` | FAILED | ACK |
+| envelope fails to parse | none | ACK |
+| anything else | none | NACK |
+| lost idempotency race | (winner's) | ACK |
+
+**ACK after processing, never before.** Acking on receipt is the classic
+way to lose work: the message is gone from Pub/Sub the instant the
+process dies. Acking after means a crash mid-message costs a redelivery,
+which idempotency makes free.
+
+**The retryable/non-retryable split is where most of the judgment is.**
+Infrastructure failures (GCS timeout, DB unreachable, Pub/Sub publish
+failure) are retryable — NACK, and Pub/Sub redelivers with backoff.
+Content and contract failures are permanent: a malformed envelope, a
+payload missing its own required fields, an unsupported content type, a
+`FileMetadata` row that no longer exists. Redelivering those produces the
+same failure forever. Getting this backwards in *either* direction is
+expensive: classifying a transient error as permanent drops real work;
+classifying a permanent error as transient burns delivery attempts and
+eventually fills a DLQ with messages no human can fix.
+
+**Non-retryable errors are ACKed and recorded, never dead-lettered.** The
+DLQ is for *retry-exhausted* messages — the ones where a human might fix
+something and replay. A permanently unsupported file type will never
+succeed no matter how many times it is redelivered; putting it in the DLQ
+turns the DLQ into noise, and the noise is what makes teams stop reading
+it. The durable record is a queryable `ProcessedEvent(status=FAILED,
+error=...)` row instead. See the DLQ runbook in
+`docs/event-driven-architecture.md`.
+
+### 15.9 Ordering that matters, and ordering that does not
+
+**No Pub/Sub ordering keys this phase.** The event catalog was audited
+rather than assumed: every consumer shipped here is an idempotent
+projection with no cross-event sequencing need. A thumbnail is generated
+from the object's *current* bytes; a notification row is append-only;
+file validation reads current state. Ordering keys serialize delivery per
+key and cap throughput at one in-flight message per aggregate — a real
+cost for a guarantee nothing needs yet. `aggregate_id` is captured on
+every outbox row anyway, so enabling ordering later is a publisher-side
+change with no migration.
+
+Ordering *within* a worker is a different question, and it does have a
+right answer. The thumbnail worker generates and uploads the thumbnail
+**first**, then points the metadata row at it. Reversed, a crash between
+the two would leave `thumbnail_object_name` referencing an object that
+does not exist — a dangling pointer served to users. In this order the
+worst outcome is an orphaned object nothing references, costing a few
+kilobytes, which the next redelivery overwrites in place because the
+thumbnail object name is deterministic.
+
+### 15.10 Thumbnails, and why the allow-list comes first
+
+`ThumbnailService` supports exactly four raster types: `image/jpeg`,
+`image/png`, `image/webp`, `image/gif`. Anything else raises
+`NonRetryableEventError` **before any download and certainly before any
+decode**. That ordering is a security property, not an optimization —
+Pillow must never be handed bytes of an unknown format on the strength of
+a client-declared MIME type. `Image.open(formats=...)` then pins the
+decoder to the declared type, so a PNG relabelled as a JPEG is rejected
+rather than sniffed and decoded anyway.
+
+The thumbnail worker is a separate Deployment with a 1Gi memory limit
+(≈4x the others) for the same reason: a 50-megapixel image expands to
+hundreds of megabytes decoded, and co-locating that with file validation
+would force the limit onto every fan-out pod and let one bad image
+OOM-kill it.
+
+### 15.11 Notifications: a stub with a real seam
+
+`NotificationSender` is a one-method abstraction; `LoggingNotificationSender`
+is the only implementation this phase ships. It writes a `Notification`
+row and logs `would send email (stub)`. There is **no SMTP, no
+SendGrid/SES/FCM, no template engine, no delivery retry** — deliberately.
+Secrets management, bounce and complaint handling, unsubscribe compliance
+and per-provider retry semantics are an entire phase's worth of concerns,
+and none of them are about event plumbing.
+
+The seam exists anyway because it costs one class, and because the row is
+genuinely useful rather than a placeholder that does nothing: it makes
+the whole chain assertable in a test and queryable by an operator ("did
+the notification path actually run for this upload?").
+
+### 15.12 Configuration and the kill switch
+
+`PUBSUB_ENABLED` defaults to **false**. With it off, `EventPublisher` is
+a logged no-op and the API behaves exactly as it did in Phases 1-7 —
+outbox rows are still written transactionally, they simply never leave
+Postgres. This is why Phase 8 can land dark: flipping a config value, not
+deploying new code, turns the system on, and flipping it back stops all
+event traffic while events accumulate durably and drain when it returns.
+Same operational pattern as Phase 7's `CACHE_ENABLED`.
+
+Full variable list: §17. All of it is mirrored into
+`k8s/05-configmap.yaml`.
+
+### 15.13 Running it locally
+
+`docker-compose.yml` now ships a `pubsub-emulator` service plus the four
+workers:
+
+```bash
+# .env — the emulator needs no credentials, which is the point
+PUBSUB_ENABLED=true
+PUBSUB_EMULATOR_HOST=pubsub-emulator:8085
+GCP_PROJECT_ID=nimbusfs-dev
+
+docker compose up -d postgres redis pubsub-emulator
+# create topics + subscriptions once (the emulator starts empty):
+docker compose exec pubsub-emulator bash -c '
+  export PUBSUB_EMULATOR_HOST=localhost:8085
+  python -m pip install --quiet google-cloud-pubsub
+  python - <<PY
+from google.cloud import pubsub_v1
+p, s = pubsub_v1.PublisherClient(), pubsub_v1.SubscriberClient()
+project = "nimbusfs-dev"
+topics = ["nimbusfs-file-events", "nimbusfs-upload-events", "nimbusfs-notification-events"]
+subs = [("nimbusfs-file-events", "nimbusfs-file-events-file-worker-sub"),
+        ("nimbusfs-file-events", "nimbusfs-file-events-thumbnail-worker-sub"),
+        ("nimbusfs-notification-events", "nimbusfs-notification-events-notification-worker-sub")]
+for t in topics:
+    p.create_topic(name=p.topic_path(project, t))
+for t, sb in subs:
+    s.create_subscription(name=s.subscription_path(project, sb), topic=p.topic_path(project, t))
+PY'
+
+docker compose up -d app worker-outbox-publisher worker-file-processing \
+                     worker-thumbnail worker-notification
+docker compose logs -f worker-thumbnail
+```
+
+`PUBSUB_EMULATOR_HOST` is read by the **client library**, not by NimbusFS
+code — `EventPublisher.build_publisher_client` exports it into the
+process environment because that is the only channel google's client
+reads it from. Nothing in the application knows it is not talking to
+Google.
+
+The emulator is in-memory: topics, subscriptions and unacked messages are
+lost on restart. That is fine, and it is exactly why the outbox lives in
+Postgres — a wiped emulator loses *messages*, never *events*.
+
+**This was written but never run.** No Pub/Sub emulator, no Postgres, no
+Docker was started in any Phase 8 session. See §15.16.
+
+### 15.14 On GKE
+
+`k8s/16-worker-serviceaccounts.yaml` through
+`k8s/21-deployment-notification-worker.yaml`. Four Deployments, four
+ServiceAccounts, four RoleBindings; no Service, no Ingress, no readiness
+probe for any of them — workers pull from Pub/Sub and nothing connects to
+them.
+
+IAM is where the real least-privilege story is, and it is per-worker on
+purpose:
+
+| Worker | Pub/Sub | GCS |
+|---|---|---|
+| outbox-publisher | publisher on all 3 topics | none |
+| file-worker | subscriber (file-worker-sub) + publisher (file, notification) | objectViewer |
+| thumbnail-worker | subscriber (thumbnail-sub) | objectViewer + objectCreator on `thumbnails/` only |
+| notification-worker | subscriber (notification-sub) | none |
+
+Read that as a blast-radius statement. A compromised notification worker
+cannot read one user's file, because it has no GCS role at all — and it
+is the component that will one day talk to a third party, so it is the
+most exposed. One shared worker service account would hand every worker
+the union of all four.
+
+Other deliberate differences from the API Deployment:
+
+- **Default RollingUpdate**, not the API's `maxUnavailable:0/maxSurge:1`.
+  That tuning keeps HTTP traffic flowing through a deploy; there is no
+  traffic here. A worker killed mid-message does not ack, Pub/Sub
+  redelivers, and the ledger makes the reprocessing a no-op.
+- **Liveness only, as an exec probe on a heartbeat file** touched on a
+  timer independent of message arrival. An idle worker on an empty
+  subscription is healthy; a probe keyed on "processed a message
+  recently" would restart every worker on a quiet night. The probe checks
+  the file's *mtime*, not merely its existence, so a wedged event loop is
+  caught instead of papered over.
+- **`command:` in exec form**, so PID 1 is Python itself — a shell
+  wrapper would swallow SIGTERM and the graceful drain would never run.
+- **One shared ConfigMap**, extended, not a second worker ConfigMap.
+  Topic names are shared vocabulary, and a producer and consumer
+  disagreeing about a topic name is a silent total delivery failure — two
+  ConfigMaps is exactly how that disagreement happens. Genuinely
+  per-worker values (the thumbnail worker's `WORKER_CONCURRENCY=3`,
+  reduced from 10 because ten concurrent decodes against a 1Gi limit is
+  an OOMKill waiting for a busy hour) are a small per-Deployment `env:`
+  block, which takes precedence over `envFrom`.
+
+### 15.15 Failure scenarios
+
+Full catalogue in `docs/event-driven-architecture.md`; the headline cases:
+
+| Failure | What happens |
+|---|---|
+| Pub/Sub unavailable | Uploads keep working. Outbox rows accumulate `FAILED` with exponential backoff into `next_attempt_at` and drain when it returns. Nothing is lost. |
+| Publisher crashes after publish, before commit | Row stays `PENDING`, republished next poll. Consumers absorb the duplicate on `event_id`. |
+| Worker crashes mid-message | No ack, redelivery, reprocessed. `process()` is idempotent by contract. |
+| Worker crashes after work, before ack | Same — but the work *and* its ledger row committed together, so the redelivery hits the pre-check and is skipped. |
+| Postgres unavailable | The API is down anyway (it is authoritative). Workers NACK everything and the subscription backlog grows; nothing is lost. |
+| GCS unavailable | Thumbnail worker NACKs (retryable). A *missing object* is different — that is permanent, ACK + `FAILED` row. |
+| Duplicate event | Absorbed by `ProcessedEvent`. Losing a race on the unique constraint still ACKs. |
+| Poison message | Unparseable bytes: logged at ERROR and ACKed. Redelivering the same bytes produces the same bytes. |
+| Retry exhausted | Pub/Sub routes to the DLQ after `MAX_DELIVERY_ATTEMPTS`. Human triage, then replay. |
+
+### 15.16 What is NOT built, and what was never verified
+
+Stated plainly, because a claim of completeness that quietly excludes
+this list is worse than the gaps themselves:
+
+- **No live infrastructure was ever run.** Across both Phase 8 sessions,
+  no Pub/Sub emulator, no real Pub/Sub, no Postgres, no Docker, no GKE
+  cluster. Everything is verified against in-memory SQLite and
+  hand-written fakes. The `docker-compose.yml` additions and the six k8s
+  manifests are written and internally consistent; neither has been
+  started or applied. Migration `0005` has never been applied to a real
+  database.
+- **No autoscaling on backlog.** No HPA for any worker, and no
+  `num_undelivered_messages` custom metric — the natural scaling signal
+  for a consumer, and the natural next step.
+- **No real notification provider.** Stub sender only (§15.11).
+- **No DLQ replay tooling.** The runbook documents the `gcloud` steps;
+  there is no script, and nothing cross-region.
+- **Thumbnails cover four raster MIME types.** No PDF, SVG, video
+  keyframe, HEIC or TIFF.
+- **No reconciliation job.** Phase 6's known gap — an upload session
+  stuck mid-`COMPLETING` after a process crash — is now *possible* to fix
+  with workers in place, but was not fixed here.
+- **No metrics backend.** Every event is structured-logged with
+  metrics-ready fields; nothing scrapes them.
+
+### 15.17 Testing
+
+`tests/test_events_envelope.py`, `test_event_publisher.py`,
+`test_outbox_repository.py`, `test_processed_event_repository.py`,
+`test_event_emission.py`, `test_outbox_publisher_worker.py`,
+`test_base_worker.py`, `test_file_processing_worker.py`,
+`test_thumbnail_worker.py`, `test_notification_worker.py`, and
+`test_events_integration.py` — **410/410 passing, zero regressions**
+against the pre-existing 246.
+
+`tests/fakes/fake_pubsub.py` follows the same philosophy as the GCS and
+Redis fakes: it really *stores* messages per topic, so a test asserts
+"this exact envelope landed on this exact topic," not "publish was called
+once." Its `publish()` returns a `concurrent.futures.Future` — not a
+coroutine — precisely because that is what the real client returns and
+what `EventPublisher` must bridge with `asyncio.wrap_future`; faking it
+as awaitable would let a genuine event-loop-blocking bug pass.
+
+It deliberately does **not** simulate Pub/Sub's server behavior — no ack
+deadlines, no automatic redelivery, no DLQ routing. Those are Google's
+semantics, and faking them would be asserting our guesses about them.
+Where redelivery matters, a test hands the same message to the worker
+twice explicitly: a guaranteed duplicate is a stronger test than a
+probabilistic one.
+
+The thumbnail tests use **real Pillow on real bytes** — genuine JPEG/PNG/
+WebP/GIF generated in memory, thumbnails decoded back and measured, plus
+truncated files, empty objects and a PNG mislabelled as a JPEG. Mocking
+Pillow would test nothing; the entire risk in that component is what a
+decoder does with real and deliberately malformed input.
+
+`test_events_integration.py` is the one that proves the phase works as a
+*system*: it drives an image upload through the real FastAPI client, then
+each stage of the chain in turn against the shared fakes, asserting the
+outbox row, the published message, the fan-out, the rendered thumbnail
+and the notification row. It also runs the whole chain twice to prove
+redelivery changes nothing, and cuts Pub/Sub off mid-flight to prove the
+event stays durable and replayable.
+
+### 15.18 Completion checklist
+
+- [x] `EventEnvelope` + 12-value `EventType` catalog + topic routing table
+- [x] `OutboxEvent`/`ProcessedEvent`/`Notification` models + migration `0005` (never run against real Postgres)
+- [x] `OutboxRepository` (`FOR UPDATE SKIP LOCKED`, backoff) + `ProcessedEventRepository` (SAVEPOINT-guarded record)
+- [x] `EventPublisher` — executor-wrapped sync client, `PUBSUB_ENABLED` kill switch, one normalized exception type
+- [x] Emission wired into all 9 hook points via optional `outbox=` kwarg — zero pre-existing call sites or tests changed
+- [x] `outbox-publisher` worker: per-row commit, exponential backoff, survives Postgres being down
+- [x] `BaseWorker`: streaming pull, thread→asyncio bridge, per-message log context, one ack policy
+- [x] File processing, thumbnail (Pillow, 4 types, allow-list before decode) and notification (stub sender) workers
+- [x] Idempotency: unique constraint as the guarantee, pre-check as optimization, deterministic derived event IDs
+- [x] Graceful shutdown + heartbeat-file liveness, shared by all four workers
+- [x] Docker Compose: emulator + 4 worker services — **written, not run**
+- [x] k8s 16–21: per-worker KSA/GSA scoping, RBAC, 4 Deployments, ConfigMap + README extended — **written, not applied**
+- [x] 164 Phase 8 tests, 410/410 passing, zero regressions
+- [x] `docs/event-driven-architecture.md`, this section, `CONTEXT.md`
+- [ ] Backlog-based autoscaling, real notification provider, DLQ replay tooling, live-infrastructure verification — known gaps, deferred
+
+## 16. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -2196,7 +2728,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 16. Environment Variables
+## 17. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -2236,6 +2768,21 @@ See `.env.example` for the full list. Key variables:
 | `RATE_LIMIT_ENABLED` | Master rate-limit switch (Phase 7) |
 | `RATE_LIMIT_FAIL_OPEN` | `true` (default): Redis unreachable => allow + log loudly. `false` fails closed with 429 (Phase 7) |
 | `RATE_LIMIT_<CATEGORY>_REQUESTS` / `_WINDOW_SECONDS` | Per-category token-bucket budgets: login, register, metadata, search, upload_initiate, upload_complete, default (Phase 7) |
+| `PUBSUB_ENABLED` | Master event kill switch. **Defaults to `false`** so the integration lands dark: outbox rows are still written transactionally, they just never leave Postgres (Phase 8) |
+| `GCP_PROJECT_ID` | Project owning the topics/subscriptions — deliberately separate from `GCS_PROJECT_ID`, since bytes and events need not co-locate (Phase 8) |
+| `PUBSUB_EMULATOR_HOST` | Point the client library at a local emulator; **never set this in a real cluster** (Phase 8) |
+| `FILE_EVENTS_TOPIC` / `UPLOAD_EVENTS_TOPIC` / `NOTIFICATION_EVENTS_TOPIC` | The three domain topics — one per genuine fan-out boundary (Phase 8) |
+| `FILE_WORKER_SUBSCRIPTION` / `THUMBNAIL_WORKER_SUBSCRIPTION` / `NOTIFICATION_WORKER_SUBSCRIPTION` | One subscription per worker, `{topic}-{consumer}-sub` — separate settings because each is scaled and DLQ-routed on its own (Phase 8) |
+| `MAX_DELIVERY_ATTEMPTS` | Attempts before Pub/Sub dead-letters. The real counter lives on the subscription in GCP; this mirrors it for logging (Phase 8) |
+| `PUBSUB_ACK_DEADLINE` | Must exceed the p99 of the slowest consumer (thumbnailing) or Pub/Sub redelivers work still in flight (Phase 8) |
+| `OUTBOX_BATCH_SIZE` / `OUTBOX_POLL_INTERVAL` | Publisher loop sizing (Phase 8) |
+| `OUTBOX_RETRY_BASE_DELAY_SECONDS` / `OUTBOX_RETRY_MAX_DELAY_SECONDS` | Exponential backoff for a failed row: `min(BASE * 2**(attempt-1), MAX)`. Without it a Pub/Sub outage becomes a self-inflicted retry storm (Phase 8) |
+| `WORKER_CONCURRENCY` | Pub/Sub `FlowControl(max_messages)` — the real backpressure knob. Lowered to 3 for the thumbnail worker, whose limit is RAM, not network waits (Phase 8) |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS` / `WORKER_HEARTBEAT_FILE_PATH` | Liveness-probe target, touched on a timer independent of message arrival — an idle worker is healthy, not dead (Phase 8) |
+| `WORKER_SHUTDOWN_GRACE_SECONDS` | Bounded drain on SIGTERM; keep below the Deployment's `terminationGracePeriodSeconds` (Phase 8) |
+| `THUMBNAIL_MAX_DIMENSION_PX` | Bounding box; aspect ratio preserved, small images never upscaled (Phase 8) |
+| `THUMBNAIL_SUPPORTED_CONTENT_TYPES` | Explicit allow-list, enforced **before** any download or decode — Pillow is never handed bytes of an unlisted type (Phase 8) |
+| `THUMBNAIL_OBJECT_PREFIX` | GCS prefix for generated thumbnails; the object name is deterministic so regeneration overwrites rather than orphans (Phase 8) |
 
 ### Google Cloud Storage Setup
 
@@ -2270,7 +2817,7 @@ GKE service account to the IAM service account via Workload Identity, leave
 Default Credentials automatically — this is what makes `app/database/gcs.py`
 work unchanged across environments.
 
-## 17. Running Locally (without Docker)
+## 18. Running Locally (without Docker)
 
 Requires a local PostgreSQL and Redis instance matching your `.env`.
 
@@ -2282,7 +2829,7 @@ alembic upgrade head
 
 API available at `http://localhost:8000`, docs at `http://localhost:8000/docs`.
 
-## 18. Running with Docker
+## 19. Running with Docker
 
 ```bash
 cp .env.example .env
@@ -2296,7 +2843,7 @@ network. Apply migrations inside the running container:
 docker compose exec api alembic upgrade head
 ```
 
-## 19. Database Migrations (Alembic)
+## 20. Database Migrations (Alembic)
 
 ```bash
 # Generate a new migration from model changes
@@ -2318,7 +2865,7 @@ Migrations so far:
 - `0004_chunked_uploads` — creates `upload_sessions`, `upload_chunks`
   (Phase 6)
 
-## 20. API Documentation
+## 21. API Documentation
 
 - Swagger UI: `GET /docs`
 - ReDoc: `GET /redoc`
@@ -2326,11 +2873,11 @@ Migrations so far:
 
 (Docs are automatically disabled when `ENVIRONMENT=production`.)
 
-## 21. Testing
+## 22. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
-services required. **246/246 passing** (145 from Phases 1-6, 101 added by
-Phase 7).
+services required. **410/410 passing** (145 from Phases 1-6, 101 added by
+Phase 7, 164 added by Phase 8).
 
 ```bash
 pytest -v
@@ -2418,32 +2965,65 @@ Coverage includes:
   authorization bypass, and a full "Redis is dead, the API keeps working"
   test.
 
-Total: **246 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
-41 Phase 6 + 101 Phase 7 — Phase 5 shipped infrastructure/manifests, not
-application tests). Zero regressions: all 145 pre-Phase-7 tests still pass
-unchanged.
+- **Phase 8** (11 files, 164 tests, against `FakePubSubClient` +
+  `FakeGCSClient` + in-memory SQLite, never real Pub/Sub): envelope field
+  defaults and JSON round-tripping, every `EventType` having a topic
+  route; publish-when-enabled, no-op-when-disabled, and the
+  `concurrent.futures.Future` → asyncio bridge; outbox
+  `fetch_pending_batch` ordering, `mark_published`/`mark_failed`
+  transitions and the exponential-backoff arithmetic; **all nine emission
+  hook points** producing exactly one row with the right
+  aggregate/payload, and services constructed without an outbox emitting
+  nothing; publisher polling, per-row commit, failure marking a row
+  `FAILED` with an incremented attempt count and a `FAILED` row past its
+  `next_attempt_at` being retried; the complete `BaseWorker` ack policy —
+  ack-after-success, nack-on-retryable, ack-plus-`FAILED`-on-permanent,
+  duplicate pre-check skip, and a lost idempotency race still acking;
+  GCS-object validation, fan-out only for supported image types, and the
+  **deterministic derived event ID** test that exists to catch the
+  dedup-defeating `uuid4()` regression; **real Pillow on real bytes** for
+  all four supported formats plus truncated files, empty objects, a PNG
+  mislabelled as a JPEG, and the proof that an unsupported type is
+  rejected before storage is even touched; notification rendering,
+  fallback templates, and the stub sender's flush-never-commit contract;
+  and `tests/test_events_integration.py`, which drives an image upload
+  through the real HTTP API and then every stage of the chain in turn —
+  outbox row → published message → fan-out → rendered thumbnail →
+  notification row — plus a full-chain redelivery proving nothing
+  duplicates, and a mid-flight Pub/Sub outage proving the event stays
+  durable and replayable.
 
-## 22. Future Roadmap (Phases 7–15, not yet built)
+Total: **410 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
+41 Phase 6 + 101 Phase 7 + 164 Phase 8 — Phase 5 shipped
+infrastructure/manifests, not application tests). Zero regressions: all
+246 pre-Phase-8 tests still pass unchanged.
+
+## 23. Future Roadmap (Phases 7–15, not yet built)
 
 Sharing & permissions between users, virus scanning integration,
-thumbnail generation, full-text content search, Pub/Sub-driven
-background workers (including reconciliation of stuck
-`COMPLETING`-state upload sessions — see Phase 6 §13's "Advanced"
-interview question), content-dedup extension to the chunked-upload path,
-CI/CD via GitHub Actions, Terraform IaC, Cloud Armor, Cloud CDN,
+full-text content search, content-dedup extension to the chunked-upload
+path, CI/CD via GitHub Actions, Terraform IaC, Cloud Armor, Cloud CDN,
 observability (Cloud Monitoring/Logging dashboards, OpenTelemetry
 tracing), multi-region deployment, disaster recovery. Kubernetes/GKE
 deployment and autoscaling (HPA) shipped in Phase 5 (§12);
-chunked/resumable uploads shipped in Phase 6 (§13); **real rate limiting
-and Redis metadata caching shipped in Phase 7 (§14)** — all three
-previously listed here.
+chunked/resumable uploads shipped in Phase 6 (§13); real rate limiting
+and Redis metadata caching shipped in Phase 7 (§14); **Pub/Sub-driven
+background workers and thumbnail generation shipped in Phase 8 (§15)** —
+all previously listed here.
+
+Two things stay on this list even though Phase 8 made them *possible*:
+reconciliation of stuck `COMPLETING`-state upload sessions (Phase 6's
+known gap — the workers that could run it now exist, but no such job was
+written), and backlog-based worker autoscaling.
 
 Phase 7's own known gaps (post-commit invalidation, descendant-breadcrumb
 invalidation fan-out, negative caching, probabilistic early expiration,
 cache warming, a metrics backend) are catalogued in §14.15 and
-`docs/PHASE_7_REDIS_DESIGN.md`.
+`docs/PHASE_7_REDIS_DESIGN.md`. Phase 8's are in §15.16 and
+`docs/event-driven-architecture.md` — chief among them that **no part of
+Phase 8 was ever run against real infrastructure.**
 
-## 23. Contribution Guide
+## 24. Contribution Guide
 
 1. Create a feature branch from `main`.
 2. Keep business logic in `services/`, persistence in `repositories/` — never
