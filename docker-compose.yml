@@ -36,7 +36,7 @@ services:
     # header comment) — local dev and production run the identical
     # image, differing only in the `command:` override below (--reload)
     # and env vars, never in a separately-maintained Dockerfile.
-    build:
+    build: &app_build
       context: .
       dockerfile: docker/Dockerfile
       args:
@@ -78,6 +78,137 @@ services:
         alembic upgrade head &&
         uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
       "
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Phase 8: local Pub/Sub
+  # ------------------------------------------------------------------
+  # The official Cloud SDK image ships the Java-based Pub/Sub emulator.
+  # It speaks the real gRPC API, so nothing in the application knows it
+  # is not talking to Google — `PUBSUB_EMULATOR_HOST` is the only switch,
+  # and it is read by the client library itself, not by our code (see
+  # `EventPublisher.build_publisher_client`).
+  #
+  # The emulator is in-memory: topics, subscriptions and every unacked
+  # message are lost on restart. That is fine for local development and
+  # is exactly why the outbox lives in Postgres — a wiped emulator loses
+  # messages, never events.
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+    container_name: file_storage_pubsub
+    # `--host-port=0.0.0.0:8085` (not 127.0.0.1) is required for the
+    # port to be reachable from another container on the compose network.
+    command: >
+      gcloud beta emulators pubsub start
+        --project=${GCP_PROJECT_ID:-nimbusfs-dev}
+        --host-port=0.0.0.0:8085
+    ports:
+      - "8085:8085"
+    healthcheck:
+      # The emulator has no health endpoint; a TCP connect is the honest
+      # check. `bash` is present in the cloud-sdk image.
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8085' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Phase 8: the four worker processes
+  # ------------------------------------------------------------------
+  # Each is the SAME image as `app`, started with a different module
+  # entrypoint — which is the whole point of `python -m app.workers.<name>`:
+  # one build, one dependency set, one set of settings, four processes.
+  # Separate services (not one container running four processes) so each
+  # gets its own restart policy, its own logs and — in GKE — its own
+  # service account, replica count and resource limits.
+  #
+  # They deliberately do NOT publish ports: a worker serves no inbound
+  # traffic, which is also why the Kubernetes manifests give them no
+  # Service and no readiness probe.
+  worker-outbox-publisher:
+    build: *app_build
+    container_name: file_storage_worker_outbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pubsub-emulator:
+        condition: service_healthy
+    environment: &worker_environment
+      - ENVIRONMENT=development
+      - POSTGRES_USER=nimbusfs
+      - POSTGRES_PASSWORD=nimbusfs
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=nimbusfs
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-secret-key}
+      - BUILD_VERSION=${BUILD_VERSION:-dev-local}
+      - GIT_COMMIT=${GIT_COMMIT:-unknown}
+      # Workers are useless with the kill switch off, so unlike `app`
+      # they turn it on explicitly rather than inheriting the
+      # ship-dark default (`PUBSUB_ENABLED=false`).
+      - PUBSUB_ENABLED=true
+      - PUBSUB_EMULATOR_HOST=pubsub-emulator:8085
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID:-nimbusfs-dev}
+      # A worker must never fail-fast on a dependency check at startup:
+      # Kubernetes/compose restart loops are a worse answer than a
+      # logged, retried poll (see OutboxPublisherWorker.run).
+      - FAIL_FAST_ON_STARTUP=false
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+    command: python -m app.workers.outbox_publisher
+    restart: unless-stopped
+
+  worker-file-processing:
+    build: *app_build
+    container_name: file_storage_worker_file
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pubsub-emulator:
+        condition: service_healthy
+    environment: *worker_environment
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+    command: python -m app.workers.file_processing_worker
+    restart: unless-stopped
+
+  worker-thumbnail:
+    build: *app_build
+    container_name: file_storage_worker_thumbnail
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pubsub-emulator:
+        condition: service_healthy
+    environment: *worker_environment
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+    command: python -m app.workers.thumbnail_worker
+    restart: unless-stopped
+
+  worker-notification:
+    build: *app_build
+    container_name: file_storage_worker_notification
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pubsub-emulator:
+        condition: service_healthy
+    environment: *worker_environment
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+    command: python -m app.workers.notification_worker
     restart: unless-stopped
 
 volumes:
