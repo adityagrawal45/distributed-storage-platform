@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------
+# Worker RBAC (Phase 8)
+# ---------------------------------------------------------------------
+# Four RoleBindings, all pointing at the SAME Role that 04-rbac.yaml
+# already defines (`nimbusfs-app-role`: get/list/watch on exactly
+# `nimbusfs-config` and `nimbusfs-secrets`, nothing else, namespace-
+# scoped). No new Role is created here.
+#
+# Why reuse rather than define a per-worker Role: a Kubernetes Role
+# governs access to the KUBERNETES API, and every worker's need there is
+# identical to the API's and equally theoretical — none of them call the
+# Kubernetes API today; configuration arrives as env vars at container
+# start. Four copies of an identical rule set would be four places to
+# drift. The permissions that genuinely DO differ per worker are Google
+# Cloud IAM permissions (Pub/Sub, GCS), and those are enforced through
+# Workload Identity on separate GSAs — see 16-worker-serviceaccounts.yaml.
+# Conflating the two would be the actual mistake: a shared Kubernetes
+# Role is fine precisely because it grants nothing interesting, while a
+# shared *GSA* would be a real least-privilege violation.
+#
+# Separate RoleBindings rather than one binding listing four subjects:
+# each is then independently revocable, and `kubectl delete rolebinding
+# nimbusfs-thumbnail-worker-rolebinding` cuts off exactly one workload
+# during an incident without touching the other three.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nimbusfs-outbox-publisher-rolebinding
+  namespace: nimbusfs
+subjects:
+  - kind: ServiceAccount
+    name: nimbusfs-outbox-publisher-ksa
+    namespace: nimbusfs
+roleRef:
+  kind: Role
+  name: nimbusfs-app-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nimbusfs-file-worker-rolebinding
+  namespace: nimbusfs
+subjects:
+  - kind: ServiceAccount
+    name: nimbusfs-file-worker-ksa
+    namespace: nimbusfs
+roleRef:
+  kind: Role
+  name: nimbusfs-app-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nimbusfs-thumbnail-worker-rolebinding
+  namespace: nimbusfs
+subjects:
+  - kind: ServiceAccount
+    name: nimbusfs-thumbnail-worker-ksa
+    namespace: nimbusfs
+roleRef:
+  kind: Role
+  name: nimbusfs-app-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nimbusfs-notification-worker-rolebinding
+  namespace: nimbusfs
+subjects:
+  - kind: ServiceAccount
+    name: nimbusfs-notification-worker-ksa
+    namespace: nimbusfs
+roleRef:
+  kind: Role
+  name: nimbusfs-app-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,135 @@
+# ---------------------------------------------------------------------
+# Thumbnail Worker Deployment (Phase 8)
+# ---------------------------------------------------------------------
+# Shared worker-Deployment reasoning: see
+# 18-deployment-outbox-publisher.yaml. Only the differences are here —
+# and this worker has the most of them, because it is the only genuinely
+# resource-hungry component in NimbusFS.
+#
+# MEMORY is the headline
+# ----------------------
+# Decoding an image expands it: a 50-megapixel PNG is a few megabytes on
+# disk and roughly `width x height x 4` bytes decoded — hundreds of
+# megabytes of RSS for one file. The limit below (1Gi, ~4x every other
+# worker) is sized for that worst case with headroom, and the whole
+# reason thumbnailing is a separate Deployment rather than a code path
+# inside the file worker: co-locating them would force this memory limit
+# onto every file-validation pod, and one hostile image would OOM-kill a
+# pod that was also responsible for fan-out.
+#
+# Note what a limit does NOT do: it bounds the blast radius, it does not
+# prevent the decode bomb. The real defenses are upstream in
+# `ThumbnailService` — the four-type allow-list checked BEFORE any
+# download, and `Image.open(formats=...)` pinning the decoder to the
+# declared type so a mislabelled file is rejected rather than sniffed.
+# See docs/event-driven-architecture.md.
+#
+# CONCURRENCY is overridden DOWN, and that is the important line
+# ---------------------------------------------------------------
+# WORKER_CONCURRENCY is 10 in the ConfigMap, which is right for the I/O-
+# bound workers. Here it is 3. Ten concurrent decodes against a 1Gi limit
+# is an OOMKill waiting for a busy hour: the other workers' concurrency
+# is bounded by network waits, this one's is bounded by RAM. It is set
+# via a per-Deployment `env:` entry, which takes precedence over
+# `envFrom` — exactly the per-worker-override mechanism the "one shared
+# ConfigMap" decision (05-configmap.yaml) depends on.
+#
+# CPU is also higher: decode/resize is the only real CPU work in the
+# system, and throttling it just stretches the ack deadline.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbusfs-thumbnail-worker
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: thumbnail-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: thumbnail-worker
+  strategy:
+    type: RollingUpdate
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nimbusfs
+        app.kubernetes.io/component: thumbnail-worker
+    spec:
+      serviceAccountName: nimbusfs-thumbnail-worker-ksa
+      # Longer than the other workers': an in-flight decode of a large
+      # image is the one piece of work here that can legitimately take
+      # tens of seconds, and cutting it short only means Pub/Sub
+      # redelivers it and the next pod pays the same cost again.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: thumbnail-worker
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: thumbnail-worker
+          image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.workers.thumbnail_worker"]
+          envFrom:
+            - configMapRef:
+                name: nimbusfs-config
+            - secretRef:
+                name: nimbusfs-secrets
+          env:
+            # Overrides the ConfigMap's 10 — see the header. `env` wins
+            # over `envFrom` in Kubernetes, which is what makes a single
+            # shared ConfigMap workable.
+            - name: WORKER_CONCURRENCY
+              value: "3"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi # decoded images live here, not on disk
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi # ~4x the other workers — see the header
+              ephemeral-storage: 512Mi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/healthy) )) -lt 60
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          # Larger than the other workers': Pillow can spill to a
+          # temporary file for some formats, and the bytes here are
+          # user-supplied and therefore larger than anything the other
+          # workers touch.
+          emptyDir:
+            sizeLimit: 256Mi

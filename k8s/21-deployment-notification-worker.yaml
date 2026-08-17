@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------
+# Notification Worker Deployment (Phase 8)
+# ---------------------------------------------------------------------
+# Shared worker-Deployment reasoning: see
+# 18-deployment-outbox-publisher.yaml.
+#
+# THIS worker specifically
+# ------------------------
+# The cheapest of the four by a wide margin: it consumes
+# `notification.requested`, renders a subject/body from a dict of
+# templates, and writes one row. No GCS, no image decode, no large
+# payloads — which is exactly why its requests/limits are the smallest
+# here, and why sharing a process with the thumbnail worker would have
+# forced the thumbnail worker's 1Gi limit onto notifications too.
+#
+# It also has NO GCS access at all (see the IAM table in
+# 16-worker-serviceaccounts.yaml). That is deliberate and worth stating
+# plainly: this is the one component that will, in a future phase, talk
+# to a third party. It is therefore the one most exposed to somebody
+# else's compromise, and the one that should be able to reach the least.
+#
+# In Phase 8 it delivers nothing — `LoggingNotificationSender` writes the
+# row and logs "would send email (stub)". There is no SMTP, no provider
+# credential in the Secret, and no egress NetworkPolicy exception for
+# one. When a real provider lands, this Deployment is where the outbound
+# allowance gets added, and 11-networkpolicy.yaml is where it gets
+# scoped — not before.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbusfs-notification-worker
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: notification-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: notification-worker
+  strategy:
+    type: RollingUpdate
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nimbusfs
+        app.kubernetes.io/component: notification-worker
+    spec:
+      serviceAccountName: nimbusfs-notification-worker-ksa
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: notification-worker
+          image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.workers.notification_worker"]
+          envFrom:
+            - configMapRef:
+                name: nimbusfs-config
+            - secretRef:
+                name: nimbusfs-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 256Mi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/healthy) )) -lt 60
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

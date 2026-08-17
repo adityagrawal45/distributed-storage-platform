@@ -1,0 +1,139 @@
+# ---------------------------------------------------------------------
+# Outbox Publisher Deployment (Phase 8)
+# ---------------------------------------------------------------------
+# This file carries the shared reasoning for all four worker Deployments
+# (18-21); 19-21 reference it rather than repeat it.
+#
+# WHAT IS DIFFERENT FROM 07-deployment.yaml (the API), and why
+# ------------------------------------------------------------
+# 1. Same image, different command. `image:` is the identical canonical
+#    artifact the API runs; the process differs only by
+#    `command: ["python", "-m", "app.workers.<name>"]`. One image means
+#    one build, one vulnerability-scan surface, and a guarantee the
+#    worker's SQLAlchemy models are byte-identical to the API's — which
+#    matters, because they read the same tables. Exec form (a JSON array)
+#    rather than a shell string so the container's PID 1 is Python
+#    itself: a shell wrapper would swallow SIGTERM and the graceful
+#    shutdown in `WorkerRuntimeMixin` would never run.
+#
+# 2. No Service, no Ingress, no readinessProbe. A worker receives no
+#    inbound traffic — it pulls from Pub/Sub. "Ready for traffic" is a
+#    question nobody asks about these pods, and a readiness probe that
+#    answers it would only create a way for a healthy worker to be marked
+#    not-Ready during a rollout, delaying it for no benefit. There is
+#    correspondingly no entry for workers in the Ingress (15-ingress.yaml).
+#
+# 3. Liveness is an exec probe on the heartbeat FILE, not an HTTP GET.
+#    There is no HTTP server in these processes. The heartbeat is written
+#    on a timer by a background asyncio task
+#    (`WorkerRuntimeMixin._heartbeat_loop`), deliberately independent of
+#    message arrival: an idle worker on an empty subscription is healthy,
+#    and a probe keyed on "processed a message recently" would restart
+#    every worker on a quiet night. The probe checks the file's mtime is
+#    recent, not merely that it exists — a stuck event loop would leave a
+#    stale file forever, and "the file is there" would call that healthy.
+#
+# 4. Default RollingUpdate (25%/25%), NOT the API's maxUnavailable:0 /
+#    maxSurge:1. That tuning exists to keep HTTP traffic flowing through
+#    a deploy; there is no traffic here. A worker killed mid-message
+#    simply does not ack, Pub/Sub redelivers, and the consumer's
+#    `ProcessedEvent` ledger makes the reprocessing a no-op. Paying for
+#    zero-downtime machinery when downtime is invisible would be cargo
+#    cult.
+#
+# 5. Its own ServiceAccount (16-worker-serviceaccounts.yaml), which is
+#    the whole least-privilege story — see that file's table.
+#
+# THIS worker specifically
+# ------------------------
+# The outbox publisher polls Postgres and publishes; it never consumes.
+# replicas: 1 is correct and deliberate. `fetch_pending_batch` uses
+# `FOR UPDATE SKIP LOCKED` so N replicas would be *safe*, but a poller's
+# throughput is bounded by the database and the publish RPC, not by
+# replica count — a second replica mostly buys contention. Scale this
+# only in response to a measured, sustained backlog of PENDING rows
+# (the query is in docs/event-driven-architecture.md's runbook), and
+# never as a reflex.
+#
+# It is also the smallest of the four: no image decode, no GCS, payloads
+# bounded by the outbox row size.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbusfs-outbox-publisher
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: outbox-publisher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: outbox-publisher
+  strategy:
+    type: RollingUpdate # default surge/unavailable — see note 4 above
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nimbusfs
+        app.kubernetes.io/component: outbox-publisher
+    spec:
+      serviceAccountName: nimbusfs-outbox-publisher-ksa
+      # Comfortably above WORKER_SHUTDOWN_GRACE_SECONDS (30s) so the
+      # worker's own drain always finishes before SIGKILL.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: outbox-publisher
+          image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.workers.outbox_publisher"]
+          envFrom:
+            - configMapRef:
+                name: nimbusfs-config
+            - secretRef:
+                name: nimbusfs-secrets
+          resources:
+            requests:
+              cpu: 50m # a 2-second poll loop is almost entirely idle
+              memory: 128Mi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 256Mi
+          livenessProbe:
+            exec:
+              # Fails if the heartbeat file is missing OR older than 60s
+              # (6x WORKER_HEARTBEAT_INTERVAL_SECONDS) — the staleness
+              # check is the part that catches a wedged event loop.
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/healthy) )) -lt 60
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Required, not optional: readOnlyRootFilesystem is on, and the
+        # heartbeat file lives at /tmp/healthy.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

@@ -1,0 +1,111 @@
+# ---------------------------------------------------------------------
+# File Processing Worker Deployment (Phase 8)
+# ---------------------------------------------------------------------
+# The shared worker-Deployment reasoning (same image different command,
+# no Service/Ingress/readinessProbe, heartbeat-file liveness probe,
+# default RollingUpdate, own KSA) is documented once in
+# 18-deployment-outbox-publisher.yaml. Only what differs is noted here.
+#
+# THIS worker specifically
+# ------------------------
+# It is the fan-out point: it consumes `file.uploaded`/`file.completed`,
+# does one cheap GCS metadata HEAD, and publishes `thumbnail.requested`
+# and `notification.requested`. Almost all its wall-clock time is spent
+# waiting on network I/O, which is exactly the profile
+# WORKER_CONCURRENCY=10 (the ConfigMap default, inherited) is sized for:
+# ten in-flight messages against an asyncio loop that is mostly idle.
+#
+# replicas: 2 rather than 1 — this is the head of the chain, so its
+# backlog is every downstream worker's backlog, and a single replica
+# means every node drain is a delivery pause. Two is availability, not
+# throughput; raise it in response to a measured subscription backlog
+# (`num_undelivered_messages` on the file-worker subscription).
+#
+# Memory sits between the publisher's and the thumbnail worker's: it
+# handles envelopes and blob *metadata*, never image bytes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbusfs-file-worker
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: file-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: file-worker
+  strategy:
+    type: RollingUpdate
+  revisionHistoryLimit: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nimbusfs
+        app.kubernetes.io/component: file-worker
+    spec:
+      serviceAccountName: nimbusfs-file-worker-ksa
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Soft anti-affinity, same reasoning as the API's (07-deployment):
+      # two replicas on one node is not availability. Soft, so a node
+      # pool resize can never leave a replica permanently Pending.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: file-worker
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: file-worker
+          image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.workers.file_processing_worker"]
+          envFrom:
+            - configMapRef:
+                name: nimbusfs-config
+            - secretRef:
+                name: nimbusfs-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+              ephemeral-storage: 256Mi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/healthy && test $(( $(date +%s) - $(stat -c %Y /tmp/healthy) )) -lt 60
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

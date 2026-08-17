@@ -33,6 +33,47 @@ versions/configurations where directory-apply ordering isn't guaranteed.
 | `13-frontendconfig.yaml` | HTTP → HTTPS redirect |
 | `14-managedcertificate.yaml` | Google-managed TLS certificate |
 | `15-ingress.yaml` | GKE Ingress → Google Cloud Load Balancer |
+| `16-worker-serviceaccounts.yaml` | Phase 8: 4 worker KSAs, one scoped GSA each (Workload Identity) |
+| `17-worker-rbac.yaml` | Phase 8: 4 RoleBindings onto the existing `nimbusfs-app-role` |
+| `18-deployment-outbox-publisher.yaml` | Phase 8: outbox → Pub/Sub publisher (1 replica) |
+| `19-deployment-file-worker.yaml` | Phase 8: file-processing consumer + fan-out (2 replicas) |
+| `20-deployment-thumbnail-worker.yaml` | Phase 8: thumbnail consumer (2 replicas, 1Gi memory limit) |
+| `21-deployment-notification-worker.yaml` | Phase 8: notification consumer (1 replica) |
+
+### Why 16–21 add no Service and no Ingress entry
+
+There is no `Service` for any worker, and nothing was added to
+`15-ingress.yaml`. Workers **pull** from Pub/Sub; nothing ever connects
+*to* them. A Service exists to give a stable virtual IP to a set of pods
+that receive traffic, and an Ingress exists to route external traffic to
+a Service — neither question applies here, so inventing an answer would
+just create an unused, internet-adjacent surface with no purpose.
+
+Three things follow from that, and they are the parts worth remembering:
+
+- **No readinessProbe on any worker.** "Ready" means "ready to be added
+  to a Service's Endpoints." With no Service, readiness has no consumer;
+  the only thing a readiness probe could achieve is marking a healthy
+  worker not-Ready and stalling a rollout.
+- **Liveness is an exec probe on `/tmp/healthy`**, not an HTTP GET —
+  there is no HTTP server in these processes. The file is touched on a
+  timer by a background task, deliberately independent of message
+  arrival (an idle worker on an empty subscription is healthy), and the
+  probe checks its *mtime*, not just its existence, so a wedged event
+  loop is caught rather than papered over.
+- **The default-deny NetworkPolicy (`11-networkpolicy.yaml`) already
+  covers them.** Its egress allow-list includes Google APIs via Private
+  Google Access, which is the path to Pub/Sub and GCS, plus Cloud SQL —
+  everything a worker needs. No worker requires any *ingress* allowance
+  at all, which is the strongest form of the point above. Note the same
+  caveat as before: the Cloud SQL/Memorystore CIDRs in that file are
+  still placeholders, and a wrong range now breaks event processing as
+  well as the API.
+
+Applying 16–17 before 18–21 matters for the usual reason (a Deployment
+referencing a missing ServiceAccount stays Pending), and 05 must be
+applied — or re-applied, since Phase 8 extended it — before any of them,
+or the workers start with no topic names.
 
 ## One-time cluster setup
 

@@ -144,3 +144,62 @@ data:
   RATE_LIMIT_SEARCH_WINDOW_SECONDS: "60"
   RATE_LIMIT_DEFAULT_REQUESTS: "600"
   RATE_LIMIT_DEFAULT_WINDOW_SECONDS: "60"
+
+  # --- Pub/Sub / Event-Driven Architecture (Phase 8) ---
+  # This ONE ConfigMap is shared by the API Deployment and all four
+  # worker Deployments (16-21). A separate "worker ConfigMap" was
+  # considered and rejected: topic names, the ack deadline and the
+  # thumbnail allow-list are shared vocabulary — the producer and the
+  # consumer disagreeing about a topic name is a silent, total delivery
+  # failure, and two ConfigMaps is exactly how that disagreement happens.
+  # The genuinely per-worker values (subscription name, concurrency) are
+  # a small `env:` block on each worker Deployment instead, overriding
+  # what is set here.
+  #
+  # PUBSUB_ENABLED is "true" here because in a cluster the workers are
+  # deployed; the `false` default in settings.py is about landing the
+  # code dark, and the ConfigMap is where that decision is reversed
+  # deliberately. Set it back to "false" and re-apply to stop all event
+  # traffic without deleting anything — outbox rows accumulate in
+  # Postgres and drain when it is flipped back.
+  GCP_PROJECT_ID: "<PROJECT_ID>"
+  PUBSUB_ENABLED: "true"
+  # PUBSUB_EMULATOR_HOST intentionally absent — an emulator host in a
+  # real cluster would silently route every event to nowhere.
+
+  FILE_EVENTS_TOPIC: "nimbusfs-file-events"
+  UPLOAD_EVENTS_TOPIC: "nimbusfs-upload-events"
+  NOTIFICATION_EVENTS_TOPIC: "nimbusfs-notification-events"
+
+  FILE_WORKER_SUBSCRIPTION: "nimbusfs-file-events-file-worker-sub"
+  THUMBNAIL_WORKER_SUBSCRIPTION: "nimbusfs-file-events-thumbnail-worker-sub"
+  NOTIFICATION_WORKER_SUBSCRIPTION: "nimbusfs-notification-events-notification-worker-sub"
+
+  # Mirrors the dead-letter policy configured on the SUBSCRIPTION in GCP
+  # (Pub/Sub owns the real counter; this is for log messages).
+  MAX_DELIVERY_ATTEMPTS: "5"
+  # Must exceed the p99 processing time of the slowest consumer. The
+  # thumbnail worker is that consumer; if its p99 ever approaches 60s,
+  # raise this BEFORE raising its replica count, or Pub/Sub will
+  # redeliver work that is still in flight and double the load.
+  PUBSUB_ACK_DEADLINE: "60"
+
+  OUTBOX_BATCH_SIZE: "100"
+  OUTBOX_POLL_INTERVAL: "2.0"
+  OUTBOX_RETRY_BASE_DELAY_SECONDS: "2.0"
+  OUTBOX_RETRY_MAX_DELAY_SECONDS: "300.0"
+
+  # Default worker runtime; per-worker Deployments override
+  # WORKER_CONCURRENCY where their resource profile differs.
+  WORKER_CONCURRENCY: "10"
+  WORKER_HEARTBEAT_INTERVAL_SECONDS: "10.0"
+  # The liveness probe's exec command reads this same path — keep the
+  # two in sync or the probe checks a file nothing writes.
+  WORKER_HEARTBEAT_FILE_PATH: "/tmp/healthy"
+  # Kept below every worker Deployment's terminationGracePeriodSeconds
+  # so in-flight messages drain before the kubelet escalates to SIGKILL.
+  WORKER_SHUTDOWN_GRACE_SECONDS: "30.0"
+
+  THUMBNAIL_MAX_DIMENSION_PX: "512"
+  THUMBNAIL_SUPPORTED_CONTENT_TYPES: "image/jpeg,image/png,image/webp,image/gif"
+  THUMBNAIL_OBJECT_PREFIX: "thumbnails"
