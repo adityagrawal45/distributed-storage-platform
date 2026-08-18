@@ -350,7 +350,8 @@ validate folder exists
   -> reject duplicate filename-in-folder (before spending a network upload)
   -> check for identical content already uploaded by this owner (dedup)
   -> upload bytes to GCS (skipped if deduped)
-  -> persist FileMetadata (status=active) + FileVersion(v1)
+  -> persist FileMetadata (status=active) + FileVersion(v1). 
+
 ```
 
 **Rollback strategy**: if metadata persistence fails *after* a real
