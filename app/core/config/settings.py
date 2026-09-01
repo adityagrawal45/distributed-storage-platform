@@ -397,6 +397,22 @@ class Settings(BaseSettings):
     )
     THUMBNAIL_OBJECT_PREFIX: str = "thumbnails"
 
+    # Reconciliation (Phase 9). A read-only consistency check between
+    # Postgres (source of truth for metadata) and GCS (source of truth for
+    # bytes) — see app/services/reconciliation_service.py and
+    # docs/disaster-recovery.md "Reconciliation" for the full design.
+    # Report-only in this phase: there is no code path anywhere in the
+    # reconciliation job that deletes or mutates a row/object, dry-run or
+    # not — RECONCILIATION_DRY_RUN exists as a documented seam for a
+    # future apply-mode, not a currently-real switch.
+    RECONCILIATION_ENABLED: bool = True
+    RECONCILIATION_DRY_RUN: bool = True
+    RECONCILIATION_BATCH_SIZE: int = 500
+    # Hard ceiling on how many issues a single run will fetch object
+    # metadata for, so a badly-corrupted dataset can't turn a scheduled
+    # CronJob into an unbounded GCS API bill.
+    RECONCILIATION_MAX_ISSUES: int = 5000
+
     @property
     def THUMBNAIL_SUPPORTED_CONTENT_TYPES(self) -> List[str]:
         return [
