@@ -103,6 +103,38 @@ spec:
           type: RuntimeDefault
 
       # -------------------------------------------------------------
+      # Phase 9: topologySpreadConstraints, ADDITIVE to the Phase 5
+      # podAntiAffinity below, not a replacement for it. Anti-affinity
+      # only ever expresses a PREFERENCE relative to other pods being
+      # placed; it has no notion of "skew" and can't say "no more than 1
+      # extra pod in any zone versus the least-loaded zone" the way this
+      # can. `whenUnsatisfiable: ScheduleAnyway` keeps this soft, for the
+      # identical reason the affinity block below is `preferred...`
+      # rather than `required...`: a regional cluster running with a
+      # temporarily degraded zone (one down for maintenance) must still
+      # be able to schedule pods into the remaining zones rather than
+      # leave them Pending. This is what actually keeps the "Zone A: Pod
+      # 1/2, Zone B: Pod 3/4, Zone C: Pod 5/6" distribution honest as
+      # `replicas` is scaled 3->10 by the HPA — anti-affinity alone tends
+      # to clump once a preferred zone already looks "different enough."
+      # -------------------------------------------------------------
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nimbusfs
+              app.kubernetes.io/component: api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nimbusfs
+              app.kubernetes.io/component: api
+
+      # -------------------------------------------------------------
       # Scheduling: spread replicas for real fault tolerance, not just
       # replica *count*. 3 Pods on one node is not high availability —
       # one node failure would take the whole service down.
