@@ -72,6 +72,9 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      # Phase 9: zone-level term added alongside the pre-existing
+      # hostname-level one, plus topologySpreadConstraints — same
+      # rationale as 19-deployment-file-worker.yaml.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -81,7 +84,22 @@ spec:
                   matchLabels:
                     app.kubernetes.io/name: nimbusfs
                     app.kubernetes.io/component: thumbnail-worker
+                topologyKey: topology.kubernetes.io/zone
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: thumbnail-worker
                 topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nimbusfs
+              app.kubernetes.io/component: thumbnail-worker
       containers:
         - name: thumbnail-worker
           image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0

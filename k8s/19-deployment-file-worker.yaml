@@ -58,6 +58,15 @@ spec:
       # Soft anti-affinity, same reasoning as the API's (07-deployment):
       # two replicas on one node is not availability. Soft, so a node
       # pool resize can never leave a replica permanently Pending.
+      #
+      # Phase 9 addition: a zone-level term alongside the pre-existing
+      # hostname-level one. At replicas: 2, hostname anti-affinity alone
+      # already prevents "both replicas on one node" but says nothing
+      # about "both replicas in one zone" — which a full zone outage
+      # would still take down entirely, stalling file-processing (and
+      # therefore its two fan-out topics) until the ReplicaSet
+      # reschedules elsewhere. `topologySpreadConstraints` (below) is the
+      # primary mechanism for that; this affinity term reinforces it.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -67,7 +76,22 @@ spec:
                   matchLabels:
                     app.kubernetes.io/name: nimbusfs
                     app.kubernetes.io/component: file-worker
+                topologyKey: topology.kubernetes.io/zone
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: file-worker
                 topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nimbusfs
+              app.kubernetes.io/component: file-worker
       containers:
         - name: file-worker
           image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
