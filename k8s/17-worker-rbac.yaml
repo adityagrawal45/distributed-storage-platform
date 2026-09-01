@@ -36,6 +36,26 @@ roleRef:
   name: nimbusfs-app-role
   apiGroup: rbac.authorization.k8s.io
 ---
+# Phase 9: the reconciliation CronJob's KSA gets the same shared,
+# uninteresting Role for the same reason the four Phase 8 workers do —
+# see the file header. It reads nimbusfs-config/nimbusfs-secrets exactly
+# like every other workload; the permissions that actually matter for
+# THIS workload are the read-only GCP IAM roles on its GSA (see
+# 16-worker-serviceaccounts.yaml).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nimbusfs-reconciliation-rolebinding
+  namespace: nimbusfs
+subjects:
+  - kind: ServiceAccount
+    name: nimbusfs-reconciliation-ksa
+    namespace: nimbusfs
+roleRef:
+  kind: Role
+  name: nimbusfs-app-role
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
