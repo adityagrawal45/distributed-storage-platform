@@ -695,11 +695,12 @@ the narrative/design layer on top. The step-by-step "how do I actually
 deploy this" runbook is [`k8s/README.md`](k8s/README.md).
 
 **Scope note**: this phase deploys the application tier only. Pub/Sub,
-background workers, a monitoring/observability stack, CI/CD automation,
-multi-region deployment, and disaster recovery are all explicitly out
-of scope — see §23 "Future Roadmap". (Chunked uploads — listed here as
-out-of-scope when this section was originally written — shipped in
-Phase 6, §13.)
+background workers, a monitoring/observability stack, and CI/CD
+automation are all explicitly out of scope — see §24 "Future Roadmap".
+(Chunked uploads — listed here as out-of-scope when this section was
+originally written — shipped in Phase 6, §13. Multi-zone HA and
+disaster recovery — also originally listed here — shipped in Phase 9,
+§16.)
 
 ### Updated distributed architecture
 
@@ -2523,7 +2524,7 @@ deploying new code, turns the system on, and flipping it back stops all
 event traffic while events accumulate durably and drain when it returns.
 Same operational pattern as Phase 7's `CACHE_ENABLED`.
 
-Full variable list: §17. All of it is mirrored into
+Full variable list: §18. All of it is mirrored into
 `k8s/05-configmap.yaml`.
 
 ### 15.13 Running it locally
@@ -2720,7 +2721,289 @@ event stays durable and replayable.
 - [x] `docs/event-driven-architecture.md`, this section, `CONTEXT.md`
 - [ ] Backlog-based autoscaling, real notification provider, DLQ replay tooling, live-infrastructure verification — known gaps, deferred
 
-## 16. Installation
+## 16. High Availability & Disaster Recovery *(Phase 9)*
+
+Phase 9 does not add a new feature to the product — it hardens
+everything Phases 1–8 already built against infrastructure failure, and
+designs (without yet running) the procedure for recovering from failure
+too large for that hardening to absorb. Full depth lives in four
+standalone documents this section summarizes and links to:
+[`docs/high-availability.md`](docs/high-availability.md),
+[`docs/disaster-recovery.md`](docs/disaster-recovery.md),
+[`docs/failure-testing.md`](docs/failure-testing.md), and
+[`docs/backup-restore.md`](docs/backup-restore.md).
+
+**Read every claim below through one lens**: DESIGNED (a document/config
+says so), IMPLEMENTED (code/manifests enforce it), TESTED (a test in
+this repo's suite exercises it, against fakes), or MEASURED (a real
+number from a real failure/restore against real infrastructure). As of
+this phase, **nothing is MEASURED** — no real GKE cluster, Cloud SQL
+instance, Memorystore instance, or Pub/Sub was available in this
+session, the same constraint every prior phase has stated for its own
+infrastructure claims. See `docs/high-availability.md` §16 and
+`docs/disaster-recovery.md` §14 for exactly what a future session with
+real GCP access should run to convert targets into measurements.
+
+### 16.1 HA vs. DR — the distinction this phase insists on
+
+**High Availability**: does the system keep serving traffic through a
+normal, expected infrastructure failure (a Pod crash, a node crash, one
+zone going down, a Redis/Cloud SQL blip)? **Disaster Recovery**: can the
+system be brought back after a failure too large for HA to absorb (an
+entire region, a corrupted database, a mass-deletion incident)? These
+are evaluated independently throughout — a system can have excellent HA
+and no DR story (three zones, zero backups) or the reverse, and
+conflating them is how one gets mistaken for the other. See
+`docs/high-availability.md` §1 for the full table.
+
+### 16.2 Availability target
+
+**99.9% monthly** for the API tier (≈8h 46m/year downtime budget), not
+99.95%/99.99% — the ceiling is Cloud SQL regional HA's recurring
+failover time (§16.4), and claiming a tighter number on top of a
+single-writer regional Postgres without read/write separation (still
+designed-not-wired since Phase 4, §11) would be a number the
+architecture cannot back. Full derivation: `docs/high-availability.md` §2.
+
+### 16.3 RTO / RPO
+
+**RTO < 4 hours, RPO < 1 hour**, for a full regional failover — the
+worst case `docs/disaster-recovery.md` covers. RPO is bounded by Cloud
+SQL PITR (continuous transaction log, not just daily backups); RTO
+reflects a genuinely **manual** warm-standby failover (a human executing
+a documented runbook), not an automated one. Full derivation:
+`docs/disaster-recovery.md` §1.
+
+### 16.4 Multi-zone GKE
+
+Phase 5 already assumed a regional (multi-zone) GKE cluster with soft
+`podAntiAffinity`; Phase 9 adds `topologySpreadConstraints`
+(`maxSkew: 1` on `topology.kubernetes.io/zone`) to the API Deployment and
+all four Phase 8 worker Deployments (`k8s/07`, `k8s/18-21`) — anti-
+affinity alone expresses only a relative preference and can clump once a
+zone looks "different enough"; skew constraints give an absolute bound
+that holds at any HPA-scaled replica count. Both are soft
+(`ScheduleAnyway`/`preferred...`), never hard, for the same reason Phase
+5 chose soft: a temporarily degraded zone must never leave a Pod
+permanently `Pending`.
+
+Two workers moved from 1 replica to 2 for the same zone-redundancy
+reason (`outbox-publisher`, `notification-worker` — see each
+Deployment's own Phase 9 header comment for the specific trade-off);
+`file-worker`/`thumbnail-worker` were already at 2 since Phase 8 and only
+gained the topology spread addition. `k8s/23-pdb-workers.yaml` (new) adds
+a `minAvailable: 1` PodDisruptionBudget per worker now that each runs
+>=2 replicas, mirroring the API's pre-existing `10-pdb.yaml`.
+
+### 16.5 Cloud SQL, Memorystore HA, and in-app failure handling
+
+Cloud SQL **Regional (HA)** configuration (primary + standby, automatic
+promotion typically under a minute) and Memorystore **Standard tier**
+(replica + automatic failover, same order of magnitude) are the intended
+managed-service configuration — both are `gcloud`-level configuration
+this session had no real instance to apply, documented in full in
+`docs/high-availability.md` §5/§7 including the honest caveat that
+"automatic failover" does not mean "zero application-visible impact":
+existing connections error, and the app's pre-existing retry/backoff
+(`retry_async`, Phase 4) and connection pool absorb the gap over tens of
+seconds, not instantly.
+
+**What is genuinely IMPLEMENTED and TESTED already** (Phase 7 work,
+Phase 9 confirms and cross-references it rather than rebuilding it):
+cache reads fall through to Postgres on Redis failure
+(`CacheService`), distributed locks fail SAFE — `ServiceUnavailableException`
+(503), never "proceed as if held" — on Redis failure at acquisition
+(`DistributedLockService`), and rate limiting degrades per the
+configurable `RATE_LIMIT_FAIL_OPEN` (default: fail-open, an explicit,
+documented security trade-off — see `docs/high-availability.md` §8 for
+why failing closed would be worse here).
+
+### 16.6 Pub/Sub and worker resilience
+
+Unchanged in mechanism from Phase 8 — the transactional outbox already
+means a Pub/Sub or worker outage delays events, never loses them
+(README §15). Phase 9's only change here is the replica-count bump in
+§16.4; the idempotent-consumer guarantee (`ProcessedEvent`'s unique
+constraint) that makes worker-crash-mid-message safe was already
+IMPLEMENTED + TESTED in Phase 8 (`tests/test_base_worker.py`).
+
+### 16.7 Reconciliation
+
+**New this phase**: `app/services/reconciliation_service.py` +
+`app/workers/reconciliation_job.py`, run every 6 hours as
+`k8s/22-cronjob-reconciliation.yaml`. A read-only, keyset-paginated
+(never `OFFSET`) walk of every non-deleted, `upload_status=COMPLETED`
+`FileMetadata` row, confirming each one's GCS object still exists.
+Detects only the dangerous drift direction — a metadata row pointing at
+a missing object, which 404s a user mid-download — not the inverse
+(orphaned GCS objects with no owning row, which costs storage money, not
+correctness, and requires a full bucket listing this codebase has never
+needed; explicitly left for a future phase, see
+`docs/disaster-recovery.md` §5.2).
+
+**The service has no delete/update code path anywhere in its call
+graph** — not "delete gated behind a flag," no delete statement exists
+at all. `tests/test_reconciliation.py` (6 tests) proves both the
+detection logic and, explicitly, that a flagged row is byte-for-byte
+unchanged after a run (`test_never_mutates_or_deletes_anything`). The
+job's exit code (0 clean / 1 issues found / 2 scan incomplete) is the
+machine-readable hook for a future alerting pipeline. Its own KSA/GSA
+(`nimbusfs-reconciliation-ksa`, `k8s/16`/`k8s/17`) is read-only on both
+systems it inspects — `roles/storage.objectViewer` and
+`roles/cloudsql.client`, nothing more — so a future phase that wants to
+*act* on a finding (quarantine, re-upload, delete) has to widen that
+grant deliberately, in lockstep with the code gaining the ability to act.
+
+### 16.8 Multi-region DR: active-passive, warm standby
+
+Selected over cold standby (RTO too slow once you count provisioning
+from scratch) and over active-active (rejected — no requirement here
+justifies solving multi-writer Postgres consistency, and doing so
+"because it sounds enterprise-grade" is exactly what this phase's own
+brief warns against). A warm-standby region keeps a minimal-replica-count
+GKE deployment running, restores Cloud SQL from a cross-region-replicated
+backup on demand (not a continuously-replicated standby — that would
+blur into active-active's cost without the RTO win), and reuses the
+existing Global external Application Load Balancer (already Phase 5
+infrastructure) to add the DR region's backend once promoted, rather
+than pre-provisioning an idle second region's frontend. Full design,
+the failover runbook, DNS-failover caveats, and secrets/IAM-for-DR
+guidance (Secret Manager + Workload Identity, never a copied service-
+account key between regions): `docs/disaster-recovery.md` §6–§10.
+
+### 16.9 GCS durability & protection
+
+GCS's own object durability is already extremely high regardless of
+bucket location type — the real decision is availability during a
+*regional* outage. **Recommendation: keep the existing regional bucket,
+add a scheduled regional-to-regional object-replication job to the DR
+region** (not a dual-region or multi-region bucket, which is either
+higher-latency for every write or optimized for a global-read-locality
+problem NimbusFS doesn't have) — designed and documented, not
+implemented this phase. Recommended bucket-level protections: GCS
+Object Versioning + a lifecycle rule aging out noncurrent versions, and
+GCS's own bucket-level soft-delete — both are a safety net against
+mutation/deletion *outside* the application (a `gsutil rm`, a
+compromised credential) that the application's own dedup/rollback
+guardrails (Phase 3) cannot see, since those bypass the application
+entirely. Full reasoning and cost trade-off: `docs/disaster-recovery.md`
+§2–§3.
+
+### 16.10 Failure matrix, monitoring, alerting, security
+
+A complete failure matrix (Pod/Node/Zone/Cloud SQL/Memorystore/Pub-Sub/
+GCS/Worker/Region — impact, detection, recovery) is in
+`docs/high-availability.md` §10. A metric inventory (not a running
+dashboard — no observability stack ships this phase, same as Phases 5/7/
+8) and a severity-tiered (P0–P3) alert list are in §11–§12 there. A
+short security review confirms no HA/DR mechanism in this phase weakens
+IAM, Workload Identity, TLS, private networking, or authentication —
+every one of those properties came from decisions already made in
+Phases 1–8 and simply carries over unchanged (§13 there).
+
+### 16.11 Cost analysis
+
+Architecture-level, no fabricated GCP pricing: multi-zone (this phase)
+is roughly compute-cost-neutral (same total replica count, just spread)
+with a real ~2x-and-up database/Redis cost premium for Regional HA/
+Standard tier; multi-region DR adds cross-region storage/egress as its
+largest new line item. Full comparison table and the recommendation
+(multi-zone as the default, multi-region only if the business accepts
+the added operational complexity for an RTO/RPO a single region can't
+meet): `docs/high-availability.md` §14.
+
+### 16.12 Testing
+
+Chaos-testing procedures for all 13 scenarios from the brief (delete a
+Pod, kill/drain a node, simulate a zone/Redis/Cloud-SQL/GCS/Pub-Sub
+failure, kill a worker mid-message, restore from backup, restore in a
+secondary region), each labeled LOCAL/TEST, STAGING, or PRODUCTION with
+commands and pass criteria, plus an RTO/RPO measurement template and an
+executable, STAGING-only backup/restore drill (7 steps, real `gcloud`/
+`curl` commands) live in `docs/failure-testing.md` and
+`docs/backup-restore.md`. **None have been executed this session** — see
+each document's own completion checklist for exactly what remains
+DESIGNED rather than MEASURED, and §16.14 below for the code-level tests
+that do run today.
+
+### 16.13 Config (`.env.example` / `k8s/05-configmap.yaml`)
+
+Four new settings, all additive, all defaulted so no existing deployment
+breaks: `RECONCILIATION_ENABLED` (default `true`), `RECONCILIATION_DRY_RUN`
+(default `true` — a documented seam for a future apply-mode; there is no
+code path that deletes/mutates regardless of this flag's value today),
+`RECONCILIATION_BATCH_SIZE` (default `500`), `RECONCILIATION_MAX_ISSUES`
+(default `5000`, bounds worst-case GCS API calls on a badly-corrupted
+dataset). Mirrored into `k8s/05-configmap.yaml` exactly like every prior
+phase's new settings.
+
+### 16.14 Tests
+
+6 new tests, `tests/test_reconciliation.py`: clean state reports no
+issues, a missing object is flagged, soft-deleted and still-pending rows
+are correctly skipped (not false positives), keyset pagination correctly
+walks multiple batches, and — the one that matters most — the service
+never mutates or deletes the row it flagged. **416/416 passing, zero
+regressions** against all 410 pre-Phase-9 tests.
+
+### 16.15 What Phase 9 does NOT include
+
+No CI/CD pipeline, no full observability/metrics backend, no AI
+features, no multi-cloud, no active-active multi-region, no service
+mesh, no Terraform (all explicitly out of scope per this phase's own
+brief). No orphaned-GCS-object detection (the reconciliation direction
+deliberately left for later, §16.7). No automatic remediation of a
+reconciliation finding — a human decides, every time, this phase. No
+actual database failover, Redis failover, or regional failover was
+triggered against real infrastructure — every HA/DR claim in this
+section is DESIGNED and, where noted, IMPLEMENTED/TESTED against fakes,
+never MEASURED.
+
+### 16.16 Design decisions
+
+Soft scheduling constraints throughout, never hard (§16.4's reasoning
+recurs from Phase 5). Two workers bumped 1→2 replicas with each
+Deployment's own explained trade-off, not a blanket "everything gets N
+replicas" policy. Reconciliation shipped read-only and single-direction
+rather than attempting both directions or auto-remediation in one pass.
+Active-passive warm standby chosen over cold (too slow) or active-active
+(no justified need, and a hard multi-writer-Postgres problem this
+codebase has no answer for). A single global external ALB frontend
+rather than per-region DNS records, specifically to remove DNS
+propagation delay from the RTO critical path. Full list with reasoning:
+`docs/high-availability.md` §15, `docs/disaster-recovery.md` §11.
+
+### 16.17 Failure scenarios, narrated
+
+Region A becomes fully unreachable: detected by simultaneous GCLB
+backend health-check failure across every Region-A NEG (categorically
+different from a single-zone failure, which only fails a subset);
+recovery is the manual runbook, target <4h RTO, up to ~1h data loss
+bounded by PITR/replication cadence. A mass-deletion incident
+(compromised credential or application bug) is *not* a regional outage
+but sits in the DR document because its recovery mechanism is DR's, not
+HA's: PITR to just before the deletion, then a reconciliation pass
+against the restored state to catch any GCS-side drift the restore alone
+didn't fix. Full narration: `docs/disaster-recovery.md` §12.
+
+### 16.18 Completion checklist
+
+- [x] HA vs. DR distinction stated and held to throughout (§16.1)
+- [x] Availability target (99.9%) and RTO/RPO (<4h / <1h) chosen and justified, not asserted (§16.2–16.3)
+- [x] Multi-zone GKE: `topologySpreadConstraints` on API + all 4 workers, 2 workers bumped to 2 replicas, worker PDBs added (§16.4)
+- [x] Cloud SQL HA / Memorystore HA designed; existing Phase 7 in-app degradation confirmed IMPLEMENTED+TESTED (§16.5)
+- [x] Pub/Sub/worker resilience confirmed unchanged-and-sufficient from Phase 8, replica bump applied (§16.6)
+- [x] Reconciliation: designed, implemented, tested, read-only, single-direction, documented gap for the other direction (§16.7)
+- [x] Multi-region DR design with a runbook, DNS-failover caveats, secrets/IAM-for-DR guidance (§16.8)
+- [x] GCS durability/protection strategy analyzed with a cost-aware recommendation, not the most expensive default (§16.9)
+- [x] Failure matrix, monitoring metric inventory, severity-tiered alerts, security-during-failover review (§16.10)
+- [x] Cost comparison across single-zone/multi-zone/multi-region, no fabricated pricing (§16.11)
+- [x] Chaos-testing procedures for all 13 requested scenarios, environment-labeled (§16.12)
+- [x] New settings additive and defaulted, mirrored into the ConfigMap (§16.13)
+- [x] 6 new tests, 416/416 total, zero regressions (§16.14)
+- [ ] Any HA/DR claim in this section MEASURED against real GCP infrastructure — **not done this session**, see `docs/high-availability.md` §16 and `docs/disaster-recovery.md` §14 for the exact procedure
+
+## 17. Installation
 
 ```bash
 git clone <repo-url> nimbusfs && cd nimbusfs
@@ -2729,7 +3012,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then edit secrets, especially JWT_SECRET_KEY
 ```
 
-## 17. Environment Variables
+## 18. Environment Variables
 
 See `.env.example` for the full list. Key variables:
 
@@ -2784,6 +3067,10 @@ See `.env.example` for the full list. Key variables:
 | `THUMBNAIL_MAX_DIMENSION_PX` | Bounding box; aspect ratio preserved, small images never upscaled (Phase 8) |
 | `THUMBNAIL_SUPPORTED_CONTENT_TYPES` | Explicit allow-list, enforced **before** any download or decode — Pillow is never handed bytes of an unlisted type (Phase 8) |
 | `THUMBNAIL_OBJECT_PREFIX` | GCS prefix for generated thumbnails; the object name is deterministic so regeneration overwrites rather than orphans (Phase 8) |
+| `RECONCILIATION_ENABLED` | Master switch for `python -m app.workers.reconciliation_job`; `false` makes the scheduled run a no-op (Phase 9) |
+| `RECONCILIATION_DRY_RUN` | Documented seam for a future apply-mode — there is no delete/mutate code path in the reconciliation service regardless of this flag's value today (Phase 9) |
+| `RECONCILIATION_BATCH_SIZE` | Keyset-pagination page size when walking `FileMetadata` rows — bounds memory, never uses `OFFSET` (Phase 9) |
+| `RECONCILIATION_MAX_ISSUES` | Hard ceiling on issues fetched per run, so a badly-corrupted dataset can't turn a scheduled CronJob into an unbounded GCS API bill (Phase 9) |
 
 ### Google Cloud Storage Setup
 
@@ -2818,7 +3105,7 @@ GKE service account to the IAM service account via Workload Identity, leave
 Default Credentials automatically — this is what makes `app/database/gcs.py`
 work unchanged across environments.
 
-## 18. Running Locally (without Docker)
+## 19. Running Locally (without Docker)
 
 Requires a local PostgreSQL and Redis instance matching your `.env`.
 
@@ -2830,7 +3117,7 @@ alembic upgrade head
 
 API available at `http://localhost:8000`, docs at `http://localhost:8000/docs`.
 
-## 19. Running with Docker
+## 20. Running with Docker
 
 ```bash
 cp .env.example .env
@@ -2844,7 +3131,7 @@ network. Apply migrations inside the running container:
 docker compose exec api alembic upgrade head
 ```
 
-## 20. Database Migrations (Alembic)
+## 21. Database Migrations (Alembic)
 
 ```bash
 # Generate a new migration from model changes
@@ -2866,7 +3153,7 @@ Migrations so far:
 - `0004_chunked_uploads` — creates `upload_sessions`, `upload_chunks`
   (Phase 6)
 
-## 21. API Documentation
+## 22. API Documentation
 
 - Swagger UI: `GET /docs`
 - ReDoc: `GET /redoc`
@@ -2874,7 +3161,7 @@ Migrations so far:
 
 (Docs are automatically disabled when `ENVIRONMENT=production`.)
 
-## 22. Testing
+## 23. Testing
 
 Tests run against an isolated in-memory SQLite database — no external
 services required. **410/410 passing** (145 from Phases 1-6, 101 added by
@@ -2994,37 +3281,46 @@ Coverage includes:
   duplicates, and a mid-flight Pub/Sub outage proving the event stays
   durable and replayable.
 
-Total: **410 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
-41 Phase 6 + 101 Phase 7 + 164 Phase 8 — Phase 5 shipped
+Total: **416 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
+41 Phase 6 + 101 Phase 7 + 164 Phase 8 + 6 Phase 9 — Phase 5 shipped
 infrastructure/manifests, not application tests). Zero regressions: all
-246 pre-Phase-8 tests still pass unchanged.
+410 pre-Phase-9 tests still pass unchanged.
 
-## 23. Future Roadmap (Phases 7–15, not yet built)
+## 24. Future Roadmap (Phases 10–15, not yet built)
 
 Sharing & permissions between users, virus scanning integration,
 full-text content search, content-dedup extension to the chunked-upload
 path, CI/CD via GitHub Actions, Terraform IaC, Cloud Armor, Cloud CDN,
 observability (Cloud Monitoring/Logging dashboards, OpenTelemetry
-tracing), multi-region deployment, disaster recovery. Kubernetes/GKE
-deployment and autoscaling (HPA) shipped in Phase 5 (§12);
-chunked/resumable uploads shipped in Phase 6 (§13); real rate limiting
-and Redis metadata caching shipped in Phase 7 (§14); **Pub/Sub-driven
-background workers and thumbnail generation shipped in Phase 8 (§15)** —
+tracing). Kubernetes/GKE deployment and autoscaling (HPA) shipped in
+Phase 5 (§12); chunked/resumable uploads shipped in Phase 6 (§13); real
+rate limiting and Redis metadata caching shipped in Phase 7 (§14);
+Pub/Sub-driven background workers and thumbnail generation shipped in
+Phase 8 (§15); **multi-zone high availability, disaster recovery design,
+and read-only Postgres↔GCS reconciliation shipped in Phase 9 (§16)** —
 all previously listed here.
 
-Two things stay on this list even though Phase 8 made them *possible*:
-reconciliation of stuck `COMPLETING`-state upload sessions (Phase 6's
-known gap — the workers that could run it now exist, but no such job was
-written), and backlog-based worker autoscaling.
+Three things stay on this list even though Phase 9 made some of them
+easier to eventually build: reconciliation of stuck `COMPLETING`-state
+upload sessions (Phase 6's known gap, distinct from Phase 9's
+Postgres↔GCS drift reconciliation — the workers that could run it exist
+since Phase 8, but no such job was written), backlog-based worker
+autoscaling, and orphaned-GCS-object detection (the direction Phase 9's
+reconciliation job deliberately does not cover — see
+`docs/disaster-recovery.md` §5.2).
 
 Phase 7's own known gaps (post-commit invalidation, descendant-breadcrumb
 invalidation fan-out, negative caching, probabilistic early expiration,
 cache warming, a metrics backend) are catalogued in §14.15 and
 `docs/PHASE_7_REDIS_DESIGN.md`. Phase 8's are in §15.16 and
 `docs/event-driven-architecture.md` — chief among them that **no part of
-Phase 8 was ever run against real infrastructure.**
+Phase 8 was ever run against real infrastructure.** Phase 9's are in
+§16.18 and `docs/high-availability.md`/`docs/disaster-recovery.md`/
+`docs/backup-restore.md` — chief among them that **no HA/DR claim in
+Phase 9 has been MEASURED against real infrastructure either; every
+number is a justified target, not a drill result.**
 
-## 24. Contribution Guide
+## 25. Contribution Guide
 
 1. Create a feature branch from `main`.
 2. Keep business logic in `services/`, persistence in `repositories/` — never
