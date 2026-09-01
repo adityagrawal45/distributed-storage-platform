@@ -203,3 +203,11 @@ data:
   THUMBNAIL_MAX_DIMENSION_PX: "512"
   THUMBNAIL_SUPPORTED_CONTENT_TYPES: "image/jpeg,image/png,image/webp,image/gif"
   THUMBNAIL_OBJECT_PREFIX: "thumbnails"
+
+  # Reconciliation (Phase 9) — consumed by the nimbusfs-reconciliation
+  # CronJob (22-cronjob-reconciliation.yaml) only; harmless no-ops for
+  # every other workload reading this same ConfigMap via envFrom.
+  RECONCILIATION_ENABLED: "true"
+  RECONCILIATION_DRY_RUN: "true"
+  RECONCILIATION_BATCH_SIZE: "500"
+  RECONCILIATION_MAX_ISSUES: "5000"

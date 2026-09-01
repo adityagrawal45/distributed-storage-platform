@@ -33,12 +33,14 @@ versions/configurations where directory-apply ordering isn't guaranteed.
 | `13-frontendconfig.yaml` | HTTP → HTTPS redirect |
 | `14-managedcertificate.yaml` | Google-managed TLS certificate |
 | `15-ingress.yaml` | GKE Ingress → Google Cloud Load Balancer |
-| `16-worker-serviceaccounts.yaml` | Phase 8: 4 worker KSAs, one scoped GSA each (Workload Identity) |
-| `17-worker-rbac.yaml` | Phase 8: 4 RoleBindings onto the existing `nimbusfs-app-role` |
-| `18-deployment-outbox-publisher.yaml` | Phase 8: outbox → Pub/Sub publisher (1 replica) |
-| `19-deployment-file-worker.yaml` | Phase 8: file-processing consumer + fan-out (2 replicas) |
-| `20-deployment-thumbnail-worker.yaml` | Phase 8: thumbnail consumer (2 replicas, 1Gi memory limit) |
-| `21-deployment-notification-worker.yaml` | Phase 8: notification consumer (1 replica) |
+| `16-worker-serviceaccounts.yaml` | Phase 8: 4 worker KSAs; Phase 9: +1 read-only reconciliation KSA (Workload Identity) |
+| `17-worker-rbac.yaml` | Phase 8: 4 RoleBindings onto the existing `nimbusfs-app-role`; Phase 9: +1 for reconciliation |
+| `18-deployment-outbox-publisher.yaml` | Phase 8: outbox → Pub/Sub publisher; Phase 9: bumped 1→2 replicas + zone spread for HA |
+| `19-deployment-file-worker.yaml` | Phase 8: file-processing consumer + fan-out (2 replicas); Phase 9: +zone-level topology spread |
+| `20-deployment-thumbnail-worker.yaml` | Phase 8: thumbnail consumer (2 replicas, 1Gi memory limit); Phase 9: +zone-level topology spread |
+| `21-deployment-notification-worker.yaml` | Phase 8: notification consumer; Phase 9: bumped 1→2 replicas + zone spread for HA |
+| `22-cronjob-reconciliation.yaml` | Phase 9: scheduled read-only Postgres↔GCS consistency check (every 6h) |
+| `23-pdb-workers.yaml` | Phase 9: `minAvailable: 1` PodDisruptionBudget for each of the 4 worker Deployments |
 
 ### Why 16–21 add no Service and no Ingress entry
 
