@@ -13,7 +13,7 @@ import uuid
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.file_metadata import FileMetadata
+from app.models.file_metadata import FileMetadata, UploadStatus
 from app.models.folder import Folder
 from app.repositories.base import BaseRepository
 from app.schemas.search import FileSearchParams
@@ -90,6 +90,30 @@ class FileMetadataRepository(BaseRepository[FileMetadata]):
             conditions.append(FileMetadata.id != exclude_id)
         result = await self._session.execute(select(FileMetadata.id).where(and_(*conditions)).limit(1))
         return result.scalar_one_or_none() is not None
+
+    async def list_completed_batch(
+        self, *, after_id: uuid.UUID | None, limit: int
+    ) -> list[FileMetadata]:
+        """
+        Keyset-paginated (not OFFSET) page of non-deleted, upload-completed
+        rows ordered by `id`, for Phase 9's reconciliation job to walk the
+        whole table in bounded chunks without ever loading it into memory
+        at once or paying OFFSET's linear rescan cost on a multi-million-row
+        table. Only `COMPLETED` rows are candidates — `PENDING`/`FAILED`
+        rows are expected to have no backing object, so flagging them would
+        just be noise on top of a real, already-known state.
+        """
+        conditions = [
+            FileMetadata.is_deleted.is_(False),
+            FileMetadata.upload_status == UploadStatus.COMPLETED,
+            FileMetadata.object_name.is_not(None),
+        ]
+        if after_id is not None:
+            conditions.append(FileMetadata.id > after_id)
+        result = await self._session.execute(
+            select(FileMetadata).where(and_(*conditions)).order_by(FileMetadata.id.asc()).limit(limit)
+        )
+        return list(result.scalars().all())
 
     async def list_trash(self, owner_id: uuid.UUID) -> list[FileMetadata]:
         result = await self._session.execute(
