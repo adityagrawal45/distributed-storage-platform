@@ -33,8 +33,16 @@ metadata:
   labels:
     app.kubernetes.io/name: nimbusfs
     app.kubernetes.io/component: notification-worker
+# Phase 9 change: replicas 1 -> 2, across zones — same "no HA reasoning
+# was ever written for this being 1" gap and the same fix as
+# 18-deployment-outbox-publisher.yaml. This is the egress-isolated
+# component (see the header above): a node/zone failure here delays
+# in-app notifications, nothing more — `notification.requested` messages
+# queue durably on Pub/Sub and this worker's own idempotent-consumption
+# guarantee (Phase 8's ProcessedEvent) means catching up after
+# rescheduling produces neither a duplicate nor a lost notification.
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: nimbusfs
@@ -57,6 +65,24 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: notification-worker
+                topologyKey: topology.kubernetes.io/zone
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nimbusfs
+              app.kubernetes.io/component: notification-worker
       containers:
         - name: notification-worker
           image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0

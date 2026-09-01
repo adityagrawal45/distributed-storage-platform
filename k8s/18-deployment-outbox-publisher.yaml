@@ -57,6 +57,21 @@
 #
 # It is also the smallest of the four: no image decode, no GCS, payloads
 # bounded by the outbox row size.
+#
+# Phase 9 change: replicas 1 -> 2, across zones. The Phase 8 reasoning
+# above (throughput doesn't need a second replica) is still true and is
+# NOT being revisited — this bump is entirely about availability, not
+# throughput. At replicas: 1, a single node or zone failure stops ALL
+# outbox publishing until the ReplicaSet reschedules (pod
+# reschedule + startup — realistically tens of seconds to a couple of
+# minutes, not instant); no event reaches Pub/Sub in that window. No
+# DATA is lost (rows sit durably PENDING in Postgres per the outbox
+# guarantee — see docs/event-driven-architecture.md), but every
+# downstream side effect (thumbnails, notifications) is delayed by
+# exactly that outage window. `FOR UPDATE SKIP LOCKED` already makes 2
+# concurrent pollers correctness-safe (Phase 8), so this costs a small,
+# fixed amount of extra polling contention in exchange for removing a
+# single point of failure from the event pipeline's front door.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -66,7 +81,7 @@ metadata:
     app.kubernetes.io/name: nimbusfs
     app.kubernetes.io/component: outbox-publisher
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: nimbusfs
@@ -91,6 +106,27 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      # Phase 9: now that replicas is 2 (see the comment above `spec:`),
+      # spread them across zones the same way every other multi-replica
+      # Deployment in this manifest set does.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: nimbusfs
+                    app.kubernetes.io/component: outbox-publisher
+                topologyKey: topology.kubernetes.io/zone
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nimbusfs
+              app.kubernetes.io/component: outbox-publisher
       containers:
         - name: outbox-publisher
           image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
