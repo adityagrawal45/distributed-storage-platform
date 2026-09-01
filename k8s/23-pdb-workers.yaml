@@ -1,0 +1,70 @@
+# ---------------------------------------------------------------------
+# Worker PodDisruptionBudgets (Phase 9)
+# ---------------------------------------------------------------------
+# Phase 5 gave the API a PDB (10-pdb.yaml); the four Phase 8 worker
+# Deployments had none, because at their Phase-8 replica counts (2, 2,
+# 1, 1) a `minAvailable` floor either had nothing to protect (the two
+# singletons) or would have meant "0 evictions ever" (the two pairs,
+# where minAvailable:2 == replicas would block every voluntary drain
+# outright — the opposite of what a PDB is for).
+#
+# Now that Phase 9 has moved every worker to >=2 replicas (18/19/20/21),
+# `minAvailable: 1` on each is the right floor: a GKE node drain or
+# Cluster Autoscaler scale-down may evict ONE replica of a worker at a
+# time and must wait for its replacement before touching the other, but
+# can never be blocked from proceeding altogether. This protects
+# THROUGHPUT during routine maintenance, not correctness — a worker
+# dropping to 1 replica processes the same backlog slower, it does not
+# lose or duplicate anything (Phase 8's idempotent-consumer guarantee is
+# what makes that true regardless of how many replicas are up at once).
+#
+# Involuntary disruption (a node/zone actually failing, not being
+# drained) is unaffected by a PDB either way — see 10-pdb.yaml's header
+# for that distinction, which applies identically here.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nimbusfs-outbox-publisher-pdb
+  namespace: nimbusfs
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: outbox-publisher
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nimbusfs-file-worker-pdb
+  namespace: nimbusfs
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: file-worker
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nimbusfs-thumbnail-worker-pdb
+  namespace: nimbusfs
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: thumbnail-worker
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nimbusfs-notification-worker-pdb
+  namespace: nimbusfs
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: notification-worker

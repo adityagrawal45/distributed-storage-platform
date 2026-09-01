@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------
+# Reconciliation CronJob (Phase 9)
+# ---------------------------------------------------------------------
+# Runs `python -m app.workers.reconciliation_job` (see that module's
+# docstring for the full design) on a schedule, as a Kubernetes Job, not
+# a Deployment — there is no queue to drain and no reason for the
+# process to stay resident between runs; a CronJob's own history
+# (`kubectl get jobs`) and exit-code semantics are a better fit for a
+# "did last night's run find anything" question than a liveness probe
+# would be.
+#
+# Schedule: every 6 hours. Chosen as a starting point, not a measured
+# value — there is no SLO yet that derives this number, and it should be
+# revisited once real GCS/Postgres error rates from production are
+# available. Running more often mostly just increases GCS API cost
+# (bounded further by RECONCILIATION_MAX_ISSUES/RECONCILIATION_BATCH_SIZE
+# in app/core/config/settings.py); running less often widens the window
+# between a real inconsistency existing and a human finding out about it.
+#
+# `concurrencyPolicy: Forbid` — two overlapping runs would both walk the
+# same table and duplicate GCS reads for no benefit; skip a run rather
+# than stack them if one is still going (e.g. after a slow restart).
+#
+# `restartPolicy: Never` + `backoffLimit: 2` — this is a read-only report,
+# so retrying a transient GCS/Postgres blip a couple of times is
+# reasonable, but it should surface as a Failed Job (exit code 2 from the
+# job itself, see reconciliation_job.py) rather than spin indefinitely.
+#
+# No Service, no Ingress, no readinessProbe, same reasoning as the four
+# Phase 8 worker Deployments — this workload receives no inbound traffic
+# either.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nimbusfs-reconciliation
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: reconciliation
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+  # A stuck run should not block the next scheduled one forever.
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800 # 30 minutes — generous, but bounded; a hung run must eventually be killed and alerted on rather than run forever.
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: nimbusfs
+            app.kubernetes.io/component: reconciliation
+        spec:
+          restartPolicy: Never
+          serviceAccountName: nimbusfs-reconciliation-ksa
+          terminationGracePeriodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: reconciliation
+              image: REGION-docker.pkg.dev/PROJECT_ID/nimbusfs/nimbusfs-api:v1.0.0
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "app.workers.reconciliation_job"]
+              envFrom:
+                - configMapRef:
+                    name: nimbusfs-config
+                - secretRef:
+                    name: nimbusfs-secrets
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 192Mi
+                  ephemeral-storage: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 384Mi
+                  ephemeral-storage: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
