@@ -79,6 +79,17 @@ or the workers start with no topic names.
 
 ## One-time cluster setup
 
+**Terraform now exists for this section and "Workload Identity setup"
+below** — see `terraform/README.md`. It provisions the same VPC,
+private regional cluster, `nimbusfs-app-pool` node pool, Artifact
+Registry repo, ingress static IP, and all 6 Workload-Identity-bound
+GSAs (the manual block below only ever scripted 1 of the 6). It has
+not been applied against a real project (none exists for NimbusFS yet
+— see that README's "What this deliberately does NOT do"). The manual
+commands below remain accurate as a reference / fallback and for the
+"Cloud SQL & Memorystore", "Secrets setup", "DNS & static IP", and
+"Build & push the image" sections, which Terraform does not cover.
+
 ```bash
 export PROJECT_ID=<your-project-id>
 export REGION=us-central1

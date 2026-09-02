@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars (git-ignored — see the repo's .gitignore,
+# which already ignores k8s/06-secret.yaml for the same "never commit
+# real values" reason) and fill in real values before `terraform apply`.
+
+project_id = "<your-gcp-project-id>"
+region      = "us-central1"
+environment = "dev" # dev | staging | prod
+
+# REQUIRED: apply succeeds without this but you will be locked out of
+# kubectl access to the private control plane. Add your office/VPN
+# CIDR or a bastion host's IP.
+master_authorized_networks = [
+  {
+    cidr_block   = "203.0.113.0/32"
+    display_name = "example-admin-ip"
+  }
+]

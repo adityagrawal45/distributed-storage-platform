@@ -10,3 +10,18 @@ venv/
 # locally (gitignored), or better, create the Secret imperatively via
 # `kubectl create secret` per k8s/README.md — never write it to disk.
 k8s/06-secret.yaml
+
+# Phase 9 (Terraform for GKE/VPC/IAM): local state and real variable
+# values never belong in git — state can contain sensitive attribute
+# values, and terraform.tfvars is where a real project_id and
+# master_authorized_networks CIDR go. Copy
+# terraform/terraform.tfvars.example to terraform/terraform.tfvars
+# locally instead. Once this module has a real user, replace the local
+# backend in terraform/versions.tf with a `gcs` remote backend so state
+# isn't only ever on one laptop.
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/*.auto.tfvars
+crash.log

@@ -1,6 +1,45 @@
 # NimbusFS — Project Context
 
-Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote.
+Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module.
+
+## Phase 9 extension (2026-09-03): Terraform for GKE + VPC + IAM
+
+Added `terraform/` — see `terraform/README.md` for the full writeup.
+Scoped, on request, to exactly "Terraform for GKE + VPC + IAM": a
+dedicated VPC (+ Cloud NAT, a real gap the pre-existing manual
+`k8s/README.md` runbook had and never provisioned), a private regional
+GKE cluster + `nimbusfs-app-pool` node pool matching
+`07-deployment.yaml`'s `nodeAffinity`, an Artifact Registry repo, an
+Ingress static IP, and — the actual point of the exercise — **6 Google
+IAM service accounts with least-privilege roles**, one per Workload
+Identity binding `k8s/03-serviceaccount.yaml` and
+`k8s/16-worker-serviceaccounts.yaml` already declared but never had a
+script provisioning the GCP side of. The GCS bucket and 3 Pub/Sub
+topics/subscriptions are also created (toggleable via
+`create_gcs_bucket`/`create_pubsub_topics`), only because IAM roles
+need a real resource to scope to — granting them at project level
+would have been the exact blast-radius mistake
+`k8s/16-worker-serviceaccounts.yaml`'s own per-worker-GSA design
+argues against.
+
+**Explicitly out of scope for this pass** (per direct instruction, not
+an oversight): Cloud SQL, Memorystore, CI/CD, and templating `k8s/*`
+manifests into Terraform — `kubectl apply` stays the deploy path for
+those.
+
+**Verification performed**: `terraform validate` and `terraform plan
+-var project_id=fake-project-for-validation` both succeeded cleanly
+(43 resources, 0 errors) using a temporarily downloaded `terraform`
+binary (not installed system-wide, removed after use) — the whole
+resource graph resolves with no real GCP credentials, since no data
+sources are used. **`terraform apply` was never run** — no GCP project
+exists for NimbusFS (the environment's `gcloud config` pointed at an
+unrelated project, `gs3-rag-chatbot-123`, at time of writing). Treat
+every claim about this module's *correctness* as validated at the
+Terraform-graph level only, not as proof it produces a working cluster
+end to end — that requires a real `apply` against a real project,
+which is deliberately still a manual step (see `terraform/README.md`
+"Usage").
 
 ## Git Remote
 
