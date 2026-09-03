@@ -6,6 +6,40 @@ class Role(str, Enum):
     ADMIN = "admin"
 
 
+class AuditEventType(str, Enum):
+    """
+    Security-audit event vocabulary (Phase 10).
+
+    Deliberately a flat, closed set rather than a free-text `action`
+    string — a native Postgres enum rejects a typo'd event type at
+    write time instead of letting the audit trail itself silently rot
+    into inconsistent naming, the same reasoning `UserRole`/`FileStatus`
+    already apply elsewhere in this codebase.
+
+    Scoped to the events this phase actually wires up (see
+    `docs/security/audit-logging.md` for the full rationale and the
+    explicitly-deferred rest of the illustrative list from the Phase 10
+    brief — UPLOAD_START/UPLOAD_COMPLETE/PASSWORD_CHANGE/PASSWORD_RESET
+    are not emitted because the code paths they would attach to either
+    don't exist yet (no password-reset feature) or would require
+    touching `ChunkedUploadService`, out of scope for a first pass).
+    """
+
+    LOGIN_SUCCESS = "login_success"
+    LOGIN_FAILURE = "login_failure"
+    LOGOUT = "logout"
+    TOKEN_REFRESH = "token_refresh"
+    TOKEN_REVOCATION = "token_revocation"
+    FILE_DOWNLOAD = "file_download"
+    FILE_DELETE = "file_delete"
+    ADMIN_ACTION = "admin_action"
+
+
+class AuditResult(str, Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
 class UploadSessionStatus(str, Enum):
     """
     Lifecycle status of a chunked/resumable upload session (Phase 6).

@@ -1,7 +1,13 @@
 # --- Web framework ---
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-python-multipart==0.0.20
+# Phase 10: bumped 0.0.20 -> 0.0.32 — a pip-audit scan found 6 known
+# CVEs against 0.0.20 (fixed progressively through 0.0.22-0.0.31); this
+# parser sits directly on untrusted upload bytes (every UploadFile in
+# the codebase), the highest-value dependency to patch found by the
+# audit. Full test suite re-run green after the bump — see
+# docs/security/dependency-audit.md.
+python-multipart==0.0.32
 
 # --- Validation / Settings ---
 pydantic==2.10.4
@@ -18,7 +24,15 @@ alembic==1.14.0
 redis==5.2.1
 
 # --- Auth / Security ---
-python-jose[cryptography]==3.3.0
+# Phase 10: bumped 3.3.0 -> 3.5.0 — a pip-audit scan found known CVEs
+# against 3.3.0 (algorithm-confusion / DoS class issues), fixed in
+# 3.4.0+. This is the library that signs and verifies every access and
+# refresh token in the system (app/core/security/tokens.py) — the
+# single highest-value dependency in the whole audit to patch. `jose`'s
+# public API (jwt.encode/jwt.decode) is unchanged across this range;
+# full test suite re-run green after the bump — see
+# docs/security/dependency-audit.md.
+python-jose[cryptography]==3.5.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 

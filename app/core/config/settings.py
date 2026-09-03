@@ -312,6 +312,10 @@ class Settings(BaseSettings):
     RATE_LIMIT_LOGIN_WINDOW_SECONDS: int = 60
     RATE_LIMIT_REGISTER_REQUESTS: int = 5
     RATE_LIMIT_REGISTER_WINDOW_SECONDS: int = 300
+    # Phase 10: /auth/refresh was previously unmetered — see
+    # RateLimitCategory.REFRESH's comment in app/core/rate_limiter.py.
+    RATE_LIMIT_REFRESH_REQUESTS: int = 20
+    RATE_LIMIT_REFRESH_WINDOW_SECONDS: int = 60
     RATE_LIMIT_METADATA_REQUESTS: int = 300
     RATE_LIMIT_METADATA_WINDOW_SECONDS: int = 60
     RATE_LIMIT_UPLOAD_INITIATE_REQUESTS: int = 60

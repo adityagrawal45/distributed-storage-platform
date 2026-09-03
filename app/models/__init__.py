@@ -1,3 +1,4 @@
+from app.models.audit_log import AuditLog
 from app.models.file_metadata import FileMetadata, FileStatus
 from app.models.file_version import FileVersion
 from app.models.folder import Folder
@@ -25,4 +26,6 @@ __all__ = [
     "ProcessedEvent",
     "ProcessedEventStatus",
     "Notification",
+    # Phase 10
+    "AuditLog",
 ]

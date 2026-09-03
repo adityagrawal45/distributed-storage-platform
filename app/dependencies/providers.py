@@ -25,6 +25,7 @@ from app.database.redis import get_redis
 from app.database.session import get_db
 from app.dependencies.rate_limit import RateLimiterDep, get_rate_limiter
 from app.events.publisher import EventPublisher
+from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
@@ -34,6 +35,7 @@ from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.upload_chunk_repository import UploadChunkRepository
 from app.repositories.upload_session_repository import UploadSessionRepository
 from app.repositories.user_repository import UserRepository
+from app.services.audit_service import AuditService
 from app.services.auth_service import AuthService
 from app.services.cache_invalidator import CacheInvalidator
 from app.services.cache_service import CacheService
@@ -155,6 +157,30 @@ def get_refresh_token_repository(session: DbSession) -> RefreshTokenRepository:
     return RefreshTokenRepository(session)
 
 
+def get_audit_log_repository(session: DbSession) -> AuditLogRepository:
+    return AuditLogRepository(session)
+
+
+AuditLogRepositoryDep = Annotated[AuditLogRepository, Depends(get_audit_log_repository)]
+
+
+def get_audit_service(repository: AuditLogRepositoryDep) -> AuditService:
+    """
+    Phase 10: bound to the SAME request-scoped session as every other
+    repository — same "one Unit of Work" mechanism the Phase 8 outbox
+    provider's docstring explains. A security-audited mutation (e.g.
+    `permanent_delete`) and its audit row therefore commit or roll back
+    together, though `AuditService.record` itself still never raises
+    (see its class docstring's degradation contract) — a failed audit
+    *write* never fails the request even though it happens to share a
+    transaction with one that would.
+    """
+    return AuditService(repository)
+
+
+AuditServiceDep = Annotated[AuditService, Depends(get_audit_service)]
+
+
 def get_folder_repository(session: DbSession) -> FolderRepository:
     return FolderRepository(session)
 
@@ -229,8 +255,9 @@ UploadChunkRepositoryDep = Annotated[UploadChunkRepository, Depends(get_upload_c
 def get_auth_service(
     user_repository: UserRepositoryDep,
     refresh_token_repository: RefreshTokenRepositoryDep,
+    audit: AuditServiceDep,
 ) -> AuthService:
-    return AuthService(user_repository, refresh_token_repository)
+    return AuthService(user_repository, refresh_token_repository, audit=audit)
 
 
 def get_user_service(
@@ -307,11 +334,13 @@ def get_file_upload_service(
     validator: FileValidationServiceDep,
     invalidator: CacheInvalidatorDep,
     outbox: OutboxRepositoryDep,
+    audit: AuditServiceDep,
 ) -> FileUploadService:
     return FileUploadService(
         file_repository, folder_repository, version_repository, storage_service, validator,
         invalidator=invalidator,
         outbox=outbox,
+        audit=audit,
     )
 
 

@@ -1,6 +1,72 @@
 # NimbusFS — Project Context
 
-Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module.
+Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10.
+
+## Phase 10 (2026-09-04): Enterprise Security, Identity & Access Control
+
+**Full writeup: `docs/security/`, especially `docs/security/final-report.md`.**
+Test suite: **429/429 passing** (416 pre-Phase-10 + 13 new, zero
+regressions — re-verified after dependency bumps too).
+
+A mandatory repository inspection (not an assumption from this file's
+own narrative) found NimbusFS's existing security posture — built
+across Phases 1-9 — **already substantially correct**: working RBAC
+(`UserRole` native enum + `require_role` dependency factory), IDOR
+protection baked directly into every repository query
+(`get_active_by_id(id, owner_id)`-shaped, never a bolt-on `if` check),
+bcrypt password hashing + strength validation, JWT with type/issuer/
+expiry validation and rotation-based refresh-token revocation,
+distributed Redis-backed rate limiting, 6 least-privilege
+Workload-Identity-bound GCP service accounts, hardened non-root K8s
+Pods, a private GCS bucket with expiring signed URLs, and no hardcoded
+secrets. None of that was rebuilt. Phase 10 made six targeted changes
+where a real gap was found:
+
+- **New: a security audit trail** (`AuditLog` model/repository/
+  service, `alembic/versions/0006_security_add_audit_log.py`) — the
+  one genuine total gap found. Wired into `LOGIN_SUCCESS`/
+  `LOGIN_FAILURE`/`LOGOUT`/`TOKEN_REFRESH`/`TOKEN_REVOCATION`/
+  `FILE_DELETE`/`FILE_DOWNLOAD` (direct + signed URL)/`ADMIN_ACTION`.
+  Never raises on write failure (logged at ERROR instead) — the same
+  "loud, never silent, never blocks the primary operation" contract
+  Phase 7's `CacheService` and Phase 8's `OutboxEmitterMixin` already
+  established, deliberately extended here rather than re-invented.
+- **Refresh-token reuse now reacts, not just rejects**: replaying an
+  already-rotated refresh token (`AuthService.refresh`) now revokes
+  the user's ENTIRE session family via
+  `RefreshTokenRepository.revoke_all_for_user` (a single `UPDATE`, not
+  a fetch-loop) and records a `TOKEN_REVOCATION` audit event —
+  previously it was only rejected with a generic 401.
+- **`/auth/refresh` is now rate-limited** (`RateLimitCategory.REFRESH`)
+  — it was previously the one auth endpoint reachable without prior
+  authentication that carried no budget at all, the same abuse shape
+  Phase 7 already recognized for `/login`/`/register`.
+- **Two dependencies with known CVEs directly on the security attack
+  surface were patched**, found by an actual `pip-audit` scan (22 CVEs
+  across 5 packages total; see `docs/security/dependency-audit.md` for
+  the full table and what was deliberately NOT bumped, and why):
+  `python-jose` 3.3.0→3.5.0 (the JWT signing/verification library) and
+  `python-multipart` 0.0.20→0.0.32 (parses every `UploadFile` in the
+  codebase — untrusted input).
+- Every service-constructor change follows the exact keyword-only-
+  defaulting-to-`None` backward-compatibility pattern Phase 7/8
+  established for `cache=`/`invalidator=`/`outbox=` — `AuthService`
+  and `FileUploadService` both gained an `audit: AuditService | None =
+  None` parameter; every pre-Phase-10 construction (all 416
+  pre-existing tests included) works unchanged.
+- **Remaining risks, recorded honestly rather than fixed**: no
+  startup guard against a production deployment still running the dev-
+  default `JWT_SECRET_KEY`/`ALLOWED_HOSTS=*`; `starlette`'s 9 known
+  CVEs not patched (would require a FastAPI-version-upgrade pass with
+  its own regression budget, out of scope for this pass); no Secret
+  Manager integration (still Kubernetes Secrets only); no audit-log
+  retention/export policy. Full list in
+  `docs/security/final-report.md`'s "Remaining Risks" section.
+- **Nothing in this phase was run against real infrastructure either**
+  — `alembic upgrade head` for migration `0006_security` has never
+  been run against a real Postgres (same caveat every migration since
+  0005 carries), consistent with every other phase's honest
+  DESIGNED/IMPLEMENTED/TESTED/MEASURED distinction.
 
 ## Phase 9 extension (2026-09-03): Terraform for GKE + VPC + IAM
 

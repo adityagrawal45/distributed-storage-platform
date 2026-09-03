@@ -35,6 +35,7 @@ from typing import AsyncIterator
 
 from fastapi import UploadFile
 
+from app.core.enums import AuditEventType, AuditResult
 from app.exceptions.custom_exceptions import (
     DuplicateFileException,
     FileNotFoundException,
@@ -50,6 +51,7 @@ from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
 from app.repositories.outbox_repository import OutboxRepository
+from app.services.audit_service import AuditService
 from app.services.cache_invalidator import CacheInvalidator
 from app.services.file_validation_service import FileValidationService
 from app.services.storage_service import StorageService
@@ -71,6 +73,7 @@ class FileUploadService(OutboxEmitterMixin):
         *,
         invalidator: CacheInvalidator | None = None,
         outbox: OutboxRepository | None = None,
+        audit: AuditService | None = None,
     ):
         self._files = file_repository
         self._folders = folder_repository
@@ -85,6 +88,11 @@ class FileUploadService(OutboxEmitterMixin):
         # transactional outbox. Bound to the request's session, so the
         # event row commits in the same transaction as the file row.
         self._outbox = outbox
+        # Phase 10: same technique again, for the security audit trail.
+        # Wired only to `permanent_delete` here — see that method's
+        # docstring for why FILE_DOWNLOAD is audited at the route layer
+        # instead.
+        self._audit = audit
 
     async def _invalidate_file(self, file: FileMetadata) -> None:
         if self._invalidator is not None:
@@ -382,6 +390,14 @@ class FileUploadService(OutboxEmitterMixin):
         object itself. Requires the file to already be soft-deleted
         (trashed) first — the same two-step "trash, then permanently
         delete" flow Phase 2 established for metadata-only rows.
+
+        Phase 10: records a FILE_DELETE audit event AFTER the row is
+        actually gone, not before -- an audit entry for a delete that
+        then failed to happen would be a false record, worse than a
+        delayed one. Audited here (in the service), unlike
+        FILE_DOWNLOAD which is audited at the route layer, because this
+        is a destructive mutation with owner/folder/file IDs already in
+        hand from the lookup the operation itself needed anyway.
         """
         file = await self._files.get_any_by_id(file_id, owner_id)
         if file is None:
@@ -399,5 +415,14 @@ class FileUploadService(OutboxEmitterMixin):
 
         if object_name and not await self._object_still_referenced(object_name):
             await self._storage.delete(object_name)
+
+        if self._audit is not None:
+            await self._audit.record(
+                AuditEventType.FILE_DELETE,
+                result=AuditResult.SUCCESS,
+                actor_user_id=owner_id,
+                resource_type="file",
+                resource_id=file_id,
+            )
 
         logger.info("permanent_delete_completed", file_id=str(file_id))

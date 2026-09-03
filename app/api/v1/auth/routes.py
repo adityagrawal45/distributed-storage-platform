@@ -15,9 +15,18 @@ reach, so they carry the tightest rate-limit budgets and are bucketed by
 client IP rather than user ID (there is no user yet). See
 `app/dependencies/rate_limit.py` for how identity is resolved and
 `app/core/rate_limiter.py` for the algorithm.
+
+Phase 10: `/refresh` is now ALSO rate-limited (`RateLimitCategory.REFRESH`)
+— a real gap found by the Phase 10 security audit: it is, like
+login/register, reachable by anyone holding a (possibly stolen) refresh
+token, with no prior successful authentication required for the request
+itself. `login`/`refresh`/`logout` now also take the FastAPI `Request`
+so `request.state.client_ip` (resolved by `TrustedProxyMiddleware`) can
+be threaded into `AuthService`'s audit-trail calls — see
+`app/services/audit_service.py` and `docs/security/audit-logging.md`.
 """
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from typing import Annotated
 
@@ -31,6 +40,10 @@ from app.schemas.response import APIResponse
 from app.schemas.user import UserCreate, UserRead
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+def _client_ip(request: Request) -> str | None:
+    return getattr(request.state, "client_ip", None)
 
 
 @router.post(
@@ -55,13 +68,16 @@ async def register(payload: UserCreate, auth_service: AuthServiceDep) -> APIResp
     dependencies=[Depends(rate_limit(RateLimitCategory.LOGIN))],
 )
 async def login(
+    request: Request,
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     auth_service: AuthServiceDep,
 ) -> APIResponse[TokenPair]:
     # OAuth2PasswordRequestForm uses `username` for the identifier field;
     # we treat it as the user's email to stay OAuth2-spec-compliant while
     # keeping email-based login semantics.
-    tokens = await auth_service.login(email=form_data.username, password=form_data.password)
+    tokens = await auth_service.login(
+        email=form_data.username, password=form_data.password, ip_address=_client_ip(request)
+    )
     return APIResponse(message="Login successful.", data=tokens)
 
 
@@ -69,9 +85,12 @@ async def login(
     "/refresh",
     response_model=APIResponse[TokenPair],
     summary="Exchange a refresh token for a new access/refresh token pair",
+    dependencies=[Depends(rate_limit(RateLimitCategory.REFRESH))],
 )
-async def refresh(payload: RefreshTokenRequest, auth_service: AuthServiceDep) -> APIResponse[TokenPair]:
-    tokens = await auth_service.refresh(payload.refresh_token)
+async def refresh(
+    request: Request, payload: RefreshTokenRequest, auth_service: AuthServiceDep
+) -> APIResponse[TokenPair]:
+    tokens = await auth_service.refresh(payload.refresh_token, ip_address=_client_ip(request))
     return APIResponse(message="Token refreshed successfully.", data=tokens)
 
 
@@ -80,6 +99,8 @@ async def refresh(payload: RefreshTokenRequest, auth_service: AuthServiceDep) ->
     response_model=APIResponse[None],
     summary="Revoke a refresh token (logout)",
 )
-async def logout(payload: RefreshTokenRequest, auth_service: AuthServiceDep) -> APIResponse[None]:
-    await auth_service.logout(payload.refresh_token)
+async def logout(
+    request: Request, payload: RefreshTokenRequest, auth_service: AuthServiceDep
+) -> APIResponse[None]:
+    await auth_service.logout(payload.refresh_token, ip_address=_client_ip(request))
     return APIResponse(message="Logged out successfully.")

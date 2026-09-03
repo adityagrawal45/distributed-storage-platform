@@ -161,6 +161,15 @@ class RateLimitCategory(str, Enum):
 
     LOGIN = "login"
     REGISTER = "register"
+    # Phase 10: `/auth/refresh` was previously unmetered even though it
+    # is, like login/register, reachable without a prior successful
+    # authentication (only a possibly-stolen refresh token is needed) —
+    # a real gap found during the Phase 10 security audit, not part of
+    # the original Phase 7 design. Given its own budget rather than
+    # reusing LOGIN's: a legitimate client refreshing normally as
+    # access tokens expire has a different natural request rate than a
+    # login form.
+    REFRESH = "refresh"
     METADATA = "metadata"
     UPLOAD_INITIATE = "upload_initiate"
     UPLOAD_COMPLETE = "upload_complete"
@@ -201,6 +210,9 @@ def _rules_from_settings(settings: Settings) -> dict[RateLimitCategory, RateLimi
         ),
         RateLimitCategory.REGISTER: RateLimitRule(
             settings.RATE_LIMIT_REGISTER_REQUESTS, settings.RATE_LIMIT_REGISTER_WINDOW_SECONDS
+        ),
+        RateLimitCategory.REFRESH: RateLimitRule(
+            settings.RATE_LIMIT_REFRESH_REQUESTS, settings.RATE_LIMIT_REFRESH_WINDOW_SECONDS
         ),
         RateLimitCategory.METADATA: RateLimitRule(
             settings.RATE_LIMIT_METADATA_REQUESTS, settings.RATE_LIMIT_METADATA_WINDOW_SECONDS

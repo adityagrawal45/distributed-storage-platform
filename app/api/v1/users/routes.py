@@ -10,10 +10,11 @@ Demonstrates:
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
+from app.core.enums import AuditEventType, AuditResult
 from app.dependencies.auth import CurrentUser, require_role
-from app.dependencies.providers import UserServiceDep
+from app.dependencies.providers import AuditServiceDep, UserServiceDep
 from app.models.user import User, UserRole
 from app.schemas.response import APIResponse
 from app.schemas.user import UserRead
@@ -38,6 +39,8 @@ async def get_my_profile(current_user: CurrentUser) -> APIResponse[UserRead]:
 async def get_user_by_id(
     user_id: uuid.UUID,
     user_service: UserServiceDep,
+    audit_service: AuditServiceDep,
+    request: Request,
     _admin: Annotated[User, Depends(require_role(UserRole.ADMIN))],
 ) -> APIResponse[UserRead]:
     """Restricted to ADMIN role via the `require_role` dependency factory."""
@@ -45,4 +48,17 @@ async def get_user_by_id(
     # request — the cache holds the user resource, never the authorization
     # decision (see UserService's module docstring).
     profile = await user_service.get_profile(user_id)
+    # Phase 10: an admin looking up ANOTHER user's profile is exactly
+    # the kind of privileged access the audit trail exists to make
+    # reviewable after the fact — recorded regardless of whether
+    # `user_id` happens to equal the admin's own ID.
+    await audit_service.record(
+        AuditEventType.ADMIN_ACTION,
+        result=AuditResult.SUCCESS,
+        actor_user_id=_admin.id,
+        resource_type="user",
+        resource_id=user_id,
+        ip_address=getattr(request.state, "client_ip", None),
+        detail={"action": "get_user_by_id"},
+    )
     return APIResponse(message="User retrieved successfully.", data=profile)

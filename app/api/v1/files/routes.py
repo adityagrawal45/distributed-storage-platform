@@ -17,14 +17,28 @@ from fastapi import APIRouter, File, Form, Header, Query, Request, UploadFile, s
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.core.config import get_settings
+from app.core.enums import AuditEventType, AuditResult
 from app.dependencies.auth import CurrentUser
-from app.dependencies.providers import FileUploadServiceDep, IdempotencyServiceDep
+from app.dependencies.providers import AuditServiceDep, FileUploadServiceDep, IdempotencyServiceDep
 from app.exceptions.custom_exceptions import ValidationException
 from app.schemas.file_metadata import FileMetadataRead, FileUploadResponse, SignedUrlResponse
 from app.schemas.response import APIResponse
 from app.services.idempotency_service import IdempotencyOutcome, compute_fingerprint
 
 router = APIRouter(prefix="/files", tags=["File Storage"])
+
+# Phase 10: FILE_DOWNLOAD is audited HERE (route layer), not inside
+# FileUploadService — unlike FILE_DELETE (audited in the service; see
+# that method's docstring). Both download paths below already have a
+# `Request` in scope for the client IP, and download is a read, not a
+# mutation, so there is no shared transaction to piggyback the audit
+# write onto the way FILE_DELETE piggybacks on its own row deletion —
+# recording it here avoids adding a `Request`/IP parameter to a service
+# method that otherwise has no reason to know about HTTP at all.
+
+
+def _client_ip(request: Request) -> str | None:
+    return getattr(request.state, "client_ip", None)
 
 
 def _content_disposition(filename: str) -> str:
@@ -124,9 +138,19 @@ async def download_file(
     file_id: uuid.UUID,
     current_user: CurrentUser,
     file_upload_service: FileUploadServiceDep,
+    audit_service: AuditServiceDep,
     request: Request,
 ):
     file = await file_upload_service.get_downloadable_file(file_id, current_user.id)
+    await audit_service.record(
+        AuditEventType.FILE_DOWNLOAD,
+        result=AuditResult.SUCCESS,
+        actor_user_id=current_user.id,
+        resource_type="file",
+        resource_id=file_id,
+        ip_address=_client_ip(request),
+        detail={"method": "direct"},
+    )
     media_type = file.mime_type or "application/octet-stream"
     disposition = _content_disposition(file.original_filename)
 
@@ -166,12 +190,29 @@ async def get_signed_url(
     file_id: uuid.UUID,
     current_user: CurrentUser,
     file_upload_service: FileUploadServiceDep,
+    audit_service: AuditServiceDep,
+    request: Request,
     expires_in_minutes: int | None = Query(
         default=None, ge=1, le=10080, description="Defaults to SIGNED_URL_EXPIRATION_MINUTES if omitted."
     ),
 ) -> APIResponse[SignedUrlResponse]:
     settings = get_settings()
+    # `get_signed_url` calls `get_downloadable_file` internally FIRST
+    # (ownership check via `get_active_by_id(file_id, owner_id)`), so a
+    # request for another user's file never reaches URL generation at
+    # all — this audit call only runs once that authorization has
+    # already passed. Never logs the URL itself (a bearer credential —
+    # see AuditService's class docstring), only that one was issued.
     url = await file_upload_service.get_signed_url(file_id, current_user.id, expires_in_minutes)
+    await audit_service.record(
+        AuditEventType.FILE_DOWNLOAD,
+        result=AuditResult.SUCCESS,
+        actor_user_id=current_user.id,
+        resource_type="file",
+        resource_id=file_id,
+        ip_address=_client_ip(request),
+        detail={"method": "signed_url"},
+    )
     return APIResponse(
         message="Signed URL generated successfully.",
         data=SignedUrlResponse(url=url, expires_in_minutes=expires_in_minutes or settings.SIGNED_URL_EXPIRATION_MINUTES),
