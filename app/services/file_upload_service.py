@@ -29,6 +29,7 @@ checks for other referencing rows before deleting the object itself.
 
 import asyncio
 import hashlib
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import AsyncIterator
@@ -36,6 +37,13 @@ from typing import AsyncIterator
 from fastapi import UploadFile
 
 from app.core.enums import AuditEventType, AuditResult
+from app.core.metrics import (
+    FILE_OPERATION_DURATION_SECONDS,
+    FILES_DOWNLOADED_TOTAL,
+    FILES_UPLOADED_TOTAL,
+    UPLOAD_BYTES_TOTAL,
+    safe_call,
+)
 from app.exceptions.custom_exceptions import (
     DuplicateFileException,
     FileNotFoundException,
@@ -160,7 +168,33 @@ class FileUploadService(OutboxEmitterMixin):
         Rollback: if metadata persistence fails AFTER a real (non-deduped)
         upload succeeded, the just-uploaded object is deleted so we never
         leave an orphaned, unreferenced object in the bucket.
+
+        Phase 11: this outer method is a thin metrics wrapper around
+        `_upload_file_inner` (all the actual logic, unchanged) — timing
+        the WHOLE call (validation + hashing + storage + metadata) is
+        what `files_upload_duration_seconds` is meant to represent, and
+        splitting it out means the success/duplicate/failure counters
+        have exactly one `try/except`, not one per early-return branch.
         """
+        started = time.perf_counter()
+        try:
+            file, is_duplicate = await self._upload_file_inner(owner_id, folder_id, upload_file)
+        except Exception:
+            safe_call(lambda: FILES_UPLOADED_TOTAL.labels(result="failure").inc(), operation="files_uploaded_inc")
+            raise
+        safe_call(
+            lambda: FILES_UPLOADED_TOTAL.labels(result="duplicate" if is_duplicate else "success").inc(),
+            operation="files_uploaded_inc",
+        )
+        safe_call(
+            lambda: FILE_OPERATION_DURATION_SECONDS.labels(operation="upload").observe(time.perf_counter() - started),
+            operation="file_operation_duration_observe",
+        )
+        return file, is_duplicate
+
+    async def _upload_file_inner(
+        self, owner_id: uuid.UUID, folder_id: uuid.UUID | None, upload_file: UploadFile
+    ) -> tuple[FileMetadata, bool]:
         await self._validate_folder(owner_id, folder_id)
 
         if not upload_file.filename:
@@ -199,6 +233,7 @@ class FileUploadService(OutboxEmitterMixin):
             )
             bucket_name, etag, storage_class = result.bucket_name, result.etag, result.storage_class
             uploaded_object_this_call = True
+            safe_call(lambda: UPLOAD_BYTES_TOTAL.inc(size), operation="upload_bytes_total_inc")
 
         try:
             # `stored_filename` is Phase 2's per-row unique key reservation
@@ -274,9 +309,23 @@ class FileUploadService(OutboxEmitterMixin):
     # Download
     # ------------------------------------------------------------------
     async def get_downloadable_file(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadata:
-        file = await self._get_owned_active(file_id, owner_id)
-        if file.upload_status != UploadStatus.COMPLETED or not file.object_name:
-            raise FileNotFoundException(detail="This file has no uploaded content yet.")
+        """
+        Phase 11: `files_downloaded_total` is incremented HERE (on
+        access being granted), not after the streaming response finishes
+        — a `StreamingResponse` can fail mid-body for reasons entirely
+        outside this service's control (client disconnect, network
+        blip), and this metric answers "how often do download requests
+        resolve to a real, accessible file", not "did every last byte
+        make it to the client".
+        """
+        try:
+            file = await self._get_owned_active(file_id, owner_id)
+            if file.upload_status != UploadStatus.COMPLETED or not file.object_name:
+                raise FileNotFoundException(detail="This file has no uploaded content yet.")
+        except Exception:
+            safe_call(lambda: FILES_DOWNLOADED_TOTAL.labels(result="failure").inc(), operation="files_downloaded_inc")
+            raise
+        safe_call(lambda: FILES_DOWNLOADED_TOTAL.labels(result="success").inc(), operation="files_downloaded_inc")
         return file
 
     def stream(self, file: FileMetadata) -> AsyncIterator[bytes]:
