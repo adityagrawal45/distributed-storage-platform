@@ -23,6 +23,44 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+#: Phase 11 security audit (see docs/observability.md "Security Audit
+#: of Logging"): NimbusFS's own log call sites were already found to be
+#: careful — nowhere does the codebase pass a raw password, JWT, or
+#: signed URL to `logger.*()`. This processor is defense-in-depth on top
+#: of that, not evidence a leak was found: a future call site, or a
+#: third-party library's log record merged in by `merge_contextvars`,
+#: could still bind a field under one of these names. Matching is on the
+#: KEY, not a regex over values, which is O(1) per field and cannot
+#: accidentally redact legitimate content that merely looks secret-shaped.
+_REDACTED_KEYS = frozenset(
+    {
+        "password",
+        "hashed_password",
+        "access_token",
+        "refresh_token",
+        "token",
+        "authorization",
+        "jwt",
+        "secret",
+        "client_secret",
+        "api_key",
+        "private_key",
+        "signed_url",
+        "database_url",
+        "redis_url",
+    }
+)
+_REDACTED_VALUE = "***REDACTED***"
+
+
+def _redact_sensitive_fields(_logger, _method_name, event_dict: dict) -> dict:
+    """A structlog processor: replaces any event-dict key in `_REDACTED_KEYS`
+    (case-insensitive) with a fixed placeholder, never the real value."""
+    for key in list(event_dict.keys()):
+        if key.lower() in _REDACTED_KEYS:
+            event_dict[key] = _REDACTED_VALUE
+    return event_dict
+
 
 def configure_logging() -> None:
     """Configure stdlib logging + structlog. Call once at startup."""
@@ -41,6 +79,9 @@ def configure_logging() -> None:
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
+        # Phase 11: last, so it sees (and can redact) fields merged in by
+        # every processor above it, including contextvars.
+        _redact_sensitive_fields,
     ]
 
     if settings.LOG_JSON:
