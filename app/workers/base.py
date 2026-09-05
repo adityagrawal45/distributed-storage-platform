@@ -49,6 +49,7 @@ human might replay after a fix. See `NonRetryableEventError`'s docstring.
 """
 
 import asyncio
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any
@@ -59,6 +60,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.metrics import PUBSUB_MESSAGES_PROCESSED_TOTAL, PUBSUB_PROCESSING_DURATION_SECONDS, safe_call
 from app.core.server_info import get_server_identity
 from app.database.session import AsyncSessionLocal
 from app.events.envelope import EventEnvelope
@@ -69,6 +71,22 @@ from app.repositories.processed_event_repository import ProcessedEventRepository
 from app.workers.runtime import WorkerRuntimeMixin
 
 logger = get_logger(__name__)
+
+
+def record_pubsub_processed(consumer_name: str, result: str) -> None:
+    """`consumer_name` is a small, fixed, code-controlled set (one per
+    worker class) — safe as a metric label; see `app/core/metrics.py`."""
+    safe_call(
+        lambda: PUBSUB_MESSAGES_PROCESSED_TOTAL.labels(consumer=consumer_name, result=result).inc(),
+        operation="pubsub_messages_processed_inc",
+    )
+
+
+def observe_pubsub_duration(consumer_name: str, seconds: float) -> None:
+    safe_call(
+        lambda: PUBSUB_PROCESSING_DURATION_SECONDS.labels(consumer=consumer_name).observe(seconds),
+        operation="pubsub_processing_duration_observe",
+    )
 
 
 class BaseWorker(WorkerRuntimeMixin, ABC):
@@ -174,6 +192,11 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
                 event_id=str(envelope.event_id),
                 event_type=envelope.event_type.value,
                 correlation_id=str(envelope.correlation_id),
+                # Phase 11: re-bind the ORIGINATING request's trace_id (not
+                # a fresh one) so this worker's logs join the same trace as
+                # the HTTP request that caused the event — see
+                # app/events/envelope.py's `trace_id` field docstring.
+                trace_id=envelope.trace_id,
             )
 
             if not self.interested_in(envelope):
@@ -193,6 +216,7 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
             try:
                 if await processed.has_processed(envelope.event_id, self.consumer_name):
                     logger.info("event_already_processed_skipped")
+                    record_pubsub_processed(self.consumer_name, "duplicate")
                     message.ack()
                     return
             except Exception as exc:  # noqa: BLE001
@@ -203,6 +227,12 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
             status = ProcessedEventStatus.SUCCEEDED
             error_text: str | None = None
 
+            # Phase 11: RED metric for the worker's actual unit of work —
+            # deliberately timing only `process()`, not the idempotency
+            # pre-check / ProcessedEvent bookkeeping around it, so this
+            # duration is comparable to "how long does this handler take"
+            # regardless of ack-path overhead.
+            started = time.perf_counter()
             try:
                 await self.process(envelope, session)
             except NonRetryableEventError as exc:
@@ -222,8 +252,11 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
                     max_delivery_attempts=self._settings.MAX_DELIVERY_ATTEMPTS,
                 )
                 await session.rollback()
+                record_pubsub_processed(self.consumer_name, "retried")
                 message.nack()
                 return
+            finally:
+                observe_pubsub_duration(self.consumer_name, time.perf_counter() - started)
 
             # --- record the terminal outcome, then settle ------------
             try:
@@ -236,6 +269,7 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
                 await session.commit()
                 if not created:
                     logger.info("duplicate_event_absorbed")
+                    record_pubsub_processed(self.consumer_name, "duplicate")
             except IntegrityError:
                 # Lost the idempotency race at the DB constraint despite
                 # `record`'s SAVEPOINT (e.g. the commit itself collided).
@@ -244,14 +278,20 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
                 # definitionally already done.
                 await session.rollback()
                 logger.info("duplicate_event_absorbed_on_commit")
+                record_pubsub_processed(self.consumer_name, "duplicate")
             except Exception as exc:  # noqa: BLE001
                 # Could not record the outcome. NACK: redelivery is safe
                 # (process() is idempotent) and losing the ledger entry
                 # silently is not.
                 await session.rollback()
                 logger.error("processed_event_record_failed", error=str(exc))
+                record_pubsub_processed(self.consumer_name, "retried")
                 message.nack()
                 return
+            else:
+                record_pubsub_processed(
+                    self.consumer_name, "succeeded" if status == ProcessedEventStatus.SUCCEEDED else "failed"
+                )
 
             message.ack()
             logger.info("event_processed", status=status.value)
