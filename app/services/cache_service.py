@@ -67,6 +67,7 @@ from typing import Any
 import redis.asyncio as redis
 
 from app.core.cache.keys import CacheKeyBuilder
+from app.core.metrics import CACHE_OPERATIONS_TOTAL, safe_call
 from app.core.cache.policy import CacheEntity, CachePolicy
 from app.core.cache.serializer import CacheSerializer
 from app.core.distributed_lock import DistributedLockFactory
@@ -136,9 +137,26 @@ class CacheService:
     def _elapsed_ms(started: float) -> float:
         return round((time.perf_counter() - started) * 1000, 2)
 
+    @staticmethod
+    def _record_metric(operation: str, result: str) -> None:
+        """
+        Phase 11: the exact same event shapes this class already logs
+        (`cache_hit`/`cache_miss`/`cache_set`/... — see the module
+        docstring's "Observability" section, written back in Phase 7)
+        also become a bounded-cardinality counter here. `operation` and
+        `result` are both small fixed enums of literal strings this
+        class itself chooses — never a cache key — so cardinality stays
+        bounded regardless of how many distinct keys exist.
+        """
+        safe_call(
+            lambda: CACHE_OPERATIONS_TOTAL.labels(operation=operation, result=result).inc(),
+            operation="cache_operations_total_inc",
+        )
+
     def _on_error(self, operation: str, cache_key: str, exc: BaseException, started: float) -> None:
         """Single funnel for every Redis failure — one log shape, always emitted."""
         self.errors += 1
+        self._record_metric(operation, "error")
         logger.error(
             "cache_error",
             operation=operation,
@@ -168,6 +186,7 @@ class CacheService:
         hit, payload = CacheSerializer.decode(raw)
         if not hit:
             self.misses += 1
+            self._record_metric("get", "miss")
             logger.debug(
                 "cache_miss",
                 operation="get",
@@ -183,6 +202,7 @@ class CacheService:
             return None
 
         self.hits += 1
+        self._record_metric("get", "hit")
         logger.debug(
             "cache_hit",
             operation="get",
@@ -250,6 +270,7 @@ class CacheService:
             self._on_error("set", key, exc, started)
             return False
 
+        self._record_metric("set", "written")
         logger.debug(
             "cache_set",
             operation="set",
@@ -273,6 +294,7 @@ class CacheService:
             self._on_error("delete", ",".join(keys), exc, started)
             return 0
 
+        self._record_metric("delete", "deleted")
         logger.debug(
             "cache_delete",
             operation="delete",
