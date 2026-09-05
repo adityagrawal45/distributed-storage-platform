@@ -43,6 +43,7 @@ import os
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.metrics import PUBSUB_MESSAGES_PUBLISHED_TOTAL, safe_call
 from app.events.envelope import EventEnvelope
 from app.events.topics import topic_for_event_type
 from app.exceptions.custom_exceptions import EventPublishError
@@ -128,6 +129,10 @@ class EventPublisher:
                 event_type=envelope.event_type.value,
                 topic=topic_name,
             )
+            safe_call(
+                lambda: PUBSUB_MESSAGES_PUBLISHED_TOTAL.labels(topic=topic_name, result="disabled").inc(),
+                operation="pubsub_published_inc",
+            )
             return f"disabled-{envelope.event_id}"
 
         data, attributes = envelope.to_pubsub_message()
@@ -152,6 +157,10 @@ class EventPublisher:
                 topic=topic_name,
                 error=str(exc),
             )
+            safe_call(
+                lambda: PUBSUB_MESSAGES_PUBLISHED_TOTAL.labels(topic=topic_name, result="failure").inc(),
+                operation="pubsub_published_inc",
+            )
             raise EventPublishError(f"Failed to publish {envelope.event_type.value}: {exc}") from exc
 
         logger.info(
@@ -161,6 +170,10 @@ class EventPublisher:
             topic=topic_name,
             message_id=str(message_id),
             correlation_id=str(envelope.correlation_id),
+        )
+        safe_call(
+            lambda: PUBSUB_MESSAGES_PUBLISHED_TOTAL.labels(topic=topic_name, result="success").inc(),
+            operation="pubsub_published_inc",
         )
         return str(message_id)
 
