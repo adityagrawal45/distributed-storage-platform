@@ -57,6 +57,7 @@ from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
 
 from app.core.config import get_settings
+from app.core.tracing import start_span
 from app.exceptions.custom_exceptions import (
     BucketNotFoundException,
     StorageException,
@@ -150,7 +151,8 @@ class StorageService:
             return blob
 
         try:
-            blob = await asyncio.to_thread(_do_upload)
+            with start_span("gcs.upload", object_name=object_name, size=size):
+                blob = await asyncio.to_thread(_do_upload)
         except gcs_exceptions.NotFound as exc:
             logger.error("storage_upload_failed", object_name=object_name, error=str(exc))
             raise BucketNotFoundException("Upload failed: configured bucket does not exist.") from exc
@@ -220,7 +222,8 @@ class StorageService:
             return blob.download_as_bytes(start=start, end=end)
 
         try:
-            return await asyncio.to_thread(_do_download)
+            with start_span("gcs.download_range", object_name=object_name, start=start, end=end):
+                return await asyncio.to_thread(_do_download)
         except gcs_exceptions.NotFound as exc:
             raise StorageObjectNotFoundException("The file's bytes could not be located in storage.") from exc
         except Exception as exc:  # noqa: BLE001
@@ -249,7 +252,8 @@ class StorageService:
             self._bucket().blob(object_name).delete()
 
         try:
-            await asyncio.to_thread(_do_delete)
+            with start_span("gcs.delete", object_name=object_name):
+                await asyncio.to_thread(_do_delete)
         except gcs_exceptions.NotFound:
             # Already gone — deleting a nonexistent object is not an error
             # for our purposes (idempotent delete), it just gets logged.
@@ -282,7 +286,8 @@ class StorageService:
             return blob.generate_signed_url(version="v4", expiration=timedelta(minutes=minutes), method=method)
 
         try:
-            url = await asyncio.to_thread(_do_generate)
+            with start_span("gcs.generate_signed_url", object_name=object_name):
+                url = await asyncio.to_thread(_do_generate)
         except Exception as exc:  # noqa: BLE001
             logger.error("signed_url_generation_failed", object_name=object_name, error=str(exc))
             raise _translate_gcs_error(exc, context="Signed URL generation") from exc
@@ -360,25 +365,28 @@ class StorageService:
             "storage_compose_started", destination=destination_object_name, source_count=len(source_object_names)
         )
 
-        current_layer = source_object_names
-        stage = 0
-        intermediate_objects: list[str] = []
+        with start_span(
+            "gcs.compose_objects", destination=destination_object_name, source_count=len(source_object_names)
+        ):
+            current_layer = source_object_names
+            stage = 0
+            intermediate_objects: list[str] = []
 
-        while len(current_layer) > GCS_COMPOSE_MAX_SOURCES:
-            next_layer: list[str] = []
-            for batch_index, i in enumerate(range(0, len(current_layer), GCS_COMPOSE_MAX_SOURCES)):
-                batch = current_layer[i : i + GCS_COMPOSE_MAX_SOURCES]
-                intermediate_name = f"{destination_object_name}.compose-stage{stage}-{batch_index}"
-                await _compose_batch(intermediate_name, batch)
-                intermediate_objects.append(intermediate_name)
-                next_layer.append(intermediate_name)
-            current_layer = next_layer
-            stage += 1
+            while len(current_layer) > GCS_COMPOSE_MAX_SOURCES:
+                next_layer: list[str] = []
+                for batch_index, i in enumerate(range(0, len(current_layer), GCS_COMPOSE_MAX_SOURCES)):
+                    batch = current_layer[i : i + GCS_COMPOSE_MAX_SOURCES]
+                    intermediate_name = f"{destination_object_name}.compose-stage{stage}-{batch_index}"
+                    await _compose_batch(intermediate_name, batch)
+                    intermediate_objects.append(intermediate_name)
+                    next_layer.append(intermediate_name)
+                current_layer = next_layer
+                stage += 1
 
-        final_blob = await _compose_batch(destination_object_name, current_layer)
+            final_blob = await _compose_batch(destination_object_name, current_layer)
 
-        if intermediate_objects:
-            await self.delete_many(intermediate_objects)
+            if intermediate_objects:
+                await self.delete_many(intermediate_objects)
 
         logger.info("storage_compose_completed", destination=destination_object_name, size=final_blob.size)
         return UploadResult(
