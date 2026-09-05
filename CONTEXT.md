@@ -1,6 +1,102 @@
 # NimbusFS — Project Context
 
-Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10.
+Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10; updated 2026-09-06 after completing Phase 11.
+
+## Phase 11 (2026-09-06): Observability, Monitoring, Distributed Tracing & Alerting
+
+**Full writeup: `docs/observability.md`, `docs/monitoring.md`,
+`docs/alerting.md`, `docs/slo.md`, `docs/incident-response.md`, and
+README §24a.** Test suite: **449/449 passing** (429 pre-Phase-11 + 20
+new in `tests/test_observability.py`, zero regressions).
+
+A mandatory repository/observability inspection (not an assumption)
+found the foundation already substantially real — structured JSON
+logging, correlation/trace/server IDs propagated via
+`structlog.contextvars` since Phase 4, and correctly-separated
+`/live`/`/ready`/`/health` endpoints. The genuine gaps, confirmed by
+grep/read rather than assumed: no `/metrics` endpoint (Phase 7's own
+docstrings and a `k8s/07-deployment.yaml` annotation comment both
+explicitly deferred this to "a future phase"), no metrics library, no
+tracing/span primitive, and no `trace_id` propagation across the Phase
+8 Pub/Sub hop. Phase 11 filled exactly those gaps:
+
+- **New: `app/core/metrics.py`** (`prometheus_client`, a dedicated
+  `CollectorRegistry`, not the global default) — bounded-cardinality
+  RED/golden-signal counters/histograms/gauges for HTTP (via the new
+  `app/middleware/metrics.py::MetricsMiddleware`), auth, file
+  uploads/downloads, chunked uploads/resumptions, the DB pool, cache
+  operations, rate-limit decisions, Pub/Sub publish/process, and worker
+  jobs. Exposed at unversioned `GET /metrics`
+  (`app/api/observability_routes.py`), scraped by **Google Managed
+  Prometheus** (`k8s/24-podmonitoring.yaml`'s `PodMonitoring` CRD +
+  a new `gmp-system`-namespace ingress rule in
+  `k8s/11-networkpolicy.yaml`) — deliberately NOT a self-hosted
+  Prometheus/Grafana deployment; `docs/monitoring.md` §1 has the
+  explicit comparison. Every metrics call is wrapped in
+  `app/core/metrics.py::safe_call`, which swallows and logs (never
+  raises) any failure — telemetry must never become a failure
+  amplifier.
+- **New: `app/core/tracing.py`** — a hand-rolled `start_span()` context
+  manager (nested `span_id`/`parent_span_id`, `span_started`/
+  `span_completed`/`span_failed` structured log events with
+  `duration_ms`), wired around `StorageService`'s GCS calls. Chosen
+  over the full OpenTelemetry SDK deliberately — `docs/observability.md`
+  §5 has the full comparison table and the honest gap this leaves (no
+  trace-waterfall UI, no Cloud Trace export) plus the mechanical
+  migration path if that's ever needed.
+- **`EventEnvelope` gained a `trace_id: str | None` field**
+  (`app/events/envelope.py`), populated at emit time from the same
+  `structlog.contextvars` `correlation_id` already reads
+  (`app/events/emitter.py`) and REBOUND (not regenerated) into a
+  worker's own logging context on consumption
+  (`app/workers/base.py::_handle`) — this is what actually closes the
+  Phase 8 correlation chain's one real gap: a worker's logs now share
+  the SAME `trace_id` as the HTTP request that caused the event.
+- **`app/logging/logger.py` gained `_redact_sensitive_fields`**, a
+  `structlog` processor run last in the chain, redacting any field
+  bound under a fixed lower-cased sensitive-key set. Defense-in-depth:
+  the Phase 11 security audit (`docs/observability.md` §2) found no
+  actual secret-logging call site in the pre-existing codebase — this
+  guards against a FUTURE one, or a merged-in third-party log record.
+- **Health endpoints reviewed against the brief's liveness-vs-readiness
+  requirements and found already correct** — no code change.
+- **Metrics wired into**: `app/middleware/metrics.py` (HTTP RED),
+  `app/services/auth_service.py` (login/refresh outcomes),
+  `app/services/file_upload_service.py` (upload/download outcomes +
+  duration + bytes), `app/services/chunked_upload_service.py`
+  (chunk outcomes, resumptions, bytes), `app/services/cache_service.py`
+  (hit/miss/error alongside its existing Phase 7 structured logs),
+  `app/core/rate_limiter.py` (allow/reject/degrade decisions),
+  `app/events/publisher.py` (publish outcomes by topic),
+  `app/workers/base.py` (processing outcomes + duration by consumer),
+  `app/workers/outbox_publisher.py` (job outcomes).
+- **New Terraform: `terraform/monitoring.tf`** (gated behind a new
+  `create_monitoring_alerts` variable, default false) — 3 Cloud
+  Monitoring alert policies (API unavailable, sustained high error
+  rate, worker processing failures) + an uptime check on
+  `GET /api/v1/live`, matching `docs/alerting.md`'s catalog. **Not**
+  run through `terraform validate` this session (no `terraform` binary
+  was installed) — lower confidence than the rest of `terraform/`,
+  which Phase 9 did validate; reviewed by eye against the provider
+  resource schemas only.
+- **Remaining risks, recorded honestly rather than fixed** (full list
+  in `docs/observability.md` §11): no real OpenTelemetry/Cloud Trace
+  integration; no trace sampling (every request fully logged/spanned
+  today — fine at zero real traffic, a real cost concern at scale); no
+  dead-letter-queue metric/replay tooling; no per-query database
+  latency instrumentation; `nimbusfs_active_upload_sessions` is
+  declared but not yet wired to a live count; `/metrics` has no
+  application-level auth (by design, matching standard Prometheus
+  exporters — access control is 100% `k8s/11-networkpolicy.yaml` plus
+  the absence of a public Ingress path to it).
+- **Nothing in this phase was run against real infrastructure** — no
+  real GKE cluster, Cloud Monitoring project, or production traffic
+  existed this session. Every SLO/alert-threshold/dashboard in
+  `docs/slo.md`/`docs/alerting.md`/`docs/monitoring.md` is DESIGNED,
+  never MEASURED — the logging/metrics/tracing MECHANISMS themselves
+  are IMPLEMENTED and TESTED against fakes (`tests/test_observability.py`),
+  consistent with every prior phase's honest
+  DESIGNED/IMPLEMENTED/TESTED/MEASURED distinction.
 
 ## Phase 10 (2026-09-04): Enterprise Security, Identity & Access Control
 
@@ -135,7 +231,7 @@ A **cloud-native distributed file storage platform** (Google-Drive-style) built 
 
 - **Phase 9**: high availability & disaster recovery — `topologySpreadConstraints` added to the API and all four Phase 8 worker Deployments (zone-level `maxSkew: 1`, additive to Phase 5's soft `podAntiAffinity`, not a replacement for it); `outbox-publisher`/`notification-worker` bumped from 1→2 replicas specifically for zone-redundancy (each Deployment's own header comment carries the reasoning); a `minAvailable: 1` PodDisruptionBudget added for all four worker Deployments now that each runs >=2 replicas; a new read-only `ReconciliationService`/`reconciliation_job.py`, run every 6 hours via `k8s/22-cronjob-reconciliation.yaml` under its own least-privilege KSA/GSA, that keyset-paginates every non-deleted `upload_status=COMPLETED` `FileMetadata` row and flags one it can't find the backing GCS object for — it has **no delete/update code path anywhere in its call graph**, proven by `tests/test_reconciliation.py::test_never_mutates_or_deletes_anything`. Everything else this phase produced is design/documentation, not code: an availability target (99.9%) and RTO/RPO targets (<4h/<1h) with derivations, Cloud SQL Regional-HA and Memorystore Standard-tier configuration guidance (not applied — no real instances existed to apply it to), a GCS durability/protection recommendation (regional bucket + a scheduled cross-region object-replication job, explicitly **not** a dual-region bucket — cost-aware, not the most expensive default), an active-passive warm-standby multi-region DR design with a manual failover runbook (active-active explicitly rejected — no requirement justifies solving multi-writer Postgres consistency), a failure matrix, a monitoring metric inventory, severity-tiered alerts, a cost comparison (no fabricated pricing), and chaos-testing procedures for all 13 requested scenarios labeled LOCAL/STAGING/PRODUCTION. See README §16 and `docs/high-availability.md`/`docs/disaster-recovery.md`/`docs/failure-testing.md`/`docs/backup-restore.md` for the full depth. **Nothing in Phase 9 was run against real infrastructure** — no real GKE cluster, Cloud SQL instance, or Memorystore instance was available in this session either, so every HA/DR number in this phase is a justified target (DESIGNED), not a drill result (MEASURED) — see the honest gap list in "Phase 9 Design Decisions" below.
 
-**Not yet built** (future phases, per README §24): sharing/permissions between users, virus scanning (placeholder only), full-text content search, content-dedup extension to chunked uploads (Phase 6), CI/CD automation (Phase 5 only documented the intended shape), Terraform, observability/OpenTelemetry tracing (Phase 5 only prepared Prometheus annotations), backlog-based worker autoscaling, orphaned-GCS-object detection (Phase 9's reconciliation job deliberately covers only the other, more dangerous direction), and reconciliation of upload sessions stuck mid-`COMPLETING` (Phase 8's workers make it *possible*, but no such job was written — distinct from Phase 9's Postgres↔GCS drift reconciliation). (Real rate limiting and Redis metadata caching were on this list until Phase 7 shipped them; Pub/Sub background workers and thumbnails until Phase 8 did; multi-zone HA and DR design until Phase 9 did.)
+**Not yet built** (future phases, per README §24): sharing/permissions between users, virus scanning (placeholder only), full-text content search, content-dedup extension to chunked uploads (Phase 6), CI/CD automation (Phase 5 only documented the intended shape), a full OpenTelemetry/Cloud Trace integration (Phase 11 shipped a lighter-weight structured-log-based span/trace-ID primitive instead — see `docs/observability.md` §5 for why), trace sampling, dead-letter-queue metric/replay tooling, backlog-based worker autoscaling, orphaned-GCS-object detection (Phase 9's reconciliation job deliberately covers only the other, more dangerous direction), and reconciliation of upload sessions stuck mid-`COMPLETING` (Phase 8's workers make it *possible*, but no such job was written — distinct from Phase 9's Postgres↔GCS drift reconciliation). (Real rate limiting and Redis metadata caching were on this list until Phase 7 shipped them; Pub/Sub background workers and thumbnails until Phase 8 did; multi-zone HA and DR design until Phase 9 did; Terraform until Phase 9's extension did; application metrics/`/metrics`/distributed tracing/alerting until Phase 11 did.)
 
 ## Tech Stack
 
