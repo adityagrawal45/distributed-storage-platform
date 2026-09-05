@@ -135,6 +135,7 @@ from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import get_settings
 from app.core.distributed_lock import DistributedLockFactory
 from app.core.enums import ChunkStatus, UploadSessionStatus
+from app.core.metrics import CHUNKS_UPLOADED_TOTAL, UPLOAD_BYTES_TOTAL, UPLOAD_RESUMPTIONS_TOTAL, safe_call
 from app.core.retry import RetryExhaustedError, retry_async
 from app.core.upload_state_machine import UploadStateMachine
 from app.events.emitter import OutboxEmitterMixin
@@ -464,12 +465,17 @@ class ChunkedUploadService(OutboxEmitterMixin):
         if declared_checksum and declared_checksum.lower() != checksum:
             raise ChunkChecksumMismatchException(f"Chunk {chunk_number}'s content did not match its declared checksum.")
 
-        async with self._guarded_lock(
-            f"upload-chunk:{upload_id}:{chunk_number}", ttl_seconds=self._settings.IDEMPOTENCY_LOCK_TIMEOUT_SECONDS
-        ):
-            chunk_row = await self._write_chunk(session, chunk_number, data, checksum)
-            await self._transition_to_uploading_if_needed(session)
+        try:
+            async with self._guarded_lock(
+                f"upload-chunk:{upload_id}:{chunk_number}", ttl_seconds=self._settings.IDEMPOTENCY_LOCK_TIMEOUT_SECONDS
+            ):
+                chunk_row = await self._write_chunk(session, chunk_number, data, checksum)
+                await self._transition_to_uploading_if_needed(session)
+        except Exception:
+            safe_call(lambda: CHUNKS_UPLOADED_TOTAL.labels(result="failure").inc(), operation="chunks_uploaded_inc")
+            raise
 
+        safe_call(lambda: CHUNKS_UPLOADED_TOTAL.labels(result="success").inc(), operation="chunks_uploaded_inc")
         logger.info("chunk_upload_completed", upload_id=str(upload_id), chunk_number=chunk_number, size=len(data))
         return chunk_row
 
@@ -478,8 +484,12 @@ class ChunkedUploadService(OutboxEmitterMixin):
 
         if existing is not None and existing.status == ChunkStatus.VERIFIED and existing.checksum == checksum:
             # Safe retry: identical content already landed — genuinely a
-            # no-op, no re-upload, no duplicate GCS object.
+            # no-op, no re-upload, no duplicate GCS object. Counted as a
+            # "resumption": a client re-sending a chunk it already landed
+            # is exactly the resumable-upload-after-a-retry/disconnect
+            # signal (see UPLOAD_RESUMPTIONS_TOTAL's docstring).
             logger.info("chunk_upload_replayed", upload_id=str(session.id), chunk_number=chunk_number)
+            safe_call(lambda: UPLOAD_RESUMPTIONS_TOTAL.inc(), operation="upload_resumptions_inc")
             return existing
 
         temp_object_name = self._chunk_object_name(session.storage_object, chunk_number)
@@ -504,6 +514,8 @@ class ChunkedUploadService(OutboxEmitterMixin):
                 "chunk_upload_failed", upload_id=str(session.id), chunk_number=chunk_number, error=str(exc.last_exception)
             )
             raise exc.last_exception from exc
+
+        safe_call(lambda: UPLOAD_BYTES_TOTAL.inc(len(data)), operation="upload_bytes_total_inc")
 
         if existing is not None:
             # Overwrite: different content for the same chunk number,
