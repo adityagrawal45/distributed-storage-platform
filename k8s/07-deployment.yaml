@@ -80,12 +80,22 @@ spec:
         app.kubernetes.io/component: api
       annotations:
         # -----------------------------------------------------------
-        # Observability preparation (Phase 5 scope: annotate only, do
-        # not install a scrape/collection stack).
+        # Observability (Phase 5: annotate only, no real /metrics endpoint
+        # yet. Phase 11: the endpoint now exists — app/api/observability_routes.py
+        # — and these `prometheus.io/*` annotations are updated to point at
+        # it. They are otherwise VESTIGIAL on GKE: the actual scrape
+        # configuration for Google Managed Prometheus is the `PodMonitoring`
+        # resource in k8s/24-podmonitoring.yaml, which selects Pods by label
+        # rather than reading these annotations (that convention is for a
+        # self-hosted Prometheus's `kubernetes_sd_configs`, which NimbusFS
+        # does not run — see docs/monitoring.md's Cloud Monitoring vs
+        # Prometheus/Grafana comparison for why). Left in place anyway: they
+        # cost nothing, remain correct, and keep this manifest scrapable by a
+        # self-hosted Prometheus too, if one is ever pointed at this cluster.
         # -----------------------------------------------------------
         prometheus.io/scrape: "true"
         prometheus.io/port: "8000"
-        prometheus.io/path: "/api/v1/health" # placeholder until a real /metrics endpoint exists (future phase)
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: nimbusfs-ksa # Workload Identity — see 03-serviceaccount.yaml
       terminationGracePeriodSeconds: 15
