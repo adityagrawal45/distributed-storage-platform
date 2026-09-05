@@ -46,6 +46,7 @@ Phase 10 additions (audit trail + refresh-token reuse hardening):
 import uuid
 
 from app.core.enums import AuditEventType, AuditResult
+from app.core.metrics import AUTH_LOGIN_ATTEMPTS_TOTAL, AUTH_TOKEN_REFRESH_TOTAL, safe_call
 from app.core.security.password import hash_password, verify_password
 from app.core.security.tokens import TokenType, create_access_token, create_refresh_token, decode_token
 from app.exceptions.custom_exceptions import (
@@ -121,6 +122,13 @@ class AuthService:
             expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         )
 
+    @staticmethod
+    def _record_login_metric(result: str) -> None:
+        """`result` is one of a fixed two-value set — see app/core/metrics.py."""
+        safe_call(
+            lambda: AUTH_LOGIN_ATTEMPTS_TOTAL.labels(result=result).inc(), operation="auth_login_attempts_total_inc"
+        )
+
     async def login(self, email: str, password: str, *, ip_address: str | None = None) -> TokenPair:
         user = await self._users.get_by_email(email)
         if user is None or not verify_password(password, user.hashed_password):
@@ -131,6 +139,7 @@ class AuthService:
                 actor_email=email,
                 ip_address=ip_address,
             )
+            self._record_login_metric("failure")
             raise InvalidCredentialsException()
         if not user.is_active:
             await self._record_audit(
@@ -141,6 +150,7 @@ class AuthService:
                 ip_address=ip_address,
                 detail={"reason": "inactive_user"},
             )
+            self._record_login_metric("failure")
             raise InactiveUserException()
 
         tokens = await self._issue_token_pair(user)
@@ -151,6 +161,7 @@ class AuthService:
             actor_email=email,
             ip_address=ip_address,
         )
+        self._record_login_metric("success")
         return tokens
 
     async def refresh(self, refresh_token: str, *, ip_address: str | None = None) -> TokenPair:
@@ -172,9 +183,17 @@ class AuthService:
                 ip_address=ip_address,
                 detail={"reason": "refresh_token_reuse_detected", "sessions_revoked": revoked_count},
             )
+            safe_call(
+                lambda: AUTH_TOKEN_REFRESH_TOTAL.labels(result="reuse_detected").inc(),
+                operation="auth_token_refresh_total_inc",
+            )
             raise InvalidTokenException(detail="Refresh token has been revoked or is invalid.")
 
         if stored is None or stored.revoked or stored.user_id != user_id:
+            safe_call(
+                lambda: AUTH_TOKEN_REFRESH_TOTAL.labels(result="failure").inc(),
+                operation="auth_token_refresh_total_inc",
+            )
             raise InvalidTokenException(detail="Refresh token has been revoked or is invalid.")
 
         user = await self._users.get_by_id(user_id)
@@ -189,6 +208,9 @@ class AuthService:
             result=AuditResult.SUCCESS,
             actor_user_id=user.id,
             ip_address=ip_address,
+        )
+        safe_call(
+            lambda: AUTH_TOKEN_REFRESH_TOTAL.labels(result="success").inc(), operation="auth_token_refresh_total_inc"
         )
         return tokens
 
