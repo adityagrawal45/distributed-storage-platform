@@ -121,6 +121,18 @@ class EventEnvelope(BaseModel):
     # Reserved; see module docstring. Always None in Phase 8.
     tenant_id: uuid.UUID | None = None
     user_id: uuid.UUID
+    # Phase 11: the distributed-tracing ID bound by `RequestContextMiddleware`
+    # for the HTTP request that (directly or transitively) caused this
+    # event, read from structlog's contextvars at emit time (see
+    # `app/events/emitter.py::_emit_event`). Plain `str`, not `uuid.UUID` —
+    # a caller-supplied `X-Trace-ID` header is honored verbatim and is not
+    # guaranteed to be a UUID. Threading this through the outbox -> Pub/Sub
+    # -> worker hop (`BaseWorker._handle` re-binds it into the worker's own
+    # contextvars) is what lets an engineer grep logs across the WHOLE
+    # chain — API request, worker execution, final processing — by one
+    # `trace_id`, without needing a full OpenTelemetry collector. See
+    # `app/core/tracing.py`'s module docstring for the full rationale.
+    trace_id: str | None = None
 
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -142,6 +154,8 @@ class EventEnvelope(BaseModel):
             "event_version": str(self.event_version),
             "correlation_id": str(self.correlation_id),
         }
+        if self.trace_id:
+            attributes["trace_id"] = self.trace_id
         return self.to_json_bytes(), attributes
 
     @classmethod
