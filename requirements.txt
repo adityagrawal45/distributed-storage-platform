@@ -39,6 +39,14 @@ bcrypt==4.0.1
 # --- Logging ---
 structlog==24.4.0
 
+# --- Metrics (Phase 11) ---
+# In-process metrics registry only, exposed as a text/plain scrape
+# endpoint at /metrics (app/api/observability_routes.py) — NOT a
+# Prometheus server/Grafana deployment. Google Managed Prometheus (a
+# built-in GKE add-on) scrapes it via k8s/24-podmonitoring.yaml. See
+# app/core/metrics.py's module docstring and docs/monitoring.md.
+prometheus-client==0.21.1
+
 # --- Cloud Storage (Phase 3) ---
 google-cloud-storage==2.19.0
 filetype==1.2.0
