@@ -71,6 +71,22 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
+    # Phase 11: Google Managed Prometheus's collector, which runs as a
+    # DaemonSet in the `gmp-system` namespace (a GKE-managed namespace,
+    # not one this repo creates) and scrapes `/metrics` directly over
+    # the pod network per k8s/24-podmonitoring.yaml's `PodMonitoring`
+    # resource. Namespace-selected (not `podSelector: {}`, which only
+    # matches THIS namespace) because the collector lives outside
+    # `nimbusfs` entirely — matches by GKE's standard
+    # `kubernetes.io/metadata.name` namespace label, present on every
+    # namespace since Kubernetes 1.21.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gmp-system
+      ports:
+        - protocol: TCP
+          port: 8000
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
