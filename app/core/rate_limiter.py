@@ -89,6 +89,7 @@ import redis.asyncio as redis
 
 from app.core.cache.keys import CacheKeyBuilder
 from app.core.config.settings import Settings
+from app.core.metrics import RATE_LIMIT_DECISIONS_TOTAL, safe_call
 from app.logging.logger import get_logger
 
 logger = get_logger(__name__)
@@ -321,6 +322,13 @@ class RateLimiter:
 
         retry_after_seconds = max(1, -(-retry_after_ms // 1000)) if not allowed else 0
 
+        safe_call(
+            lambda: RATE_LIMIT_DECISIONS_TOTAL.labels(
+                category=category.value, result="allowed" if allowed else "rejected"
+            ).inc(),
+            operation="rate_limit_decisions_total_inc",
+        )
+
         if allowed:
             logger.debug(
                 "rate_limit_allowed",
@@ -364,6 +372,12 @@ class RateLimiter:
         started: float,
     ) -> RateLimitResult:
         """Applies the configured fail-open/fail-closed policy, loudly."""
+        safe_call(
+            lambda: RATE_LIMIT_DECISIONS_TOTAL.labels(
+                category=category.value, result="degraded_open" if self._fail_open else "degraded_closed"
+            ).inc(),
+            operation="rate_limit_decisions_total_inc",
+        )
         logger.error(
             "rate_limit_degraded",
             category=category.value,
