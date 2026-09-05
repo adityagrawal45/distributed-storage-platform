@@ -112,6 +112,10 @@ class OutboxEmitterMixin:
                 causation_id=_context_uuid("causation_id"),
                 user_id=user_id,
                 payload=payload or {},
+                # Phase 11: same contextvars source as correlation_id (see
+                # module docstring point 2) — read, never threaded through
+                # a parameter, so no call site changes shape.
+                trace_id=structlog.contextvars.get_contextvars().get("trace_id"),
             )
             await self._outbox.add_event(
                 event_id=envelope.event_id,
