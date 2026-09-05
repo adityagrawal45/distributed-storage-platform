@@ -49,6 +49,7 @@ import asyncio
 from dataclasses import dataclass
 
 from app.core.config import get_settings
+from app.core.metrics import WORKER_JOBS_TOTAL, safe_call
 from app.database.session import AsyncSessionLocal
 from app.events.envelope import EventEnvelope, EventType
 from app.events.publisher import EventPublisher
@@ -170,8 +171,16 @@ class OutboxPublisherWorker(WorkerRuntimeMixin):
                     break
                 if await self._publish_one(repo, event, session):
                     result.published += 1
+                    safe_call(
+                        lambda: WORKER_JOBS_TOTAL.labels(worker=WORKER_NAME, result="succeeded").inc(),
+                        operation="worker_jobs_total_inc",
+                    )
                 else:
                     result.failed += 1
+                    safe_call(
+                        lambda: WORKER_JOBS_TOTAL.labels(worker=WORKER_NAME, result="failed").inc(),
+                        operation="worker_jobs_total_inc",
+                    )
 
         if result.fetched:
             logger.info(
