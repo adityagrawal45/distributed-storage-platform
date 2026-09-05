@@ -143,3 +143,28 @@ variable "labels" {
     "managed-by" = "terraform"
   }
 }
+
+# ---------------------------------------------------------------------
+# Monitoring & alerting (Phase 11) — see docs/alerting.md for the full
+# alert catalog and why these specific conditions/thresholds/durations
+# were chosen. Off by default (matching create_gcs_bucket/
+# create_pubsub_topics's pattern) so `terraform plan` against a fresh
+# project never tries to create alert policies pointing at metrics that
+# don't exist yet because no traffic has ever reached this deployment.
+variable "create_monitoring_alerts" {
+  description = "Whether this module creates the Phase 11 Cloud Monitoring alert policies + uptime check (see docs/alerting.md). Set true only once real traffic/metrics exist to alert on."
+  type        = bool
+  default     = false
+}
+
+variable "alert_notification_email" {
+  description = "Email address for the Cloud Monitoring notification channel alert policies page. Empty string creates the alert policies with NO notification channel (they still show up in the Cloud Monitoring console, but page nobody) — set a real address before relying on this for on-call paging."
+  type        = string
+  default     = ""
+}
+
+variable "uptime_check_host" {
+  description = "Hostname the Phase 11 uptime check probes (GET /api/v1/live over HTTPS) — the Ingress's public hostname/static IP, once one exists. Empty string skips creating the uptime check (it has nothing to check yet)."
+  type        = string
+  default     = ""
+}
