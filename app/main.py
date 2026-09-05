@@ -21,6 +21,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.observability_routes import router as metrics_router
 from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.retry import RetryExhaustedError, retry_async
@@ -71,6 +72,7 @@ from app.exceptions.handlers import (
     validation_exception_handler,
 )
 from app.logging.logger import configure_logging, get_logger
+from app.middleware.metrics import MetricsMiddleware
 from app.middleware.proxy_headers import TrustedProxyMiddleware
 from app.middleware.rate_limit import RateLimitHeadersMiddleware
 from app.middleware.request_context import RequestContextMiddleware
@@ -240,6 +242,10 @@ def create_application() -> FastAPI:
     application.add_middleware(RateLimitHeadersMiddleware)
     application.add_middleware(RequestContextMiddleware)
     application.add_middleware(TrustedProxyMiddleware)
+    # Outermost: times/counts the FULL request including every other
+    # middleware's overhead, and must never itself be skipped by an
+    # earlier middleware short-circuiting the chain.
+    application.add_middleware(MetricsMiddleware)
 
     # ------------------------------------------------------------------
     # Exception handlers (order matters: FastAPI matches most specific
@@ -272,6 +278,9 @@ def create_application() -> FastAPI:
     # Routes
     # ------------------------------------------------------------------
     application.include_router(api_router, prefix=settings.API_V1_PREFIX)
+    # Unversioned, root-level — see app/api/observability_routes.py's
+    # module docstring for why this is not under API_V1_PREFIX.
+    application.include_router(metrics_router)
 
     return application
 
