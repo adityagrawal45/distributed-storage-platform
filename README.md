@@ -3320,6 +3320,78 @@ Phase 8 was ever run against real infrastructure.** Phase 9's are in
 Phase 9 has been MEASURED against real infrastructure either; every
 number is a justified target, not a drill result.**
 
+## 24a. Phase 11 — Observability, Monitoring, Distributed Tracing & Alerting
+
+A repository/security-audit-first pass (per the Phase 11 brief) found
+NimbusFS's observability foundation already substantially real, built
+incrementally since Phase 4: structured JSON logging (`structlog`),
+correlation/trace/server IDs bound via `structlog.contextvars` and
+propagated through the Phase 8 outbox/Pub/Sub/worker chain, and
+correctly-separated `/live`/`/ready`/`/health` endpoints. What was
+missing — a `/metrics` endpoint (explicitly deferred by Phase 7's own
+docstrings and flagged as a "placeholder ... future phase" in
+`k8s/07-deployment.yaml`'s annotation), any metrics library, any
+span/tracing primitive, and `trace_id` propagation across the Pub/Sub
+hop — is what this phase adds:
+
+- **Metrics** (`app/core/metrics.py`, `prometheus_client`): bounded-
+  cardinality RED/golden-signal counters/histograms/gauges for HTTP,
+  auth, file uploads/downloads, chunked uploads, the DB connection
+  pool, cache operations, rate-limit decisions, Pub/Sub publish/process,
+  and worker jobs — exposed at `GET /metrics`
+  (`app/api/observability_routes.py`, unversioned, unauthenticated by
+  design, access-controlled at the network layer). Scraped by **Google
+  Managed Prometheus**, not a self-hosted Prometheus/Grafana deployment
+  — see `docs/monitoring.md` §1 for the explicit comparison the Phase
+  11 brief requires before choosing, and `k8s/24-podmonitoring.yaml`
+  for the `PodMonitoring` resource that wires up the scrape.
+- **Lightweight distributed tracing** (`app/core/tracing.py`): a
+  `start_span()` context manager producing nested, timed
+  `span_started`/`span_completed`/`span_failed` structured log events
+  (not a full OpenTelemetry SDK integration — `docs/observability.md`
+  §5 spells out exactly why, and the mechanical migration path if one
+  is added later), wired around `StorageService`'s GCS calls.
+  `EventEnvelope` gained a `trace_id` field, populated from the same
+  `structlog.contextvars` `correlation_id` already reads
+  (`app/events/emitter.py`) and rebound into a worker's own logging
+  context on consumption (`app/workers/base.py::_handle`) — closing the
+  one real gap in Phase 8's already-good correlation/causation chain:
+  an engineer can now grep logs for one `X-Trace-ID` across the HTTP
+  request, the outbox publish, and the worker's execution.
+- **Logging hardened**: `app/logging/logger.py` gained
+  `_redact_sensitive_fields`, a `structlog` processor that redacts any
+  field bound under a fixed sensitive-key set
+  (`password`/`access_token`/`refresh_token`/`authorization`/`signed_url`/
+  etc.) — defense-in-depth on top of a security audit that found no
+  actual secret-logging call site in the existing codebase (documented
+  in full in `docs/observability.md` §2).
+- **Health endpoints reviewed, unchanged** — liveness/readiness
+  separation (§22 of the brief) was already correct; verified, not
+  rebuilt.
+- **Documentation**: `docs/observability.md` (architecture, security
+  audit, logs/metrics/traces, testing, remaining risks),
+  `docs/monitoring.md` (metric inventory, Cloud Monitoring vs.
+  Prometheus/Grafana comparison, dashboards, load-testing status),
+  `docs/alerting.md` (the full CRITICAL/HIGH/MEDIUM alert catalog +
+  `terraform/monitoring.tf`), `docs/slo.md` (SLIs/SLOs/error budget,
+  explicitly unmeasured against real traffic), `docs/incident-response.md`
+  (investigation workflows + an honest failure-detection matrix,
+  including the one real gap found: no dead-letter-queue metric/replay
+  tooling exists yet).
+- **Testing**: `tests/test_observability.py` (20 new tests — redaction,
+  metrics shape/cardinality/endpoint, span nesting/propagation,
+  envelope `trace_id` round-trip and end-to-end HTTP propagation).
+  **449/449 tests passing** (429 pre-Phase-11 + 20 new), zero
+  regressions.
+- **Nothing in this phase was run against real infrastructure** — no
+  real GKE cluster, Cloud Monitoring project, or production traffic
+  existed this session, so every SLO/alert-threshold/dashboard is
+  DESIGNED (and, for the logging/metrics/tracing mechanisms themselves,
+  IMPLEMENTED + TESTED against fakes), never MEASURED — see
+  `docs/observability.md`'s opening section for the full
+  DESIGNED/IMPLEMENTED/TESTED/MEASURED discipline this phase (and every
+  phase since 9) holds itself to.
+
 ## 25. Contribution Guide
 
 1. Create a feature branch from `main`.
