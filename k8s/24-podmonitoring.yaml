@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------
+# PodMonitoring (Phase 11) — tells Google Managed Prometheus to scrape
+# this app's /metrics endpoint.
+# ---------------------------------------------------------------------
+# `PodMonitoring` is a CRD provided by Google Managed Prometheus (GMP),
+# which ships enabled by default on GKE >= 1.25 (Autopilot and Standard).
+# It is NOT a self-hosted Prometheus Operator's `ServiceMonitor` — same
+# idea (select Pods by label, scrape a port+path on an interval, ship
+# the samples somewhere), different controller: GMP's own
+# already-running collector DaemonSet reads this resource and writes
+# the resulting time series straight into Cloud Monitoring. No
+# Prometheus server, Alertmanager, or extra Deployment is introduced by
+# this file — see app/core/metrics.py's module docstring and
+# docs/monitoring.md for the full "why not self-hosted Prometheus/
+# Grafana" comparison this choice is based on.
+#
+# If GMP is not enabled on a given cluster (`gcloud container clusters
+# describe --format='value(monitoringConfig)'`), this resource is
+# simply inert — nothing else in NimbusFS depends on it existing, and
+# `/metrics` remains reachable for a manual `kubectl port-forward` +
+# `curl`, or a self-hosted Prometheus pointed at the same
+# label selector via a `ServiceMonitor` instead.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: nimbusfs-api
+  namespace: nimbusfs
+  labels:
+    app.kubernetes.io/name: nimbusfs
+    app.kubernetes.io/component: api
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nimbusfs
+      app.kubernetes.io/component: api
+  endpoints:
+    # Named port, matching k8s/07-deployment.yaml's container port name
+    # ("http", containerPort 8000) — GMP's PodMonitoring resolves the
+    # scrape target by port NAME, not number, the same convention a
+    # self-hosted Prometheus Operator's ServiceMonitor/PodMonitor uses.
+    - port: http
+      path: /metrics
+      interval: 30s
+      # Bounded scrape timeout well under the interval, so a slow/stuck
+      # scrape can never pile up concurrent scrapes against the same Pod.
+      timeout: 10s
