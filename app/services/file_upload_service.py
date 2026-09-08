@@ -31,8 +31,8 @@ import asyncio
 import hashlib
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 from fastapi import UploadFile
 
@@ -44,6 +44,8 @@ from app.core.metrics import (
     UPLOAD_BYTES_TOTAL,
     safe_call,
 )
+from app.events.emitter import OutboxEmitterMixin
+from app.events.envelope import EventType
 from app.exceptions.custom_exceptions import (
     DuplicateFileException,
     FileNotFoundException,
@@ -51,8 +53,6 @@ from app.exceptions.custom_exceptions import (
     RollbackFailedException,
     ValidationException,
 )
-from app.events.emitter import OutboxEmitterMixin
-from app.events.envelope import EventType
 from app.logging.logger import get_logger
 from app.models.file_metadata import FileMetadata, FileStatus, UploadStatus
 from app.repositories.file_metadata_repository import FileMetadataRepository
@@ -257,7 +257,7 @@ class FileUploadService(OutboxEmitterMixin):
                 storage_class=storage_class,
                 etag=etag,
                 upload_status=UploadStatus.COMPLETED,
-                uploaded_at=datetime.now(timezone.utc),
+                uploaded_at=datetime.now(UTC),
                 created_by=owner_id,
                 updated_by=owner_id,
             )
@@ -298,7 +298,7 @@ class FileUploadService(OutboxEmitterMixin):
         logger.warning("rolling_back_orphaned_object", object_name=object_name)
         try:
             await self._storage.delete(object_name)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("rollback_failed", object_name=object_name, error=str(exc))
             raise RollbackFailedException(
                 f"Metadata persistence failed and the rollback delete of '{object_name}' also failed. "
@@ -399,7 +399,7 @@ class FileUploadService(OutboxEmitterMixin):
             file.checksum = checksum
             file.version += 1
             file.upload_status = UploadStatus.COMPLETED
-            file.uploaded_at = datetime.now(timezone.utc)
+            file.uploaded_at = datetime.now(UTC)
             file.updated_by = actor_id
             await self._versions.create(file_id=file.id, version=file.version, checksum=checksum, size=size)
             await self._emit_event(
