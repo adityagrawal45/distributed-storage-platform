@@ -125,7 +125,7 @@ class OutboxPublisherWorker(WorkerRuntimeMixin):
         try:
             envelope = self._to_envelope(event)
             message_id = await self._publisher.publish(envelope)
-        except Exception as exc:  # noqa: BLE001 - see docstring
+        except Exception as exc:
             logger.warning(
                 "outbox_publish_failed",
                 event_id=str(event.event_id),
@@ -210,7 +210,7 @@ class OutboxPublisherWorker(WorkerRuntimeMixin):
             while not self.shutting_down:
                 try:
                     await self.poll_once()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     # The LOOP must survive anything — including Postgres
                     # being unreachable. Crashing here would just hand the
                     # restart to Kubernetes with no backoff advantage and
