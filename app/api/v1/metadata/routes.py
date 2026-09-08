@@ -8,7 +8,7 @@ here operates purely on metadata rows, per Phase 2's scope.
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, status
 
 from app.core.rate_limiter import RateLimitCategory
 from app.dependencies.auth import CurrentUser
