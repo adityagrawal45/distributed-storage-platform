@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -116,7 +116,7 @@ class CacheSerializer:
 
         envelope = {
             _VERSION_FIELD: CACHE_SCHEMA_VERSION,
-            _TIMESTAMP_FIELD: datetime.now(timezone.utc).isoformat(),
+            _TIMESTAMP_FIELD: datetime.now(UTC).isoformat(),
             _PAYLOAD_FIELD: value,
         }
         try:
