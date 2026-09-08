@@ -17,7 +17,6 @@ from app.dependencies.auth import CurrentUser
 from app.dependencies.providers import FolderServiceDep
 from app.dependencies.rate_limit import rate_limit
 from app.schemas.folder import (
-    BreadcrumbItem,
     BreadcrumbResponse,
     FolderCreate,
     FolderMove,
