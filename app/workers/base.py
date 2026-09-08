@@ -219,7 +219,7 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
                     record_pubsub_processed(self.consumer_name, "duplicate")
                     message.ack()
                     return
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # The pre-check is only an optimization; if the database
                 # is unreachable the work below will fail anyway and NACK.
                 logger.warning("idempotency_precheck_failed", error=str(exc))
@@ -241,7 +241,7 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
                 status = ProcessedEventStatus.FAILED
                 error_text = exc.detail
                 logger.warning("event_permanently_failed", error=exc.detail)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # Retryable — including anything unexpected. "Try again"
                 # is the safe default when we do not know what broke.
                 retryable = isinstance(exc, RetryableEventError)
@@ -279,7 +279,7 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
                 await session.rollback()
                 logger.info("duplicate_event_absorbed_on_commit")
                 record_pubsub_processed(self.consumer_name, "duplicate")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # Could not record the outcome. NACK: redelivery is safe
                 # (process() is idempotent) and losing the ledger entry
                 # silently is not.
@@ -311,11 +311,11 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
         future = asyncio.run_coroutine_threadsafe(self._handle(message), self._loop)
         try:
             future.result()
-        except Exception as exc:  # noqa: BLE001 - _handle should never raise; belt and braces
+        except Exception as exc:
             logger.error("worker_callback_crashed", error=str(exc))
             try:
                 message.nack()
-            except Exception:  # noqa: BLE001, S110 - nothing further can be done
+            except Exception:  # nosec B110 - both settle paths already failed; nothing further can be done
                 pass
 
     def _build_subscriber(self) -> Any:
@@ -324,13 +324,13 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
 
             if self._settings.PUBSUB_EMULATOR_HOST:
                 os.environ["PUBSUB_EMULATOR_HOST"] = self._settings.PUBSUB_EMULATOR_HOST
-            from google.cloud import pubsub_v1  # noqa: PLC0415 - deferred, see EventPublisher
+            from google.cloud import pubsub_v1
 
             self._subscriber = pubsub_v1.SubscriberClient()
         return self._subscriber
 
     def _flow_control(self) -> Any:
-        from google.cloud import pubsub_v1  # noqa: PLC0415
+        from google.cloud import pubsub_v1
 
         return pubsub_v1.types.FlowControl(max_messages=self._settings.WORKER_CONCURRENCY)
 
@@ -387,7 +387,7 @@ class BaseWorker(WorkerRuntimeMixin, ABC):
         if self._subscriber is not None:
             try:
                 self._subscriber.close()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("worker_subscriber_close_failed", error=str(exc))
         logger.info("worker_stopped", worker=self.worker_name, drained_seconds=round(waited, 1))
 
