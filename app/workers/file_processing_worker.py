@@ -157,7 +157,7 @@ class FileProcessingWorker(BaseWorker):
             raise NonRetryableEventError(
                 f"Storage object '{object_name}' does not exist; the metadata row references missing bytes."
             ) from exc
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Everything else about GCS (timeouts, 5xx, auth blips) is
             # transient by default — NACK and let Pub/Sub redeliver.
             raise RetryableEventError(f"Could not read storage metadata for '{object_name}': {exc}") from exc
@@ -246,7 +246,7 @@ class FileProcessingWorker(BaseWorker):
         try:
             for child in derived:
                 await self._publisher.publish(child)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Retryable: the whole message is redelivered and the fan-out
             # re-runs. Deterministic derived event IDs make the repeat
             # harmless — downstream absorbs it as a duplicate.
