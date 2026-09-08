@@ -8,10 +8,10 @@ from app.services.version_service import VersionService
 
 __all__ = [
     "AuthService",
-    "UserService",
     "FolderService",
     "MetadataService",
     "SearchService",
     "TrashService",
+    "UserService",
     "VersionService",
 ]
