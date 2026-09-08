@@ -45,6 +45,7 @@ Phase 10 additions (audit trail + refresh-token reuse hardening):
 
 import uuid
 
+from app.core.config import get_settings
 from app.core.enums import AuditEventType, AuditResult
 from app.core.metrics import AUTH_LOGIN_ATTEMPTS_TOTAL, AUTH_TOKEN_REFRESH_TOTAL, safe_call
 from app.core.security.password import hash_password, verify_password
@@ -61,7 +62,6 @@ from app.repositories.user_repository import UserRepository
 from app.schemas.auth import TokenPair
 from app.schemas.user import UserCreate
 from app.services.audit_service import AuditService
-from app.core.config import get_settings
 
 settings = get_settings()
 
