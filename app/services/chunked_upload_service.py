@@ -129,7 +129,7 @@ import math
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import get_settings
@@ -244,8 +244,8 @@ class ChunkedUploadService(OutboxEmitterMixin):
         # datetimes` in tests while working fine against real Postgres.
         expires_at = session.expires_at
         if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) >= expires_at
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return datetime.now(UTC) >= expires_at
 
     async def _apply_expiration_if_needed(self, session: UploadSession) -> None:
         """Lazy expiration: checked on every access, no background sweeper this phase — see README Phase 6."""
@@ -302,7 +302,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             await lock.acquire_or_raise()
         except LockAcquisitionException:
             raise
-        except Exception as exc:  # noqa: BLE001 - deliberately broad: any Redis/network failure, not a specific type
+        except Exception as exc:
             logger.error("upload_lock_infrastructure_failure", key=key, error=str(exc))
             raise ServiceUnavailableException(
                 "The upload coordination service is temporarily unavailable. Please retry."
@@ -313,7 +313,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
         finally:
             try:
                 await lock.release()
-            except Exception as exc:  # noqa: BLE001 - never mask whatever happened inside the lock with a cleanup failure
+            except Exception as exc:
                 logger.warning("upload_lock_release_failed", key=key, error=str(exc))
 
     # ------------------------------------------------------------------
@@ -366,7 +366,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             raise DuplicateFileException()
 
         storage_object = self._storage.generate_object_name(owner_id, extension)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expires_at = now + timedelta(minutes=self._settings.UPLOAD_SESSION_EXPIRATION_MINUTES)
 
         session = UploadSession(
@@ -527,7 +527,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             existing.checksum = checksum
             existing.status = ChunkStatus.VERIFIED
             existing.storage_reference = result.object_name
-            existing.uploaded_at = datetime.now(timezone.utc)
+            existing.uploaded_at = datetime.now(UTC)
             await self._chunks.flush()
             return existing
 
@@ -538,7 +538,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             checksum=checksum,
             status=ChunkStatus.VERIFIED,
             storage_reference=result.object_name,
-            uploaded_at=datetime.now(timezone.utc),
+            uploaded_at=datetime.now(UTC),
         )
         chunk_row, created = await self._chunks.create_or_get_existing(new_chunk)
         if not created and chunk_row.checksum != checksum:
@@ -612,7 +612,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             compose_result = await _compose_breaker.call(_do_compose)
         except UploadFailedException:
             raise
-        except Exception as exc:  # noqa: BLE001 - CircuitBreakerOpenException or an unexpected compose failure
+        except Exception as exc:
             raise UploadFailedException(f"Failed to compose chunks into the final object: {exc}") from exc
 
         if compose_result.size != session.total_size:
@@ -664,7 +664,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             storage_class=compose_result.storage_class,
             etag=compose_result.etag,
             upload_status=UploadStatus.COMPLETED,
-            uploaded_at=datetime.now(timezone.utc),
+            uploaded_at=datetime.now(UTC),
             created_by=actor_id,
             updated_by=actor_id,
         )
@@ -701,7 +701,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
         session.actual_checksum = actual_checksum
         session.uploaded_bytes = compose_result.size
         session.file_id = file.id
-        session.completed_at = datetime.now(timezone.utc)
+        session.completed_at = datetime.now(UTC)
         session.updated_by = actor_id
         await self._sessions.flush()
 
@@ -759,7 +759,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             await self._chunks.delete_all_for_upload(upload_id)
 
             session.status = UploadSessionStatus.CANCELLED
-            session.cancelled_at = datetime.now(timezone.utc)
+            session.cancelled_at = datetime.now(UTC)
             await self._sessions.flush()
 
         logger.info("upload_cancelled", upload_id=str(upload_id))
