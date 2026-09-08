@@ -29,7 +29,7 @@ listings and the owner's cached search pages.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.core.cache.policy import CacheEntity
 from app.events.emitter import OutboxEmitterMixin
@@ -268,7 +268,7 @@ class MetadataService(OutboxEmitterMixin):
     async def delete_file(self, file_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> None:
         file = await self._get_owned_active(file_id, owner_id)
         file.is_deleted = True
-        file.deleted_at = datetime.now(timezone.utc)
+        file.deleted_at = datetime.now(UTC)
         file.deleted_by = actor_id
         file.updated_by = actor_id
         await self._invalidate_file(file)
