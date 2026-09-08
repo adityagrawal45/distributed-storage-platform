@@ -17,7 +17,7 @@ Three distinct endpoints, each with a distinct probe semantics — see
 """
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
@@ -72,7 +72,7 @@ async def health_check(gcs_client: GCSClientDep) -> APIResponse[HealthCheckRespo
         database=database,
         redis=redis_status,
         storage=storage,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         response_time_ms=round((time.perf_counter() - start) * 1000, 2),
     )
     return APIResponse(message="Health check completed.", data=data)
@@ -97,7 +97,7 @@ async def readiness_check(gcs_client: GCSClientDep):
         database=database,
         redis=redis_status,
         storage=storage,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         response_time_ms=round((time.perf_counter() - start) * 1000, 2),
     )
     envelope = APIResponse(
@@ -120,6 +120,6 @@ async def liveness_check() -> APIResponse[LivenessResponse]:
     data = LivenessResponse(
         alive=True,
         server=_server_info(get_server_identity()),
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
     return APIResponse(message="Process is alive.", data=data)
