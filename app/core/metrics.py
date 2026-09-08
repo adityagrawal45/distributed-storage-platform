@@ -50,9 +50,10 @@ non-blocking).
 
 from __future__ import annotations
 
-from typing import Callable, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
 from app.logging.logger import get_logger
 
@@ -226,6 +227,6 @@ def safe_call(fn: Callable[[], T], *, operation: str) -> T | None:
     """
     try:
         return fn()
-    except Exception as exc:  # noqa: BLE001 - telemetry must never propagate
+    except Exception as exc:
         logger.warning("metrics_recording_failed", operation=operation, error=str(exc))
         return None
