@@ -1,0 +1,82 @@
+# Phase 12 — production deploy. Manual trigger ONLY
+# (`workflow_dispatch`) — production is never a side effect of a push.
+#
+# The approval gate is `environment: production` below PLUS the
+# matching GitHub Environment's protection rules (required reviewers),
+# configured in this repo's Settings -> Environments — Actions YAML
+# cannot create that protection rule itself, only reference an
+# environment by name (see docs/ci-cd.md "Production approval" for the
+# full chain, and terraform/cicd.tf's `ci_deploy_production_wif` for
+# how the SAME gate is independently enforced again at the GCP IAM
+# layer via the OIDC token's `environment` claim — belt and suspenders,
+# not two ways of saying the same thing: a leaked workflow file cannot
+# bypass either check unilaterally).
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Git SHA to deploy (must already exist in Artifact Registry — i.e. already deployed to and verified in staging)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy + verify
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.image_tag }}
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_DEPLOY_PROD_SA }}
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME_PRODUCTION }}
+          location: ${{ vars.GCP_REGION }}
+          project_id: ${{ vars.GCP_PROJECT_ID_PRODUCTION }}
+
+      - name: Deploy
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID_PRODUCTION }}
+          REGION: ${{ vars.GCP_REGION }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: ./scripts/ci-deploy.sh
+
+      - name: Smoke test
+        id: smoke_test
+        run: ./scripts/k8s-smoke-test.sh
+
+      - name: Rollback on smoke-test failure
+        if: failure() && steps.smoke_test.outcome == 'failure'
+        run: ./scripts/ci-rollback.sh
+
+      - name: Record deployment (release traceability — Phase 12 §28-29)
+        if: always()
+        run: |
+          echo "### Production deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit / image tag | \`${{ inputs.image_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Environment | production |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Requested by | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Approved via | GitHub Environment \`production\` required reviewers |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Result | ${{ job.status }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Deployed at (UTC) | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No credentials are logged above or anywhere in this workflow's output (Phase 12 §34)." >> "$GITHUB_STEP_SUMMARY"
