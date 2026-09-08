@@ -26,11 +26,10 @@ be threaded into `AuthService`'s audit-trail calls — see
 `app/services/audit_service.py` and `docs/security/audit-logging.md`.
 """
 
-from fastapi import APIRouter, Request, status
-from fastapi.security import OAuth2PasswordRequestForm
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import APIRouter, Depends, Request, status
+from fastapi.security import OAuth2PasswordRequestForm
 
 from app.core.rate_limiter import RateLimitCategory
 from app.dependencies.providers import AuthServiceDep
