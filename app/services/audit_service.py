@@ -84,7 +84,7 @@ class AuditService:
                 request_id=request_id,
                 detail=detail,
             )
-        except Exception as exc:  # noqa: BLE001 - see class docstring's degradation contract
+        except Exception as exc:
             logger.error(
                 "audit_log_write_failed",
                 event_type=event_type.value,
