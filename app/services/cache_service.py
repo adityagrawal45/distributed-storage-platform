@@ -67,10 +67,10 @@ from typing import Any
 import redis.asyncio as redis
 
 from app.core.cache.keys import CacheKeyBuilder
-from app.core.metrics import CACHE_OPERATIONS_TOTAL, safe_call
 from app.core.cache.policy import CacheEntity, CachePolicy
 from app.core.cache.serializer import CacheSerializer
 from app.core.distributed_lock import DistributedLockFactory
+from app.core.metrics import CACHE_OPERATIONS_TOTAL, safe_call
 from app.exceptions.custom_exceptions import CacheSerializationError
 from app.logging.logger import get_logger
 
