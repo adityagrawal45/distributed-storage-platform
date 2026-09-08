@@ -20,7 +20,7 @@ Design decisions:
 """
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -44,7 +44,7 @@ def _create_token(
     extra_claims: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Build and sign a JWT. Returns (token, jti)."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     jti = str(uuid.uuid4())
     payload: dict[str, Any] = {
         "sub": subject,
@@ -85,7 +85,7 @@ def create_refresh_token(user_id: uuid.UUID) -> tuple[str, str, datetime]:
         token_type=TokenType.REFRESH,
         expires_delta=expires_delta,
     )
-    expires_at = datetime.now(timezone.utc) + expires_delta
+    expires_at = datetime.now(UTC) + expires_delta
     return token, jti, expires_at
 
 
