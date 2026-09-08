@@ -16,17 +16,16 @@ itself is exercised on a genuine authorization boundary, not only on
 the happy path.
 """
 
-import uuid
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache.keys import CacheKeyBuilder
 from app.core.config.settings import Settings
 from app.core.enums import AuditEventType
 from app.core.rate_limiter import RateLimiter
-from app.core.cache.keys import CacheKeyBuilder
 from app.dependencies.rate_limit import get_rate_limiter
 from app.main import app
 from app.models.audit_log import AuditLog
