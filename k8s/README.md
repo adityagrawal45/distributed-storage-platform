@@ -232,8 +232,11 @@ docker push "${REGION}-docker.pkg.dev/${PROJECT_ID}/nimbusfs/nimbusfs-api:${TAG}
 ```
 
 Update `07-deployment.yaml`'s `image:` field to match before deploying
-— see main README.md §29 "CI/CD Preparation" for how this step is
-intended to become automated in a future phase.
+manually. **This whole build-tag-push-update-apply sequence is now
+automated by `.github/workflows/ci.yml` + `scripts/ci-deploy.sh`** —
+see `docs/ci-cd.md`/`docs/deployment.md` (Phase 12). The manual steps
+here remain valid for local/one-off debugging; CI does not require
+anyone to run them by hand for a normal deploy.
 
 ## Deploy
 
