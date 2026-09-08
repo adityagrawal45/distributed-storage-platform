@@ -16,7 +16,7 @@ that aren't high-frequency-write, high-page-depth feeds.
 from typing import Generic, TypeVar
 
 from fastapi import Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 T = TypeVar("T")
 
