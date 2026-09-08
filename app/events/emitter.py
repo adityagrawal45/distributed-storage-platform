@@ -131,7 +131,7 @@ class OutboxEmitterMixin:
                 # `uuid.UUID` would fail to serialize at flush time.
                 payload=envelope.model_dump(mode="json")["payload"],
             )
-        except Exception as exc:  # noqa: BLE001 - see decision #3 in the module docstring
+        except Exception as exc:
             logger.error(
                 "outbox_emit_failed",
                 event_type=getattr(event_type, "value", str(event_type)),
