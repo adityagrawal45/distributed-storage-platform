@@ -62,9 +62,12 @@ class CircuitBreaker:
 
     @property
     def state(self) -> CircuitState:
-        if self._state == CircuitState.OPEN and self._opened_at is not None:
-            if time.monotonic() - self._opened_at >= self.recovery_timeout:
-                self._state = CircuitState.HALF_OPEN
+        if (
+            self._state == CircuitState.OPEN
+            and self._opened_at is not None
+            and time.monotonic() - self._opened_at >= self.recovery_timeout
+        ):
+            self._state = CircuitState.HALF_OPEN
         return self._state
 
     async def call(self, operation):
