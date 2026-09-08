@@ -1,0 +1,214 @@
+# Phase 12 — pull-request/push quality+security+build gate.
+#
+# Triggers on every PR into main (checks only, nothing pushed/deployed)
+# and every push to main (checks + build + push to Artifact Registry,
+# tagged by the immutable commit SHA — see docs/ci-cd.md "Immutable
+# tags" for why never `:latest`). Deploying that pushed image is a
+# SEPARATE workflow (deploy-staging.yml) triggered by this one
+# succeeding — kept separate so "did the build/scan pass" and "did the
+# rollout succeed" are two independently-readable check runs, not one
+# workflow whose failure could mean either.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A newer push on the same PR/branch cancels an in-flight run for it —
+# no point finishing a lint/test run against a commit that's already
+# been superseded.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Required for google-github-actions/auth's WIF exchange in the
+  # `build-and-push` job below — this is the GitHub-side half of
+  # "no long-lived GCP keys" (see docs/ci-cd.md "Authentication").
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------
+  # Lint — fast, no external services, no secrets needed. Runs first
+  # so an obviously-broken PR fails in seconds, not after a 2-3 minute
+  # test run.
+  # ---------------------------------------------------------------
+  lint:
+    name: Lint (ruff check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install ruff==0.16.0
+      # Blocking — see pyproject.toml's [tool.ruff.lint] docstring for
+      # the exact curated rule selection and why (BLE001/S110/UP042/
+      # UP046/UP047/SIM105/RUF022 deliberately excluded, each with a
+      # written reason — this is not "lint is off", it's a scoped-in
+      # baseline the whole existing codebase already passes).
+      - run: ruff check .
+      # `ruff format --check` is informational only this phase: the
+      # codebase predates ruff and was hand-formatted before any
+      # formatter config existed, so a repo-wide reformat is its own,
+      # separate, deliberate change — not something to force through as
+      # a side effect of standing up CI. See docs/ci-cd.md "Lint scope".
+      - name: ruff format --check (informational, non-blocking)
+        run: ruff format --check . || true
+
+  # ---------------------------------------------------------------
+  # Type check — informational for the same reason as ruff format:
+  # 53 pre-existing findings (mostly Starlette exception-handler
+  # variance and Optional-narrowing the runtime already guards) were
+  # found and catalogued (docs/ci-cd.md), not fixed, standing up CI
+  # itself. Kept in CI as a visible signal for new code, not as a gate
+  # that fails on Phase 1-11 debt.
+  # ---------------------------------------------------------------
+  typecheck:
+    name: Type check (mypy, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -r requirements.txt mypy==1.13.0
+      - run: mypy app
+
+  # ---------------------------------------------------------------
+  # Security gates — secrets, dependency CVEs, static-analysis
+  # security patterns. Each is its own job so a security failure is
+  # unambiguous in the PR checks list, never buried inside a "tests"
+  # job's log.
+  # ---------------------------------------------------------------
+  secret-scan:
+    name: Security / secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history — gitleaks scans commits, not just the working tree
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+          GITLEAKS_ENABLE_COMMENTS: false
+
+  dependency-audit:
+    name: Security / dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install pip-audit==2.10.1
+      # See docs/ci-cd.md "Security gates" for exactly why each ignored
+      # ID is safe to ignore (documented exceptions, per Phase 12 §10 —
+      # not a blanket suppression). A NEW CVE not in this list still
+      # fails the build. Kept in sync with
+      # docs/security/dependency-audit.md's Phase 10 findings plus the
+      # Phase 12 re-audit addendum.
+      - run: >
+          pip-audit -r requirements.txt
+          --ignore-vuln PYSEC-2026-161 --ignore-vuln PYSEC-2026-248 --ignore-vuln PYSEC-2026-249
+          --ignore-vuln PYSEC-2026-1942 --ignore-vuln PYSEC-2026-1941 --ignore-vuln PYSEC-2026-2281
+          --ignore-vuln PYSEC-2026-2280 --ignore-vuln PYSEC-2026-1845 --ignore-vuln PYSEC-2026-1325
+
+  bandit:
+    name: Security / static analysis (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install bandit==1.9.4
+      # Reads [tool.bandit] in pyproject.toml (skip list + exclusions,
+      # each individually justified there) plus the 6 per-site
+      # `# nosec B110` comments already in app/ — see that file.
+      - run: bandit -c pyproject.toml -r app
+
+  # ---------------------------------------------------------------
+  # Tests — the existing 449-test suite (Phases 1-11), against
+  # in-memory SQLite + fake GCS/Redis/Pub/Sub, exactly as documented in
+  # tests/conftest.py. No real GCP credentials or network access
+  # needed or used.
+  # ---------------------------------------------------------------
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  # ---------------------------------------------------------------
+  # Build + container scan. Runs for EVERY PR too (catches a broken
+  # Dockerfile/dependency before merge), but only PUSHES to Artifact
+  # Registry on main — a PR's image is built, scanned, and discarded.
+  # ---------------------------------------------------------------
+  build-and-push:
+    name: Build, scan, and push image
+    runs-on: ubuntu-latest
+    needs: [lint, secret-scan, dependency-audit, bandit, test]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          docker build \
+            -f docker/Dockerfile \
+            --build-arg GIT_COMMIT=${{ github.sha }} \
+            --build-arg BUILD_VERSION=${{ github.ref_name }}-${{ github.sha }} \
+            -t nimbusfs-api:${{ github.sha }} \
+            .
+
+      # Container scan BEFORE anything is pushed anywhere — a scan
+      # after push would mean a vulnerable image already sat in the
+      # registry (and be pullable) for however long the scan took.
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "nimbusfs-api:${{ github.sha }}"
+          # Fails the build on CRITICAL/HIGH with a known fix available.
+          # Findings with no fix yet (base-image 0-days) would otherwise
+          # permanently block every build until upstream patches —
+          # `ignore-unfixed` is what keeps that a real gate instead of
+          # one that has to be disabled the first time it's inconvenient.
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # ---- Everything below only runs on a push to main ----
+      - name: Authenticate to GCP (Workload Identity Federation)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_BUILD_SA }}
+
+      - name: Configure Docker for Artifact Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Tag and push (immutable, git-SHA-tagged — never :latest)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/nimbusfs/nimbusfs-api:${{ github.sha }}"
+          docker tag nimbusfs-api:${{ github.sha }} "$IMAGE"
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
