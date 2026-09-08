@@ -37,6 +37,28 @@ output "service_account_emails" {
   }
 }
 
+# ---------------------------------------------------------------------
+# CI/CD (Phase 12) — paste these into GitHub repo Settings -> Secrets
+# and variables -> Actions -> Variables (NOT Secrets — none of these
+# values are sensitive; they're resource identifiers WIF exchanges a
+# GitHub-issued OIDC token against, not credentials themselves).
+# ---------------------------------------------------------------------
+output "workload_identity_provider" {
+  description = "GCP_WORKLOAD_IDENTITY_PROVIDER repo variable — the full WIF provider resource name every workflow's google-github-actions/auth step references."
+  value       = google_iam_workload_identity_pool_provider.github_actions.name
+}
+
+output "ci_service_account_emails" {
+  description = "GCP_CI_BUILD_SA / GCP_CI_DEPLOY_SA / GCP_CI_DEPLOY_PROD_SA / GCP_CI_TERRAFORM_PLAN_SA / GCP_CI_TERRAFORM_APPLY_SA repo variables."
+  value = {
+    ci_build            = google_service_account.ci_build.email
+    ci_deploy           = google_service_account.ci_deploy.email
+    ci_deploy_production = google_service_account.ci_deploy_production.email
+    ci_terraform_plan   = google_service_account.ci_terraform_plan.email
+    ci_terraform_apply  = google_service_account.ci_terraform_apply.email
+  }
+}
+
 output "next_steps" {
   value = <<-EOT
     1. Run the get_credentials_command output above.
@@ -55,5 +77,11 @@ output "next_steps" {
     6. Build & push the image (k8s/README.md "Build & push the image"),
        using artifact_registry_repo above as the registry.
     7. ./scripts/k8s-deploy.sh
+    8. (Phase 12) Create 3 GitHub Environments in repo Settings ->
+       Environments: "staging" (no protection needed), "production" and
+       "production-terraform" (both: required reviewers). Then set the
+       workload_identity_provider and ci_service_account_emails outputs
+       above as repository VARIABLES (not secrets) in Settings ->
+       Secrets and variables -> Actions -> Variables. See docs/ci-cd.md.
   EOT
 }
