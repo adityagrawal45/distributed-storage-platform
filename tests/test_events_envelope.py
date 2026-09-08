@@ -9,7 +9,7 @@ first and in isolation (mirroring how Phase 7 tested `CacheKeyBuilder`/
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -74,7 +74,7 @@ def test_envelope_generates_its_own_ids_and_timestamp():
     assert isinstance(envelope.event_id, uuid.UUID)
     assert isinstance(envelope.correlation_id, uuid.UUID)
     assert envelope.occurred_at.tzinfo is not None
-    assert envelope.occurred_at <= datetime.now(timezone.utc)
+    assert envelope.occurred_at <= datetime.now(UTC)
 
 
 def test_envelope_defaults_are_the_documented_ones():
