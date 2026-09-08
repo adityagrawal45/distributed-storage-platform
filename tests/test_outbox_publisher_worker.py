@@ -13,6 +13,7 @@ genuine assertion rather than an in-memory one.
 """
 
 import uuid
+from datetime import UTC
 
 import pytest
 from sqlalchemy import select
@@ -201,9 +202,9 @@ async def test_a_failed_row_publishes_once_the_transport_recovers(worker_db):
     async with worker_db() as session:
         repo = OutboxRepository(session)
         [row] = await repo.list_by_status(OutboxEventStatus.FAILED)
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
-        row.next_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        row.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.commit()
 
     result = await worker.poll_once()
