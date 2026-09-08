@@ -21,7 +21,7 @@ degradation assertions genuine rather than aspirational.
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -127,7 +127,7 @@ class TestCacheSerializer:
     def test_round_trips_the_types_our_schemas_actually_use(self):
         value = {
             "id": uuid.uuid4(),
-            "created_at": datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
+            "created_at": datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
             "amount": Decimal("12.34"),
             "entity": CacheEntity.FOLDER,
             "tags": {"b", "a"},
