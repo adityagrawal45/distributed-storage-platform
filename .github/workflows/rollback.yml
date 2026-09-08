@@ -1,0 +1,45 @@
+# Phase 12 — manual, on-demand rollback. deploy-staging.yml/
+# deploy-production.yml already roll back automatically when their own
+# post-deploy smoke test fails; this workflow exists for the OTHER
+# case — a deploy reported healthy, was voted "successfully rolled
+# out" by every automated check, and only later (an alert from
+# docs/alerting.md, an incident) is a rollback actually decided on by
+# a human. See docs/rollback.md.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to roll back"
+        required: true
+        type: choice
+        options: [staging, production]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rollback:
+    name: Roll back
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ inputs.environment == 'production' && vars.GCP_CI_DEPLOY_PROD_SA || vars.GCP_CI_DEPLOY_SA }}
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ inputs.environment == 'production' && vars.GKE_CLUSTER_NAME_PRODUCTION || vars.GKE_CLUSTER_NAME_STAGING }}
+          location: ${{ vars.GCP_REGION }}
+          project_id: ${{ inputs.environment == 'production' && vars.GCP_PROJECT_ID_PRODUCTION || vars.GCP_PROJECT_ID_STAGING }}
+
+      - run: ./scripts/ci-rollback.sh
+
+      - run: ./scripts/k8s-smoke-test.sh
