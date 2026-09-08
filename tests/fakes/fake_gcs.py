@@ -23,7 +23,7 @@ class _StoredObject:
 
 
 class FakeBlob:
-    def __init__(self, bucket: "FakeBucket", name: str):
+    def __init__(self, bucket: FakeBucket, name: str):
         self._bucket = bucket
         self.name = name
         self.metadata: dict = {}
@@ -76,7 +76,7 @@ class FakeBlob:
             raise gcs_exceptions.NotFound(f"{self.name} not found")
         return f"https://storage.fake.test/{self._bucket.name}/{self.name}?signature=fake&method={method}"
 
-    def compose(self, sources: list["FakeBlob"], client=None) -> None:
+    def compose(self, sources: list[FakeBlob], client=None) -> None:
         """
         Fakes GCS's native Compose operation (Phase 6): concatenates
         `sources`' stored bytes, IN THE GIVEN ORDER, into this blob's
