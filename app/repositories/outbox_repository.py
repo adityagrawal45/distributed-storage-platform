@@ -48,7 +48,7 @@ needs it).
 """
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
@@ -70,7 +70,7 @@ def _as_aware(value: datetime | None) -> datetime | None:
     """
     if value is None:
         return None
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 class OutboxRepository(BaseRepository[OutboxEvent]):
@@ -124,7 +124,7 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         """
         settings = get_settings()
         batch_size = limit or settings.OUTBOX_BATCH_SIZE
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         statement = (
             select(OutboxEvent)
@@ -161,7 +161,7 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         whose only changing column is `status`.
         """
         event.status = OutboxEventStatus.PUBLISHED
-        event.published_at = datetime.now(timezone.utc)
+        event.published_at = datetime.now(UTC)
         event.last_error = None
         await self.flush()
         return event
@@ -198,13 +198,13 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
             settings.OUTBOX_RETRY_BASE_DELAY_SECONDS * (2 ** (event.attempt_count - 1)),
             settings.OUTBOX_RETRY_MAX_DELAY_SECONDS,
         )
-        event.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        event.next_attempt_at = datetime.now(UTC) + timedelta(seconds=delay_seconds)
         await self.flush()
         return event
 
     @staticmethod
     def is_due(event: OutboxEvent, *, now: datetime | None = None) -> bool:
         """tz-safe 'is this row eligible for a publish attempt right now?' (see `_as_aware`)."""
-        reference = now or datetime.now(timezone.utc)
+        reference = now or datetime.now(UTC)
         next_attempt = _as_aware(event.next_attempt_at)
         return next_attempt is None or next_attempt <= reference
