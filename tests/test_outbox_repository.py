@@ -11,7 +11,7 @@ limits, and — most importantly — that `add_event` never commits.
 """
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -19,7 +19,7 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.events.envelope import EventType
 from app.models.outbox_event import OutboxEvent, OutboxEventStatus
-from app.models.processed_event import ProcessedEvent, ProcessedEventStatus
+from app.models.processed_event import ProcessedEventStatus
 from app.repositories.outbox_repository import OutboxRepository
 from app.repositories.processed_event_repository import ProcessedEventRepository
 
@@ -102,7 +102,7 @@ async def test_fetch_pending_batch_includes_failed_rows_because_failed_is_not_te
     event = await _add(repo)
     await repo.mark_failed(event, "transient boom")
     # Wind the backoff back so it is due again.
-    event.next_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    event.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
     await repo.flush()
 
     batch = await repo.fetch_pending_batch()
@@ -123,7 +123,7 @@ async def test_fetch_pending_batch_excludes_published_rows(db_session):
 async def test_fetch_pending_batch_excludes_rows_not_yet_due(db_session):
     repo = OutboxRepository(db_session)
     event = await _add(repo)
-    event.next_attempt_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    event.next_attempt_at = datetime.now(UTC) + timedelta(minutes=10)
     await repo.flush()
 
     assert await repo.fetch_pending_batch() == []
@@ -181,7 +181,7 @@ async def test_mark_failed_increments_attempts_and_applies_exponential_backoff(d
     repo = OutboxRepository(db_session)
     event = await _add(repo)
 
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     await repo.mark_failed(event, "pubsub unavailable")
 
     assert event.status == OutboxEventStatus.FAILED
@@ -191,7 +191,7 @@ async def test_mark_failed_increments_attempts_and_applies_exponential_backoff(d
     first_delay = (event.next_attempt_at - before).total_seconds()
     assert first_delay == pytest.approx(settings.OUTBOX_RETRY_BASE_DELAY_SECONDS, abs=1.0)
 
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     await repo.mark_failed(event, "still unavailable")
     assert event.attempt_count == 2
     second_delay = (event.next_attempt_at - before).total_seconds()
@@ -206,7 +206,7 @@ async def test_backoff_is_capped_at_the_configured_maximum(db_session):
     for _ in range(20):
         await repo.mark_failed(event, "down")
 
-    delay = (event.next_attempt_at - datetime.now(timezone.utc)).total_seconds()
+    delay = (event.next_attempt_at - datetime.now(UTC)).total_seconds()
     assert delay <= settings.OUTBOX_RETRY_MAX_DELAY_SECONDS + 1
 
 
@@ -221,10 +221,10 @@ async def test_is_due_normalizes_naive_timestamps_from_sqlite(db_session):
     """The Phase 6 SQLite-naive-datetime trap, guarded at the repository boundary."""
     repo = OutboxRepository(db_session)
     event = await _add(repo)
-    event.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=5)
+    event.next_attempt_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=5)
     assert repo.is_due(event) is True
 
-    event.next_attempt_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).replace(tzinfo=None)
+    event.next_attempt_at = (datetime.now(UTC) + timedelta(minutes=5)).replace(tzinfo=None)
     assert repo.is_due(event) is False
 
 
