@@ -122,7 +122,7 @@ class WorkerRuntimeMixin:
             self.touch_heartbeat()
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=self._heartbeat_interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
     def start_heartbeat(self) -> None:
@@ -134,7 +134,7 @@ class WorkerRuntimeMixin:
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
-            except (asyncio.CancelledError, Exception):  # noqa: B014 - cancellation is the expected path
+            except (asyncio.CancelledError, Exception):
                 pass
             self._heartbeat_task = None
 
@@ -149,5 +149,5 @@ class WorkerRuntimeMixin:
         """
         try:
             await asyncio.wait_for(self._shutdown_event.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
