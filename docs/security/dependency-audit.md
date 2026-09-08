@@ -48,3 +48,35 @@ This is a snapshot, not a standing guarantee — re-running `pip-audit
 -r requirements.txt` periodically (or wiring it into CI, which does
 not exist yet — see `CONTEXT.md`'s "Not yet built" list) is how that
 gap gets closed structurally rather than by memory.
+
+## Phase 12 addendum (2026-09-08): re-audit + wired into CI
+
+Re-ran `pip-audit -r requirements.txt` while standing up
+`.github/workflows/ci.yml`'s `dependency-audit` job. The accumulated
+CVE database now reports **11 known vulnerabilities across 3
+packages** (`starlette` 0.41.3 — now 7 distinct advisory IDs, up from
+9 individual CVE mentions in the Phase 10 table above, as the public
+database has been updated since; `pytest` 8.3.4 — 1; `ecdsa` 0.19.2 —
+1). The underlying situation is UNCHANGED from Phase 10's analysis
+above — same three packages, same reasoning for not bumping each
+(`starlette`: transitive via `fastapi`, a real upgrade-and-reverify
+project of its own; `pytest`: dev-only, never shipped; `ecdsa`: HS256
+is the default `JWT_ALGORITHM`, so this code path isn't exercised) —
+this addendum exists because the brief for the phase that adds
+dependency-scanning CI (§10, §42: "do not fabricate ... vulnerability
+results") requires re-confirming the count against what CI will
+actually enforce, not reusing a possibly-stale number.
+
+**CI enforcement**: `dependency-audit` passes `--ignore-vuln <ID>` for
+each of the 9 specific advisory IDs found in this re-audit (7
+`starlette` + 1 `pytest` + 1 `ecdsa` — see the job step in
+`.github/workflows/ci.yml` and the mirrored `make security` target in
+`Makefile` for the exact IDs). This is an ALLOW-LIST of specific,
+individually-already-reviewed findings, not a blanket
+`--ignore-vuln`-everything or a severity threshold — **a new CVE
+published against any pinned dependency, including these three
+packages, fails the build** the moment `pip-audit`'s database picks it
+up, because its ID will not be in the ignore list. Re-reviewing and
+either bumping the dependency or adding a newly-justified ignore entry
+is the correct response to that failure, not blindly widening the
+ignore list.
