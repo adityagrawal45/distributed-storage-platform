@@ -156,7 +156,7 @@ class ThumbnailService:
             source_bytes = (
                 await self._storage.download_range(object_name, 0, source_size - 1) if source_size else b""
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RetryableEventError(f"Could not read source object '{object_name}': {exc}") from exc
 
         if not source_bytes:
@@ -180,7 +180,7 @@ class ThumbnailService:
                 checksum_sha256=hashlib.sha256(png_bytes).hexdigest(),
                 size=len(png_bytes),
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RetryableEventError(f"Could not write thumbnail '{thumbnail_name}': {exc}") from exc
 
         logger.info(
