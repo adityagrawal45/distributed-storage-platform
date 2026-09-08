@@ -86,7 +86,7 @@ def _resolve_identity(request: Request) -> tuple[str, str]:
             subject = payload.get("sub")
             if subject:
                 return f"user:{subject}", "user"
-        except Exception:
+        except Exception:  # nosec B110 - deliberately silent, see comment below
             # Not a usable token — fall through to IP. Deliberately not
             # logged: an expired token on a normal request is routine, and
             # logging it here would drown the signal in noise.
