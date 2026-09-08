@@ -71,13 +71,13 @@ import statistics
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 try:
     import httpx
-except ImportError:  # pragma: no cover - operator-facing script
+except ImportError as exc:  # pragma: no cover - operator-facing script
     print("This script needs httpx:  pip install httpx", file=sys.stderr)
-    raise SystemExit(1)
+    raise SystemExit(1) from exc
 
 
 DEFAULT_PASSWORD = "StrongP@ssw0rd"
@@ -97,7 +97,7 @@ class Measurement:
             # Nearest-rank percentile: no interpolation, so a reported
             # p99 is always an actually-observed request, not an
             # arithmetic artifact between two of them.
-            index = max(0, min(len(ordered) - 1, int(round(p / 100 * len(ordered))) - 1))
+            index = max(0, min(len(ordered) - 1, round(p / 100 * len(ordered)) - 1))
             return ordered[index]
 
         return {
