@@ -200,7 +200,7 @@ class FakeRedisClient:
             return -2
         if name not in self._expiry:
             return -1
-        return max(0, int(math.ceil(self._expiry[name] - self._now())))
+        return max(0, math.ceil(self._expiry[name] - self._now()))
 
     async def incrby(self, name: str, amount: int = 1) -> int:
         self._record("incrby")
@@ -302,12 +302,12 @@ class FakeRedisClient:
             tokens -= requested
         else:
             deficit = requested - tokens
-            retry_after_ms = int(math.ceil((deficit / refill_rate) * 1000.0))
+            retry_after_ms = math.ceil((deficit / refill_rate) * 1000.0)
 
         self._hashes[key] = {"tokens": str(tokens), "ts": str(now_ms)}
         self._expiry[key] = self._now() + (ttl_ms / 1000)
 
-        return [allowed, int(math.floor(tokens)), retry_after_ms]
+        return [allowed, math.floor(tokens), retry_after_ms]
 
     # ------------------------------------------------------------------
     # Lifecycle
