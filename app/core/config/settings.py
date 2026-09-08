@@ -16,7 +16,6 @@ import socket
 import uuid
 from enum import Enum
 from functools import lru_cache
-from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -190,7 +189,7 @@ class Settings(BaseSettings):
     SHUTDOWN_GRACE_PERIOD_SECONDS: float = 10.0
 
     @property
-    def TRUSTED_PROXIES(self) -> List[str]:
+    def TRUSTED_PROXIES(self) -> list[str]:
         return [item.strip() for item in self.TRUSTED_PROXIES_RAW.split(",") if item.strip()]
 
     @property
@@ -418,7 +417,7 @@ class Settings(BaseSettings):
     RECONCILIATION_MAX_ISSUES: int = 5000
 
     @property
-    def THUMBNAIL_SUPPORTED_CONTENT_TYPES(self) -> List[str]:
+    def THUMBNAIL_SUPPORTED_CONTENT_TYPES(self) -> list[str]:
         return [
             item.strip().lower()
             for item in self.THUMBNAIL_SUPPORTED_CONTENT_TYPES_RAW.split(",")
@@ -434,20 +433,20 @@ class Settings(BaseSettings):
         return self.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
     @property
-    def ALLOWED_MIME_TYPES(self) -> List[str]:
+    def ALLOWED_MIME_TYPES(self) -> list[str]:
         return [item.strip().lower() for item in self.ALLOWED_MIME_TYPES_RAW.split(",") if item.strip()]
 
     @property
-    def BLOCKED_EXTENSIONS(self) -> List[str]:
+    def BLOCKED_EXTENSIONS(self) -> list[str]:
         return [item.strip().lstrip(".").lower() for item in self.BLOCKED_EXTENSIONS_RAW.split(",") if item.strip()]
 
     @property
-    def CORS_ALLOWED_ORIGINS(self) -> List[str]:
+    def CORS_ALLOWED_ORIGINS(self) -> list[str]:
         """Comma-separated env value, e.g. 'http://a.com,http://b.com', as a list."""
         return [item.strip() for item in self.CORS_ALLOWED_ORIGINS_RAW.split(",") if item.strip()]
 
     @property
-    def ALLOWED_HOSTS(self) -> List[str]:
+    def ALLOWED_HOSTS(self) -> list[str]:
         return [item.strip() for item in self.ALLOWED_HOSTS_RAW.split(",") if item.strip()]
 
     @property
