@@ -19,7 +19,6 @@ from app.core.cache.keys import CacheKeyBuilder
 from app.core.cache.policy import CachePolicy
 from app.core.config import get_settings
 from app.core.distributed_lock import DistributedLockFactory, DistributedLockService
-from app.core.rate_limiter import RateLimiter
 from app.database.gcs import get_storage_client
 from app.database.redis import get_redis
 from app.database.session import get_db
