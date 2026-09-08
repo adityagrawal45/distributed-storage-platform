@@ -44,7 +44,8 @@ Design decisions:
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
