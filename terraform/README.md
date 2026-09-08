@@ -90,4 +90,6 @@ The commented-out block in `versions.tf` is where that goes.
 | `pubsub.tf` | The 3 Phase 8 topics + 3 subscriptions, names matching `app/core/config/settings.py` exactly |
 | `iam.tf` | **The core deliverable** — 6 GSAs, roles scoped per `k8s/16-worker-serviceaccounts.yaml`'s table, 6 Workload Identity bindings |
 | `artifact_registry.tf` | Image repo + Ingress static IP |
-| `outputs.tf` | Everything you need to complete the manual steps this module doesn't cover |
+| `monitoring.tf` | Phase 11: Cloud Monitoring alert policies + uptime check (gated behind `create_monitoring_alerts`, default false) — see `docs/alerting.md` |
+| `cicd.tf` | Phase 12: Workload Identity Federation pool/provider + 5 CI-only service accounts (build/deploy-staging/deploy-prod/terraform-plan/terraform-apply) — see `docs/ci-cd.md` §4 |
+| `outputs.tf` | Everything you need to complete the manual steps this module doesn't cover, plus (Phase 12) the WIF provider name + CI service-account emails to paste into GitHub repo variables |
