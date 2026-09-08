@@ -1,0 +1,132 @@
+# Phase 12 — infrastructure-change review pipeline for terraform/.
+#
+# PR: fmt check + validate + plan, plan output posted as a PR comment.
+# Uses the READ-ONLY `ci_terraform_plan` identity (terraform/cicd.tf) —
+# a PR from any branch, including a fork, can see what WOULD change,
+# never apply it (Phase 12 §19: "Do not automatically apply arbitrary
+# infrastructure changes to production on every commit").
+#
+# Apply: workflow_dispatch only, gated by the `production-terraform`
+# GitHub Environment's required reviewers AND (independently)
+# terraform/cicd.tf's `ci_terraform_apply_wif` binding, which only
+# trusts a GitHub OIDC token carrying `environment=production-terraform`
+# — the same belt-and-suspenders double gate deploy-production.yml
+# uses. See docs/infrastructure.md "Terraform workflow".
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action"
+        required: true
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write # to post the plan as a PR comment
+
+env:
+  TF_VERSION: "1.9.8"
+
+jobs:
+  plan:
+    name: terraform plan
+    if: github.event_name == 'pull_request' || inputs.action == 'plan'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive
+        working-directory: terraform
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_TERRAFORM_PLAN_SA }}
+
+      - run: terraform init
+        working-directory: terraform
+
+      - run: terraform validate
+        working-directory: terraform
+
+      - name: terraform plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="github_repository=${{ github.repository }}"
+          terraform show -no-color tfplan > plan_output.txt
+        working-directory: terraform
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan_output.txt', 'utf8').slice(0, 60000);
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `#### Terraform Plan\n<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`,
+            });
+
+      - name: Fail if plan errored
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply:
+    name: terraform apply (approval-gated)
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: production-terraform
+    concurrency:
+      group: terraform-apply
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_TERRAFORM_APPLY_SA }}
+
+      - run: terraform init
+        working-directory: terraform
+
+      # `-auto-approve` only skips Terraform's OWN interactive y/n
+      # prompt (meaningless in a non-interactive CI shell — there is no
+      # terminal to answer it). The actual human approval already
+      # happened: this job cannot even START running until the
+      # `production-terraform` GitHub Environment's required reviewers
+      # approve it (a manual gate in the Actions UI, separate from and
+      # prior to this step), and the WIF token this job runs with only
+      # works at all because that approval already happened (see
+      # terraform/cicd.tf's `ci_terraform_apply_wif`). "review -> plan
+      # -> approval -> apply" (Phase 12 §19) already happened by the
+      # time this line runs — the *_plan_ output a human reviewed is
+      # the PR comment from the `plan` job above, produced on the SAME
+      # commit this dispatch was run against.
+      - run: >
+          terraform apply -auto-approve
+          -var="project_id=${{ vars.GCP_PROJECT_ID }}"
+          -var="github_repository=${{ github.repository }}"
+        working-directory: terraform
