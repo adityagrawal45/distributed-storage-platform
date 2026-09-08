@@ -70,7 +70,7 @@ async def retry_async(
     for attempt in range(1, max_attempts + 1):
         try:
             return await operation()
-        except retry_on as exc:  # noqa: PERF203 - retry loop, not a hot path
+        except retry_on as exc:
             last_exception = exc
             if attempt == max_attempts:
                 break
