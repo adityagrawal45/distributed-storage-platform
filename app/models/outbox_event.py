@@ -71,10 +71,11 @@ Model design decisions
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 
-from sqlalchemy import JSON, DateTime, Enum as SAEnum, Index, Integer, String, Text, func
+from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, func
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -113,7 +114,7 @@ def _published_at_on_update(context) -> datetime | None:
     status = parameters.get("status")
     status_value = getattr(status, "value", status)
     if status_value == OutboxEventStatus.PUBLISHED.value:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
     return parameters.get("published_at")
 
 
@@ -180,7 +181,7 @@ class OutboxEvent(Base):
     # compares `next_attempt_at` against `datetime.now(timezone.utc)`.
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
         server_default=func.now(),
         nullable=False,
     )
@@ -204,7 +205,7 @@ class OutboxEvent(Base):
     # eligible on the very next poll; a failed row's backoff pushes it out.
     next_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
         server_default=func.now(),
         nullable=False,
     )
