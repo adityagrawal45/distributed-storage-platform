@@ -84,15 +84,12 @@ def configure_logging() -> None:
         _redact_sensitive_fields,
     ]
 
-    if settings.LOG_JSON:
-        renderer = structlog.processors.JSONRenderer()
-    else:
-        renderer = structlog.dev.ConsoleRenderer(colors=True)
+    renderer = (
+        structlog.processors.JSONRenderer() if settings.LOG_JSON else structlog.dev.ConsoleRenderer(colors=True)
+    )
 
     structlog.configure(
-        processors=shared_processors + [
-            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
-        ],
+        processors=[*shared_processors, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
