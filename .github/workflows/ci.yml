@@ -181,7 +181,7 @@ jobs:
       # after push would mean a vulnerable image already sat in the
       # registry (and be pullable) for however long the scan took.
       - name: Scan image (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref: "nimbusfs-api:${{ github.sha }}"
           # Fails the build on CRITICAL/HIGH with a known fix available.
