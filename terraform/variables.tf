@@ -135,6 +135,12 @@ variable "create_pubsub_topics" {
   default     = true
 }
 
+variable "github_repository" {
+  description = "The \"owner/repo\" GitHub Actions is allowed to federate from (Phase 12, terraform/cicd.tf) — see CONTEXT.md's \"Git Remote\" note for the canonical value. Every WIF trust boundary in cicd.tf is conditioned on this exact string; a fork or a differently-named repo cannot impersonate any CI identity even if it somehow obtained a GSA email."
+  type        = string
+  default     = "adityagrawal45/distributed-storage-platform"
+}
+
 variable "labels" {
   description = "Common labels applied to created resources."
   type        = map(string)
