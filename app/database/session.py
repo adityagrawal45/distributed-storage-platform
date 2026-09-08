@@ -17,7 +17,7 @@ Design decisions:
   even if an exception is raised mid-request.
 """
 
-from collections.abc import Awaitable, Callable, AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import TypeVar
 
 from sqlalchemy.exc import OperationalError
