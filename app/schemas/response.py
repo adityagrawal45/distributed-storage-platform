@@ -8,7 +8,7 @@ accurate OpenAPI schema generation while reusing this single wrapper.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, Field
@@ -26,7 +26,7 @@ class APIResponse(BaseModel, Generic[T]):
     message: str = "Request completed successfully"
     data: T | None = None
     errors: list[ErrorDetail] | list[dict] | None = None
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 
     model_config = {"json_schema_extra": {"example": {
