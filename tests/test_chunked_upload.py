@@ -10,7 +10,7 @@ design (see CONTEXT.md).
 import asyncio
 import hashlib
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -343,7 +343,7 @@ async def test_expired_upload_session_rejects_new_chunks(authed_client: AsyncCli
 
     result = await db_session.execute(select(UploadSession).where(UploadSession.id == upload_id))
     session = result.scalar_one()
-    session.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    session.expires_at = datetime.now(UTC) - timedelta(minutes=1)
     await db_session.flush()
 
     response = await authed_client.put(f"/api/v1/uploads/{upload_id}/chunks/1", content=_chunk_bytes(1))
