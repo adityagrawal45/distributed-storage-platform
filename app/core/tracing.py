@@ -58,8 +58,9 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 import structlog
 
@@ -105,7 +106,7 @@ def start_span(operation: str, **fields: Any) -> Iterator[str]:
     started = time.perf_counter()
     try:
         logger.debug("span_started", operation=operation, **fields)
-    except Exception:  # noqa: BLE001 - telemetry must never break the caller
+    except Exception:  # nosec B110 - best-effort telemetry, never break the caller, see module docstring
         pass
 
     try:
@@ -121,17 +122,17 @@ def start_span(operation: str, **fields: Any) -> Iterator[str]:
                 error=str(exc),
                 **fields,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # nosec B110 - best-effort telemetry, never break the caller, see module docstring
             pass
         raise
     else:
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         try:
             logger.info("span_completed", operation=operation, duration_ms=duration_ms, **fields)
-        except Exception:  # noqa: BLE001
+        except Exception:  # nosec B110 - best-effort telemetry, never break the caller, see module docstring
             pass
     finally:
         try:
             structlog.contextvars.reset_contextvars(**tokens)
-        except Exception:  # noqa: BLE001
+        except Exception:  # nosec B110 - best-effort telemetry, never break the caller, see module docstring
             pass
