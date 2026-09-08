@@ -56,7 +56,7 @@ async def main_async() -> int:
     logger.info("reconciliation_job_started", batch_size=settings.RECONCILIATION_BATCH_SIZE)
     try:
         report = await run_once()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error("reconciliation_job_failed", error=str(exc))
         return 2
 
