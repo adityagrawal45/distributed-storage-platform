@@ -1,0 +1,88 @@
+# Phase 12 — automatic staging deploy, triggered by CI's build-and-push
+# job succeeding on `main`. Deliberately a SEPARATE workflow from CI
+# (see ci.yml's header comment) triggered via `workflow_run` rather
+# than folded in as another job — this is what lets staging deploy
+# happen for main-branch pushes specifically, using the CI run's own
+# recorded outcome, without CI needing GKE credentials or knowing
+# anything about deployment at all.
+#
+# No manual approval — staging is where a build gets exercised against
+# a real cluster before anyone considers production, exactly the "use
+# staging to validate migrations/deployment/workers/health checks"
+# role Phase 12 §36 describes. If this deploy or its smoke test fails,
+# it auto-rolls-back and the workflow fails loudly; it never blocks
+# main or requires a human to unstick it.
+name: Deploy to Staging
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy + verify
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      # Never run two staging deploys at once — a second push landing
+      # mid-rollout would otherwise race kubectl against itself.
+      group: deploy-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_DEPLOY_SA }}
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME_STAGING }}
+          location: ${{ vars.GCP_REGION }}
+          project_id: ${{ vars.GCP_PROJECT_ID_STAGING }}
+
+      - name: Deploy
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID_STAGING }}
+          REGION: ${{ vars.GCP_REGION }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+        run: ./scripts/ci-deploy.sh
+
+      # Deployment verification (Phase 12 §25 / Phase 11 observability):
+      # NOT just "kubectl says rollout complete" (ci-deploy.sh's
+      # `rollout status` wait already covers that) — this additionally
+      # exercises `/live`+`/ready` from inside a live Pod, confirms
+      # Service endpoints are populated, and checks the HPA/PDB/
+      # NetworkPolicy objects are intact. See scripts/k8s-smoke-test.sh.
+      - name: Smoke test
+        id: smoke_test
+        run: ./scripts/k8s-smoke-test.sh
+
+      - name: Rollback on smoke-test failure
+        if: failure() && steps.smoke_test.outcome == 'failure'
+        run: ./scripts/ci-rollback.sh
+
+      - name: Record deployment (release traceability — Phase 12 §28-29)
+        if: success()
+        run: |
+          echo "### Staging deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.event.workflow_run.head_sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image tag | \`${{ github.event.workflow_run.head_sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Environment | staging |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | ${{ github.event.workflow_run.actor.login }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Deployed at (UTC) | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Verify traceability: \`curl https://staging.../api/v1/health\` and confirm \`server.git_commit\` matches the commit above (app/core/server_info.py, Phase 4)." >> "$GITHUB_STEP_SUMMARY"
