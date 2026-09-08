@@ -15,8 +15,8 @@ from app.events.envelope import EventEnvelope, EventType
 from app.events.topics import EVENT_TYPE_TO_TOPIC, topic_for_event_type
 
 __all__ = [
+    "EVENT_TYPE_TO_TOPIC",
     "EventEnvelope",
     "EventType",
-    "EVENT_TYPE_TO_TOPIC",
     "topic_for_event_type",
 ]
