@@ -49,9 +49,10 @@ Design decisions:
 import asyncio
 import hashlib
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import BinaryIO, Iterator
+from datetime import UTC, datetime, timedelta
+from typing import BinaryIO
 
 from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
@@ -118,7 +119,7 @@ class StorageService:
     @staticmethod
     def generate_object_name(owner_id: uuid.UUID, extension: str | None, tenant_id: str = "default") -> str:
         """Builds a unique, non-user-controlled object key. See module docstring for rationale."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         suffix = f"{uuid.uuid4()}.{extension.lstrip('.').lower()}" if extension else str(uuid.uuid4())
         return f"{tenant_id}/{owner_id}/{now.year:04d}/{now.month:02d}/{suffix}"
 
@@ -156,7 +157,7 @@ class StorageService:
         except gcs_exceptions.NotFound as exc:
             logger.error("storage_upload_failed", object_name=object_name, error=str(exc))
             raise BucketNotFoundException("Upload failed: configured bucket does not exist.") from exc
-        except Exception as exc:  # noqa: BLE001 - translated below, nothing swallowed
+        except Exception as exc:
             logger.error("storage_upload_failed", object_name=object_name, error=str(exc))
             translated = _translate_gcs_error(exc, context="Upload")
             raise UploadFailedException(translated.detail) from exc
@@ -206,7 +207,7 @@ class StorageService:
                     yield chunk
         except gcs_exceptions.NotFound as exc:
             raise StorageObjectNotFoundException("The file's bytes could not be located in storage.") from exc
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise _translate_gcs_error(exc, context="Download") from exc
         logger.info("storage_download_completed", object_name=object_name)
 
@@ -226,7 +227,7 @@ class StorageService:
                 return await asyncio.to_thread(_do_download)
         except gcs_exceptions.NotFound as exc:
             raise StorageObjectNotFoundException("The file's bytes could not be located in storage.") from exc
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise _translate_gcs_error(exc, context="Range download") from exc
 
     async def get_blob_metadata(self, object_name: str) -> storage.Blob:
@@ -239,7 +240,7 @@ class StorageService:
 
         try:
             return await asyncio.to_thread(_reload)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise _translate_gcs_error(exc, context="Metadata lookup") from exc
 
     # ------------------------------------------------------------------
@@ -259,7 +260,7 @@ class StorageService:
             # for our purposes (idempotent delete), it just gets logged.
             logger.warning("storage_delete_object_already_absent", object_name=object_name)
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("storage_delete_failed", object_name=object_name, error=str(exc))
             raise _translate_gcs_error(exc, context="Delete") from exc
 
@@ -288,7 +289,7 @@ class StorageService:
         try:
             with start_span("gcs.generate_signed_url", object_name=object_name):
                 url = await asyncio.to_thread(_do_generate)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("signed_url_generation_failed", object_name=object_name, error=str(exc))
             raise _translate_gcs_error(exc, context="Signed URL generation") from exc
 
@@ -354,7 +355,7 @@ class StorageService:
 
             try:
                 return await asyncio.to_thread(_do_compose)
-            except Exception as exc:  # noqa: BLE001 - translated below
+            except Exception as exc:
                 logger.error(
                     "storage_compose_failed", destination=dest_name, source_count=len(sources), error=str(exc)
                 )
@@ -415,7 +416,7 @@ class StorageService:
         for name in object_names:
             try:
                 await self.delete(name)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("storage_bulk_delete_item_failed", object_name=name, error=str(exc))
 
     async def compute_object_checksum(self, object_name: str) -> str:
