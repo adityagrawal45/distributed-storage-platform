@@ -48,7 +48,7 @@ invalidate-before-commit race).
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.core.cache.policy import CacheEntity
 from app.events.emitter import OutboxEmitterMixin
@@ -329,7 +329,7 @@ class FolderService(OutboxEmitterMixin):
         """Soft delete: this folder AND every descendant move into the trash together."""
         folder = await self._get_owned_active(folder_id, owner_id)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         descendants = await self._folders.list_descendants(folder, owner_id)
 
         for node in [folder, *descendants]:
