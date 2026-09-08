@@ -9,8 +9,6 @@ import io
 import pytest
 from httpx import AsyncClient
 
-from app.dependencies.providers import get_gcs_client
-from app.main import app
 from tests.fakes.fake_gcs import FakeGCSClient
 
 PDF_MAGIC_BYTES = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n" + b"0" * 100
