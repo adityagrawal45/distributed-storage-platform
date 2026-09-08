@@ -910,21 +910,15 @@ rationale. Summary of what changed this phase:
   `GIT_COMMIT`, so every `/health` response and log line traces back to
   the exact image that produced it.
 
-### CI/CD preparation (not built)
+### CI/CD (Phase 12 — implemented; see §24b below)
 
-Deliberately not implemented this phase — the intended future shape,
-so the seam is documented rather than improvised later:
-
-1. GitHub Actions workflow, triggered on merge to `main`, running
-   `pytest` (all 104+ tests) as a gate.
-2. On pass: `docker build` (using `docker/Dockerfile`, with
-   `GIT_COMMIT`/`BUILD_VERSION` build args from the CI-provided SHA/tag)
-   → push to Artifact Registry, tagged with the Git SHA (immutable,
-   matching `07-deployment.yaml`'s "never `:latest`" rule).
-3. `kubectl set image` (or a GitOps tool watching Artifact Registry) to
-   roll the new tag out via the existing rolling-update strategy — no
-   new deployment mechanism needed, CI would just be what triggers the
-   same `kubectl` commands `k8s/README.md` documents doing by hand today.
+Built exactly as anticipated when this section was written in Phase 5:
+a GitHub Actions workflow gating on `pytest` (now 449 tests) + lint +
+security scans, building via the unchanged `docker/Dockerfile` with
+CI-provided `GIT_COMMIT`/`BUILD_VERSION`, pushing to Artifact Registry
+tagged by git SHA (never `:latest`), and `kubectl`-based rollout —
+no GitOps tool introduced, exactly as predicted above. See
+`docs/ci-cd.md` for the full pipeline.
 
 ### Testing
 
@@ -3391,6 +3385,73 @@ hop — is what this phase adds:
   `docs/observability.md`'s opening section for the full
   DESIGNED/IMPLEMENTED/TESTED/MEASURED discipline this phase (and every
   phase since 9) holds itself to.
+
+## 24b. Phase 12 — CI/CD, Infrastructure as Code, GitOps & Release Engineering
+
+A repository-inspection-first pass (per the Phase 12 brief) found no
+CI/CD of any kind existed — but the exact intended shape was already
+documented in §24a's predecessor section (Phase 5) and in
+`k8s/README.md`/`terraform/README.md`'s own forward-looking comments
+("before a second person or a CI pipeline ever runs this..."). Phase
+12 implements that already-anticipated design rather than inventing a
+new one:
+
+- **GitHub Actions** (`.github/workflows/ci.yml`,
+  `deploy-staging.yml`, `deploy-production.yml`, `rollback.yml`,
+  `terraform.yml`) — lint (`ruff check`, blocking), security (gitleaks/
+  pip-audit/bandit, all blocking), tests (449, blocking), Docker build
+  + Trivy container scan (blocking), push to Artifact Registry tagged
+  by immutable git SHA (never `:latest`), automatic staging deploy,
+  manually-approved production deploy, automatic rollback on a failed
+  post-deploy smoke test. **No Jenkins/GitLab/Argo CD/service mesh
+  introduced** — see `docs/ci-cd.md`'s explicit "why not Argo CD".
+- **Zero long-lived GCP credentials**: every workflow authenticates via
+  **Workload Identity Federation** (`terraform/cicd.tf` — a new WIF
+  pool/provider + 5 least-privilege CI-only service accounts: build,
+  deploy-staging, deploy-production, terraform-plan, terraform-apply),
+  never a downloaded service-account JSON key. Production and
+  Terraform-apply access are each gated TWICE, independently: a GitHub
+  Environment's required-reviewer approval, AND a GCP IAM trust
+  condition that only accepts an OIDC token already carrying that
+  environment's name as a claim (which GitHub only stamps on after the
+  approval already happened).
+- **A real, live security finding, found and fixed mid-phase**:
+  running `gitleaks` (the exact tool this phase's secret-scanning gate
+  uses) against this repo's own history surfaced a genuine JWT signing
+  secret committed to `.env` in 4 commits predating this project's
+  phased development, still in active local use. Rotated immediately
+  on request; the exposed historical value and whether to rewrite git
+  history were left to the user's explicit decision, not acted on
+  unilaterally.
+- **Lint/type/security baselines established for the first time**:
+  `pyproject.toml` (new) — a curated `ruff` rule selection the entire
+  existing codebase now passes cleanly (after ~30 safe, individually-
+  reviewed mechanical fixes — import sorting, `datetime.UTC`,
+  redundant int casts, a handful of `# nosec`/documented-ignore
+  annotations — 449/449 tests re-verified passing throughout), plus
+  `bandit`/`mypy` configuration. Deliberately-deferred findings
+  (`BLE001`/`S110` broad-exception patterns, `ruff format`'s 59-file
+  reformat, 53 mostly-false-positive `mypy` findings) are catalogued,
+  not silently ignored — see `docs/ci-cd.md` §6.
+- **Terraform**: `versions.tf`'s already-anticipated GCS remote-state
+  backend is documented as the concrete next step (bootstrap bucket +
+  `terraform init -migrate-state`) but not executed (no real GCP
+  project); `terraform.yml` gates every infra change behind
+  PR-plan-then-approved-apply, never auto-applying to production.
+- **Documentation**: `docs/ci-cd.md`, `docs/deployment.md`,
+  `docs/release-process.md`, `docs/rollback.md`,
+  `docs/infrastructure.md`, `docs/development-workflow.md` — plus a
+  `Makefile` giving `make lint`/`make test`/`make security`/`make ci`
+  as the exact local reproduction of CI's blocking gates.
+- **Nothing in this phase was run against real infrastructure** — no
+  real GKE cluster or GCP project existed this session (same
+  constraint every phase since 5 has recorded); Terraform resources
+  are schema-reviewed, not `terraform validate`-checked (no binary
+  installed). What WAS run for real, against this actual codebase:
+  `ruff`, `bandit`, `pip-audit`, `gitleaks`, and the full `pytest`
+  suite (449/449 passing) — see `docs/ci-cd.md`'s
+  DESIGNED/IMPLEMENTED/TESTED/MEASURED table for the precise line
+  between the two.
 
 ## 25. Contribution Guide
 
