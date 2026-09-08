@@ -1,6 +1,83 @@
 # NimbusFS — Project Context
 
-Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10; updated 2026-09-06 after completing Phase 11.
+Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10; updated 2026-09-06 after completing Phase 11; updated 2026-09-08 after completing Phase 12.
+
+## Phase 12 (2026-09-08): CI/CD, Infrastructure as Code, GitOps & Release Engineering
+
+**Full writeup: `docs/ci-cd.md`, `docs/deployment.md`,
+`docs/release-process.md`, `docs/rollback.md`,
+`docs/infrastructure.md`, `docs/development-workflow.md`, and README
+§24b.** Test suite: **449/449 passing**, re-verified after every lint
+fix applied this phase, zero regressions.
+
+Inspection found no CI/CD existed, but the intended shape was already
+documented (README's Phase-5-era "CI/CD preparation" section,
+`terraform/README.md`'s "before a second person or a CI pipeline ever
+runs this" state-backend note) — this phase builds exactly that,
+not a new design:
+
+- **`.github/workflows/`**: `ci.yml` (lint/security/test/build/scan
+  gate on every PR+push-to-main), `deploy-staging.yml` (automatic),
+  `deploy-production.yml` (manual `workflow_dispatch`, approval-gated),
+  `rollback.yml` (manual), `terraform.yml` (plan-on-PR,
+  approval-gated-apply). GitHub Actions chosen (repo already lives
+  there); explicitly no Jenkins/GitLab/Argo CD/service mesh — see
+  `docs/ci-cd.md`'s "why not Argo CD."
+- **New: `terraform/cicd.tf`** — a GitHub Actions Workload Identity
+  Federation pool/provider + 5 CI-only least-privilege service
+  accounts (build, deploy-staging, deploy-production, terraform-plan,
+  terraform-apply). Zero long-lived GCP keys anywhere. Production and
+  terraform-apply are double-gated: a GitHub Environment's
+  required-reviewer approval AND a GCP IAM trust condition requiring
+  the OIDC token already carry that environment's name as a claim.
+- **New: `pyproject.toml`** — the first committed `ruff`/`mypy`/
+  `bandit` configuration in this project's history, despite ~40
+  `# noqa`-style comments already implying one was always intended.
+  Curated rule selection; the entire codebase now passes `ruff check`
+  cleanly after ~30 safe, individually-reviewed mechanical fixes
+  (import sorting, `datetime.UTC`, redundant int casts in a test fake,
+  a nested-if collapse, a ternary, 6 new `# nosec B110` annotations on
+  already-documented "log, never raise" sites). `ruff format --check`
+  and `mypy` are informational-only this phase (59-file reformat and
+  53 mostly-false-positive findings respectively, catalogued not
+  fixed — see `docs/ci-cd.md` §6). Every fix re-verified against the
+  full 449-test suite.
+- **Security tools actually run for real** (not fabricated) against
+  this codebase this session: `ruff`, `bandit`, `pip-audit`,
+  `gitleaks` (downloaded a real binary since none was installed).
+  **`gitleaks` found a genuine, currently-in-use JWT signing secret
+  committed to `.env` in git history (4 commits predating this
+  project's phased development)** — surfaced to the user immediately
+  rather than silently documented; rotated on request
+  (`JWT_SECRET_KEY` in local `.env`); the exposed historical value and
+  any git-history rewrite were explicitly left to the user's decision,
+  not acted on unilaterally.
+- **New: `Makefile`** — `make lint`/`test`/`security`/`build`/`ci`,
+  mirroring `ci.yml`'s blocking jobs so a developer reproduces CI
+  locally before pushing.
+- **`scripts/ci-deploy.sh`/`scripts/ci-rollback.sh`** (new,
+  non-interactive) — extend `scripts/k8s-deploy.sh`'s manifest
+  coverage to include the Phase 8/9 worker Deployments/CronJob and
+  Phase 11's PodMonitoring (a real, pre-existing gap in the human-run
+  script, deliberately left uncorrected there and documented instead —
+  see `docs/ci-cd.md` §9).
+- **Remaining risks, recorded honestly rather than fixed** (full list
+  in `docs/ci-cd.md`/`docs/infrastructure.md`): Terraform state is
+  still local (remote GCS backend documented as the next concrete
+  step, not executed); no Secret Manager integration (Phase 10's gap,
+  still open); `BLE001`/`S110` broad-exception-catch lint rules not
+  yet enforced (~35 sites needing individual review); no canary/
+  blue-green delivery (explicitly evaluated and rejected as
+  premature at current scale, per the brief's own instruction to say
+  so when rolling updates suffice).
+- **Nothing in this phase was run against real infrastructure** — no
+  real GKE cluster or GCP project existed this session. Terraform
+  resources are schema-reviewed only (no `terraform` binary installed
+  this session, unlike Phase 9's own session). What WAS genuinely
+  executed against this real codebase: `ruff`/`bandit`/`pip-audit`/
+  `gitleaks`/`pytest` (449/449) — see `docs/ci-cd.md`'s
+  DESIGNED/IMPLEMENTED/TESTED/MEASURED table for the exact line
+  between what was proven and what remains a documented design.
 
 ## Phase 11 (2026-09-06): Observability, Monitoring, Distributed Tracing & Alerting
 
@@ -231,7 +308,7 @@ A **cloud-native distributed file storage platform** (Google-Drive-style) built 
 
 - **Phase 9**: high availability & disaster recovery — `topologySpreadConstraints` added to the API and all four Phase 8 worker Deployments (zone-level `maxSkew: 1`, additive to Phase 5's soft `podAntiAffinity`, not a replacement for it); `outbox-publisher`/`notification-worker` bumped from 1→2 replicas specifically for zone-redundancy (each Deployment's own header comment carries the reasoning); a `minAvailable: 1` PodDisruptionBudget added for all four worker Deployments now that each runs >=2 replicas; a new read-only `ReconciliationService`/`reconciliation_job.py`, run every 6 hours via `k8s/22-cronjob-reconciliation.yaml` under its own least-privilege KSA/GSA, that keyset-paginates every non-deleted `upload_status=COMPLETED` `FileMetadata` row and flags one it can't find the backing GCS object for — it has **no delete/update code path anywhere in its call graph**, proven by `tests/test_reconciliation.py::test_never_mutates_or_deletes_anything`. Everything else this phase produced is design/documentation, not code: an availability target (99.9%) and RTO/RPO targets (<4h/<1h) with derivations, Cloud SQL Regional-HA and Memorystore Standard-tier configuration guidance (not applied — no real instances existed to apply it to), a GCS durability/protection recommendation (regional bucket + a scheduled cross-region object-replication job, explicitly **not** a dual-region bucket — cost-aware, not the most expensive default), an active-passive warm-standby multi-region DR design with a manual failover runbook (active-active explicitly rejected — no requirement justifies solving multi-writer Postgres consistency), a failure matrix, a monitoring metric inventory, severity-tiered alerts, a cost comparison (no fabricated pricing), and chaos-testing procedures for all 13 requested scenarios labeled LOCAL/STAGING/PRODUCTION. See README §16 and `docs/high-availability.md`/`docs/disaster-recovery.md`/`docs/failure-testing.md`/`docs/backup-restore.md` for the full depth. **Nothing in Phase 9 was run against real infrastructure** — no real GKE cluster, Cloud SQL instance, or Memorystore instance was available in this session either, so every HA/DR number in this phase is a justified target (DESIGNED), not a drill result (MEASURED) — see the honest gap list in "Phase 9 Design Decisions" below.
 
-**Not yet built** (future phases, per README §24): sharing/permissions between users, virus scanning (placeholder only), full-text content search, content-dedup extension to chunked uploads (Phase 6), CI/CD automation (Phase 5 only documented the intended shape), a full OpenTelemetry/Cloud Trace integration (Phase 11 shipped a lighter-weight structured-log-based span/trace-ID primitive instead — see `docs/observability.md` §5 for why), trace sampling, dead-letter-queue metric/replay tooling, backlog-based worker autoscaling, orphaned-GCS-object detection (Phase 9's reconciliation job deliberately covers only the other, more dangerous direction), and reconciliation of upload sessions stuck mid-`COMPLETING` (Phase 8's workers make it *possible*, but no such job was written — distinct from Phase 9's Postgres↔GCS drift reconciliation). (Real rate limiting and Redis metadata caching were on this list until Phase 7 shipped them; Pub/Sub background workers and thumbnails until Phase 8 did; multi-zone HA and DR design until Phase 9 did; Terraform until Phase 9's extension did; application metrics/`/metrics`/distributed tracing/alerting until Phase 11 did.)
+**Not yet built** (future phases, per README §24): sharing/permissions between users, virus scanning (placeholder only), full-text content search, content-dedup extension to chunked uploads (Phase 6), a full OpenTelemetry/Cloud Trace integration (Phase 11 shipped a lighter-weight structured-log-based span/trace-ID primitive instead — see `docs/observability.md` §5 for why), trace sampling, dead-letter-queue metric/replay tooling, backlog-based worker autoscaling, orphaned-GCS-object detection (Phase 9's reconciliation job deliberately covers only the other, more dangerous direction), reconciliation of upload sessions stuck mid-`COMPLETING` (Phase 8's workers make it *possible*, but no such job was written — distinct from Phase 9's Postgres↔GCS drift reconciliation), Terraform remote state (still local — Phase 12 documented the concrete fix, didn't execute it), GCP Secret Manager integration (Phase 10's gap, still open), and canary/blue-green deployment (Phase 12 evaluated and deliberately deferred — rolling updates are sufficient at current scale). (Real rate limiting and Redis metadata caching were on this list until Phase 7 shipped them; Pub/Sub background workers and thumbnails until Phase 8 did; multi-zone HA and DR design until Phase 9 did; Terraform until Phase 9's extension did; application metrics/`/metrics`/distributed tracing/alerting until Phase 11 did; CI/CD automation, lint/security gates, and Workload Identity Federation until Phase 12 did.)
 
 ## Tech Stack
 
