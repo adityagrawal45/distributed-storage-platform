@@ -65,7 +65,7 @@ def build_publisher_client() -> Any:
     if settings.PUBSUB_EMULATOR_HOST:
         os.environ["PUBSUB_EMULATOR_HOST"] = settings.PUBSUB_EMULATOR_HOST
 
-    from google.cloud import pubsub_v1  # noqa: PLC0415 - deferred by design
+    from google.cloud import pubsub_v1
 
     return pubsub_v1.PublisherClient()
 
@@ -149,7 +149,7 @@ class EventPublisher:
                 None, lambda: self._resolve_client().publish(topic_path, data, **attributes)
             )
             message_id = await asyncio.wrap_future(concurrent_future)
-        except Exception as exc:  # noqa: BLE001 - normalized into one domain error by design
+        except Exception as exc:
             logger.error(
                 "event_publish_failed",
                 event_id=str(envelope.event_id),
