@@ -30,7 +30,8 @@ Design decisions:
   to "not ready" and pull a perfectly healthy replica out of rotation.
 """
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable
+from typing import Any, cast
 
 import redis.asyncio as redis
 
@@ -104,6 +105,33 @@ async def check_redis_connection(*, with_retry: bool = True) -> bool:
         return False
     finally:
         await client.aclose()
+
+
+async def eval_script(client: redis.Redis, script: str, numkeys: int, *keys_and_args: str) -> Any:
+    """
+    Typed wrapper around `Redis.eval` (Phase 12 mypy pass).
+
+    `redis-py`'s installed type stub declares `eval`'s return as
+    `Awaitable[str] | str` unconditionally — a real gap in the stub, not
+    in this codebase, on two counts: (1) for `redis.asyncio.Redis` (the
+    only client this project ever constructs — see `get_redis_client`
+    above) the call always returns a coroutine, never a bare `str`; (2)
+    a Lua script's actual return type depends entirely on what THAT
+    script returns (an integer, a string, or — like
+    `RateLimiter`'s `TOKEN_BUCKET_SCRIPT` — a 3-element table, which
+    `redis-py` decodes as a `list`), so hardcoding `str` here would be
+    just as wrong as the stub's own claim. `Any` is the honest return
+    type; `cast` resolves mypy's "Incompatible types in await" by
+    narrowing the AWAIT expression to what's actually true at runtime
+    (a coroutine), without asserting anything false about what it
+    resolves TO — callers still narrow the result themselves
+    (`bool(...)`, `int(raw[0])`, etc.), exactly as before this wrapper
+    existed. Every `Redis.eval` call site in this codebase goes through
+    this one wrapper (`app/core/distributed_lock.py`,
+    `app/core/rate_limiter.py`) instead of repeating the same `cast` at
+    each call site.
+    """
+    return await cast("Awaitable[Any]", client.eval(script, numkeys, *keys_and_args))
 
 
 async def close_redis_pool() -> None:
