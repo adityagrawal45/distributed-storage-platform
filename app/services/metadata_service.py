@@ -157,10 +157,18 @@ class MetadataService(OutboxEmitterMixin):
 
     async def get_metadata_cached(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadataRead:
         """Cache-aside `get_metadata`, returning the API schema. See module docstring on authorization."""
-        if not self._caching:
+        # Bound to a local rather than repeatedly re-reading `self._cache`
+        # (Phase 12 mypy pass): mypy narrows a LOCAL variable's `X | None`
+        # to `X` after an `is None` guard, but does not see through the
+        # `self._caching` PROPERTY call above to narrow `self._cache`
+        # itself — every `self._cache.foo` below would otherwise still be
+        # typed `CacheService | None`, despite `_caching` being exactly
+        # the check that guarantees it isn't.
+        cache = self._cache
+        if cache is None or not cache.enabled:
             return FileMetadataRead.model_validate(await self._get_owned_active(file_id, owner_id))
 
-        key = self._cache.keys.file(file_id)
+        key = cache.keys.file(file_id)
 
         async def _load() -> dict:
             # Loaded un-owner-filtered on purpose: the cached entry is a
@@ -171,9 +179,7 @@ class MetadataService(OutboxEmitterMixin):
                 raise FileNotFoundException()
             return FileMetadataRead.model_validate(file).model_dump(mode="json")
 
-        payload = await self._cache.get_or_set(
-            key, _load, self._cache.ttl_for(CacheEntity.FILE), entity=CacheEntity.FILE
-        )
+        payload = await cache.get_or_set(key, _load, cache.ttl_for(CacheEntity.FILE), entity=CacheEntity.FILE)
         return self._authorize_cached(payload, owner_id)
 
     async def update_metadata(
