@@ -65,6 +65,7 @@ from typing import Self
 
 import redis.asyncio as redis
 
+from app.database.redis import eval_script
 from app.exceptions.custom_exceptions import (
     DistributedLockError,
     LockAcquisitionException,
@@ -220,7 +221,7 @@ class DistributedLock:
         """
         if not self._held:
             return False
-        released = bool(await self._client.eval(_RELEASE_SCRIPT, 1, self._key, self._token))
+        released = bool(await eval_script(self._client, _RELEASE_SCRIPT, 1, self._key, self._token))
         self._held = False
         if released:
             logger.debug("lock_released", lock_key=self._key)
@@ -236,7 +237,9 @@ class DistributedLock:
         """Extends the lock's TTL — only succeeds if we still hold it."""
         if not self._held:
             return False
-        extended = await self._client.eval(_EXTEND_SCRIPT, 1, self._key, self._token, int(ttl_seconds * 1000))
+        extended = await eval_script(
+            self._client, _EXTEND_SCRIPT, 1, self._key, self._token, str(int(ttl_seconds * 1000))
+        )
         return bool(extended)
 
     async def __aenter__(self) -> Self:
