@@ -123,11 +123,16 @@ exclude = ["tests/", "alembic/"]
 #     predictable jitter value has no security consequence, only a
 #     scheduling one. `app/core/security/tokens.py`/`password.py` (the
 #     actual crypto boundary) use `python-jose`/`bcrypt`, never `random`.
-#   B101 (assert_used): the two sites (app/core/retry.py,
-#     app/core/distributed_lock.py) assert an internal invariant the
+#   B101 (assert_used): every site (app/core/retry.py,
+#     app/core/distributed_lock.py, plus several added during the
+#     Phase 12 mypy pass in app/services/file_upload_service.py,
+#     app/services/chunked_upload_service.py, app/api/v1/files/routes.py,
+#     app/api/v1/uploads/routes.py) asserts an internal invariant the
 #     surrounding code already guarantees structurally (documented
-#     inline at each site) — not input validation, and this image is
-#     never run with Python's `-O` flag (see docker/Dockerfile), so
+#     inline at each site — most are a query filter or a prior
+#     `raise`-on-falsy check mypy can't see across a function/variable
+#     boundary) — not input validation, and this image is never run
+#     with Python's `-O` flag (see docker/Dockerfile), so
 #     assert-stripping is not an actual runtime risk here either.
 skips = ["B104", "B608", "B105", "B108", "B311", "B101"]
 exclude_dirs = ["tests", "alembic", ".venv", "venv"]
