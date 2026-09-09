@@ -41,17 +41,16 @@ git push -u origin feature/my-change
 # open a PR — ci.yml runs the full gate automatically
 ```
 
-`make ci` runs lint+test+security together, in the same order CI
-does, so a failure locally is a failure in CI too (see `Makefile`'s
-own comment for the one thing it does NOT reproduce locally: the
-Trivy container scan, which needs a registry/Trivy install most
-developers won't have).
+`make ci` runs lint+typecheck+test+security together, in the same
+order CI does, so a failure locally is a failure in CI too (see
+`Makefile`'s own comment for the one thing it does NOT reproduce
+locally: the Trivy container scan, which needs a registry/Trivy
+install most developers won't have).
 
 ## 3. What CI checks that `make ci` doesn't
 
 - `ruff format` — informational only, see `docs/ci-cd.md` §6; running
   `ruff format .` locally is safe and welcome, just not required.
-- `mypy` — same, informational; `make typecheck` runs it locally.
 - `gitleaks` — not distributed as a simple `pip install`; install
   separately (https://github.com/gitleaks/gitleaks#installing) if you
   want to run it locally before pushing. CI always runs it regardless.
