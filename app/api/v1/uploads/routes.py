@@ -101,6 +101,11 @@ async def initiate_upload(
         )
         check = await idempotency_service.check_or_begin(current_user.id, idempotency_key, fingerprint)
         if check.outcome is IdempotencyOutcome.REPLAY:
+            # `cached_status_code` is `int | None` in the dataclass because
+            # it's unset for every OTHER outcome — a REPLAY only ever
+            # exists because `IdempotencyService.complete()` previously
+            # wrote both fields together (Phase 12 mypy pass).
+            assert check.cached_status_code is not None
             return JSONResponse(status_code=check.cached_status_code, content=check.cached_body)
 
     try:
@@ -249,6 +254,11 @@ async def complete_upload(
         fingerprint = compute_fingerprint("chunked_upload_complete", str(upload_id))
         check = await idempotency_service.check_or_begin(current_user.id, idempotency_key, fingerprint)
         if check.outcome is IdempotencyOutcome.REPLAY:
+            # `cached_status_code` is `int | None` in the dataclass because
+            # it's unset for every OTHER outcome — a REPLAY only ever
+            # exists because `IdempotencyService.complete()` previously
+            # wrote both fields together (Phase 12 mypy pass).
+            assert check.cached_status_code is not None
             return JSONResponse(status_code=check.cached_status_code, content=check.cached_body)
 
     try:
