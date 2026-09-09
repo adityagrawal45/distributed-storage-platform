@@ -107,12 +107,12 @@ feature/* branch -> Pull Request into main
 .github/workflows/ci.yml   (every PR + every push to main)
   |
   +-- lint (ruff check)                      BLOCKING
-  +-- typecheck (mypy)                       informational
+  +-- typecheck (mypy)                       BLOCKING
   +-- secret-scan (gitleaks)                 BLOCKING
   +-- dependency-audit (pip-audit)           BLOCKING
   +-- bandit                                 BLOCKING
   +-- test (pytest, 449 tests)               BLOCKING
-  |     (all 5 BLOCKING jobs must pass ->)
+  |     (all 6 BLOCKING jobs must pass ->)
   v
   build-and-push
   +-- docker build
@@ -185,7 +185,7 @@ any of them or vice versa.
 | Container vulnerabilities | Trivy | the built image | **Yes** (CRITICAL/HIGH with a fix available) |
 | Code quality | `ruff check` | `.` | **Yes** (curated rule set — see §6) |
 | Formatting | `ruff format --check` | `.` | **No** — informational (see §6) |
-| Type checking | `mypy` | `app/` | **No** — informational (see §6) |
+| Type checking | `mypy` | `app/` | **Yes** (53 pre-existing findings — fixed, not suppressed; see §6) |
 
 ## 6. Lint/type/security scope — what's enforced, what's deferred, and why
 
@@ -200,6 +200,47 @@ reviewed (not blanket-suppressed) and falls into one of three buckets:
    `# nosec B110` annotations on already-documented "log, never raise"
    `except Exception: pass` sites). **449/449 tests still pass**
    after every fix — re-run and verified, not assumed.
+
+   **All 53 pre-existing `mypy` findings were also fixed this way**,
+   once CI actually ran and surfaced them as blocking (they were
+   initially shipped informational-only — see the git history on this
+   file — then fixed on request rather than left deferred). None
+   needed a behavior change or a blanket `# type: ignore`:
+   - A shared `app/database/redis.py::eval_script` wrapper resolves
+     `redis-py`'s stub declaring `Redis.eval`'s return as
+     `Awaitable[str] | str` regardless of client flavor or script —
+     one `cast`, three call sites (`distributed_lock.py`,
+     `rate_limiter.py`), documented in the wrapper's own docstring.
+   - `BaseRepository.get_by_id` (`app/repositories/base.py`) looks up
+     by `class_mapper(self.model).primary_key[0]` instead of
+     `self.model.id` — `Base` itself declares no `id` (each concrete
+     model does independently), and this is also more correct: it no
+     longer assumes every model's primary key column is literally
+     named `id`.
+   - `app/exceptions/handlers.py::_envelope` pins `APIResponse[None]`
+     explicitly — `data=None` alone doesn't tell mypy what `T` is.
+   - A handful of `assert`s narrow a real, already-true invariant mypy
+     can't see across a function/variable boundary — e.g.
+     `FileMetadataRepository.get_by_checksum` filters
+     `object_name.is_not(None)` at the QUERY level
+     (`app/services/file_upload_service.py`), and a chunk's
+     `status == VERIFIED` is only ever set alongside a real
+     `storage_reference` (`app/services/chunked_upload_service.py`).
+     Each assert's comment names the exact guarantee it's asserting.
+   - `CacheService | None` access after the `self._caching` PROPERTY
+     check (`metadata_service.py`/`folder_service.py`, 4 sites): bound
+     to a local variable and guarded directly (`if cache is None or
+     not cache.enabled:`) instead — mypy narrows a local's type after
+     an `is None` check, but doesn't see through an opaque property
+     call to narrow `self._cache` itself.
+   - `app/main.py::_register_handler` — a `TypeVar`-generic, one-`cast`
+     wrapper around `add_exception_handler` for the genuine parameter-
+     contravariance mismatch every FastAPI codebase with per-exception-
+     type handlers hits (Starlette's stub wants
+     `Callable[[Request, Exception], ...]`; each handler is correctly,
+     usefully typed against its own specific exception subclass).
+     Fixes all 20 `app/main.py` findings from one place instead of 20
+     scattered `# type: ignore`s.
 2. **Documented and suppressed at the exact site** — `pyproject.toml`'s
    `[tool.bandit]` skip list (B104/B608/B105/B108/B311/B101, each with
    a one-line "why this is safe in THIS codebase" reason) and 6
@@ -220,15 +261,6 @@ reviewed (not blanket-suppressed) and falls into one of three buckets:
      formatter config existed). Reformatting 59 files as a side effect
      of adding CI is out of scope and risky; kept as a visible,
      non-blocking signal instead.
-   - `mypy`: 53 pre-existing findings, mostly Starlette's own
-     exception-handler-registration variance (a well-known false-
-     positive pattern in FastAPI codebases — `add_exception_handler`'s
-     signature doesn't narrow to a specific exception subtype) and
-     `Optional`-narrowing mypy can't see through runtime guards for
-     (e.g. `self._cache` checked via a `_events_enabled`-style property
-     before use). Kept informational rather than either disabling mypy
-     entirely or spending this phase's budget re-typing 11 phases of
-     code.
    - `UP042`/`UP046`/`UP047` (pyupgrade `StrEnum`/PEP 695 generics),
      `SIM105` (`contextlib.suppress`), `RUF022` (deliberately
      phase-grouped `__all__` in `app/models/__init__.py`): pure
@@ -236,7 +268,9 @@ reviewed (not blanket-suppressed) and falls into one of three buckets:
 
 This is the honest state of lint/type debt in this codebase as of
 Phase 12 — a real baseline CI now protects going forward, not a claim
-that everything already conformed to it.
+that everything already conformed to it. `mypy` is the one tool of
+the three originally-deferred ("`ruff format`/`mypy`/`BLE001`-`S110`")
+that moved from deferred to fully fixed and blocking.
 
 ## 7. Immutable image tags (Phase 12 §12)
 
