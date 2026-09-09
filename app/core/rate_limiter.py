@@ -90,6 +90,7 @@ import redis.asyncio as redis
 from app.core.cache.keys import CacheKeyBuilder
 from app.core.config.settings import Settings
 from app.core.metrics import RATE_LIMIT_DECISIONS_TOTAL, safe_call
+from app.database.redis import eval_script
 from app.logging.logger import get_logger
 
 logger = get_logger(__name__)
@@ -304,7 +305,8 @@ class RateLimiter:
         ttl_ms = max(1000, int(rule.window_seconds * 2 * 1000))
 
         try:
-            raw = await self._client.eval(
+            raw = await eval_script(
+                self._client,
                 TOKEN_BUCKET_SCRIPT,
                 1,
                 key,
