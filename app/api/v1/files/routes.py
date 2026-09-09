@@ -99,6 +99,10 @@ async def upload_file(
         if check.outcome is IdempotencyOutcome.REPLAY:
             # Safe retry: return exactly what the original attempt returned
             # instead of re-executing the (non-idempotent) upload.
+            # `cached_status_code` is `int | None` in the dataclass only
+            # because it's unset for every OTHER outcome (Phase 12 mypy
+            # pass) — a REPLAY only exists because `complete()` wrote it.
+            assert check.cached_status_code is not None
             return JSONResponse(status_code=check.cached_status_code, content=check.cached_body)
 
     try:
