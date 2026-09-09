@@ -123,7 +123,11 @@ class FileProcessingWorker(BaseWorker):
         return self._storage
 
     def _is_thumbnailable(self, content_type: str | None) -> bool:
-        return bool(content_type) and content_type.lower() in self._settings.THUMBNAIL_SUPPORTED_CONTENT_TYPES
+        # `is not None` (not `bool(content_type)`) — mypy narrows the
+        # former on the right side of `and`, not the latter (Phase 12
+        # mypy pass); behaviorally identical either way since an empty
+        # string was never a valid content type.
+        return content_type is not None and content_type.lower() in self._settings.THUMBNAIL_SUPPORTED_CONTENT_TYPES
 
     async def process(self, envelope: EventEnvelope, session: AsyncSession) -> None:
         payload = envelope.payload
