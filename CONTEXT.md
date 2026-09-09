@@ -38,10 +38,14 @@ not a new design:
   (import sorting, `datetime.UTC`, redundant int casts in a test fake,
   a nested-if collapse, a ternary, 6 new `# nosec B110` annotations on
   already-documented "log, never raise" sites). `ruff format --check`
-  and `mypy` are informational-only this phase (59-file reformat and
-  53 mostly-false-positive findings respectively, catalogued not
-  fixed — see `docs/ci-cd.md` §6). Every fix re-verified against the
-  full 449-test suite.
+  is informational-only this phase (59-file reformat, out of scope —
+  see `docs/ci-cd.md` §6). `mypy`'s 53 pre-existing findings were
+  fixed on request after an initial informational-only pass (a shared
+  typed `Redis.eval` wrapper, a generic-repository primary-key lookup,
+  several documented `assert`s narrowing real invariants, and a
+  `cast`-based wrapper for `add_exception_handler`'s parameter-
+  contravariance) — `mypy` is now a blocking CI gate. Every fix
+  re-verified against the full 449-test suite.
 - **Security tools actually run for real** (not fabricated) against
   this codebase this session: `ruff`, `bandit`, `pip-audit`,
   `gitleaks` (downloaded a real binary since none was installed).
