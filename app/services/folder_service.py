@@ -177,10 +177,14 @@ class FolderService(OutboxEmitterMixin):
 
     async def get_folder_cached(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> FolderRead:
         """Cache-aside `get_folder`, returning the API schema. See module docstring on authorization."""
-        if not self._caching:
+        # See metadata_service.py's get_metadata_cached for why this is a
+        # local variable, not repeated `self._cache` access (Phase 12
+        # mypy pass: `self._caching` is a property, opaque to narrowing).
+        cache = self._cache
+        if cache is None or not cache.enabled:
             return FolderRead.model_validate(await self._get_owned_active(folder_id, owner_id))
 
-        key = self._cache.keys.folder(folder_id)
+        key = cache.keys.folder(folder_id)
 
         async def _load() -> dict:
             # Loaded WITHOUT the owner filter on purpose: the cached entry
@@ -195,9 +199,7 @@ class FolderService(OutboxEmitterMixin):
                 raise FolderNotFoundException()
             return FolderRead.model_validate(folder).model_dump(mode="json")
 
-        payload = await self._cache.get_or_set(
-            key, _load, self._cache.ttl_for(CacheEntity.FOLDER), entity=CacheEntity.FOLDER
-        )
+        payload = await cache.get_or_set(key, _load, cache.ttl_for(CacheEntity.FOLDER), entity=CacheEntity.FOLDER)
         return self._authorize_cached(payload, owner_id)
 
     async def list_children(
@@ -212,7 +214,8 @@ class FolderService(OutboxEmitterMixin):
         self, owner_id: uuid.UUID, parent_folder_id: uuid.UUID | None, params: FolderListParams
     ) -> list[FolderRead]:
         """Cache-aside children listing, keyed per folder AND per listing parameter set."""
-        if not self._caching:
+        cache = self._cache
+        if cache is None or not cache.enabled:
             folders = await self.list_children(owner_id, parent_folder_id, params)
             return [FolderRead.model_validate(f) for f in folders]
 
@@ -221,18 +224,16 @@ class FolderService(OutboxEmitterMixin):
             # non-owner never reaches the listing key at all.
             await self.get_folder_cached(parent_folder_id, owner_id)
 
-        key = self._cache.keys.folder_children(
-            parent_folder_id, owner_id, self._listing_params(params)
-        )
+        key = cache.keys.folder_children(parent_folder_id, owner_id, self._listing_params(params))
 
         async def _load() -> list[dict]:
             folders = await self._folders.list_children(owner_id, parent_folder_id, params)
             return [FolderRead.model_validate(f).model_dump(mode="json") for f in folders]
 
-        payload = await self._cache.get_or_set(
+        payload = await cache.get_or_set(
             key,
             _load,
-            self._cache.ttl_for(CacheEntity.FOLDER_CHILDREN),
+            cache.ttl_for(CacheEntity.FOLDER_CHILDREN),
             entity=CacheEntity.FOLDER_CHILDREN,
         )
         return [FolderRead.model_validate(item) for item in payload]
@@ -483,22 +484,23 @@ class FolderService(OutboxEmitterMixin):
         one navigation bar, on a request that is otherwise trivial. This
         is the single highest query-count-per-byte read in the API.
         """
-        if not self._caching:
+        cache = self._cache
+        if cache is None or not cache.enabled:
             return await self.get_breadcrumb(folder_id, owner_id)
 
         # Authorize first — the cached trail is keyed by folder only.
         await self.get_folder_cached(folder_id, owner_id)
 
-        key = self._cache.keys.folder_breadcrumbs(folder_id)
+        key = cache.keys.folder_breadcrumbs(folder_id)
 
         async def _load() -> list[dict]:
             items = await self.get_breadcrumb(folder_id, owner_id)
             return [item.model_dump(mode="json") for item in items]
 
-        payload = await self._cache.get_or_set(
+        payload = await cache.get_or_set(
             key,
             _load,
-            self._cache.ttl_for(CacheEntity.FOLDER_BREADCRUMBS),
+            cache.ttl_for(CacheEntity.FOLDER_BREADCRUMBS),
             entity=CacheEntity.FOLDER_BREADCRUMBS,
         )
         return [BreadcrumbItem.model_validate(item) for item in payload]
