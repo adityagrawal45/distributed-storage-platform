@@ -33,12 +33,12 @@ build:
 		-t nimbusfs-api:local .
 
 # The same gate sequence ci.yml runs, in the same order (fail fast on
-# lint before spending time on tests/security). NOT a guarantee CI
-# will pass (CI also runs the container scan, which needs a registry
-# and Trivy this target doesn't assume you have installed) — a
-# strong, fast local signal before pushing, not a full substitute.
-ci: lint test security
-	@echo "Local checks passed. CI additionally runs: mypy (informational), gitleaks, and a Trivy container scan."
+# lint/types before spending time on tests/security). NOT a guarantee
+# CI will pass (CI also runs the container scan, which needs a
+# registry and Trivy this target doesn't assume you have installed) —
+# a strong, fast local signal before pushing, not a full substitute.
+ci: lint typecheck test security
+	@echo "Local checks passed. CI additionally runs: gitleaks and a Trivy container scan."
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
