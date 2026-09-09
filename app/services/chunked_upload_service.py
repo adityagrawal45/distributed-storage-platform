@@ -600,7 +600,16 @@ class ChunkedUploadService(OutboxEmitterMixin):
                 f"Uploaded bytes ({total_uploaded_size}) do not match the declared total_size ({session.total_size})."
             )
 
-        source_object_names = [c.storage_reference for c in verified_chunks]
+        # `storage_reference` is nullable at the model level (a chunk row
+        # exists before its upload lands), but every chunk in
+        # `verified_chunks` has `status == VERIFIED`, which this
+        # codebase only ever sets alongside a real `storage_reference`
+        # (see `_write_chunk`) — a real, enforced invariant, not an
+        # assumption; the assert states it for mypy (Phase 12 mypy pass).
+        source_object_names: list[str] = []
+        for c in verified_chunks:
+            assert c.storage_reference is not None, f"verified chunk {c.chunk_number} has no storage_reference"
+            source_object_names.append(c.storage_reference)
         logger.info("upload_completing", upload_id=str(session.id), total_chunks=session.total_chunks)
 
         async def _do_compose():
