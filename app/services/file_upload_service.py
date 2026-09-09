@@ -215,8 +215,19 @@ class FileUploadService(OutboxEmitterMixin):
         duplicate_source = await self._files.get_by_checksum(owner_id, checksum)
         is_duplicate = duplicate_source is not None
 
-        if is_duplicate:
+        if duplicate_source is not None:
+            # Direct `is not None` check, not `if is_duplicate:` (Phase 12
+            # mypy pass) — mypy narrows on the checked expression itself;
+            # a separately-assigned bool derived from it doesn't carry
+            # the narrowing across to `duplicate_source` below, even
+            # though it's logically equivalent.
             logger.info("upload_deduplicated", owner_id=str(owner_id), checksum=checksum)
+            # `FileMetadataRepository.get_by_checksum` filters on
+            # `object_name.is_not(None)` at the query level — this is a
+            # real, query-enforced invariant, not an assumption; the
+            # assert states it for mypy, which can't see through the
+            # WHERE clause (Phase 12 mypy pass).
+            assert duplicate_source.object_name is not None
             object_name = duplicate_source.object_name
             bucket_name = duplicate_source.bucket_name
             etag = duplicate_source.etag
@@ -329,9 +340,17 @@ class FileUploadService(OutboxEmitterMixin):
         return file
 
     def stream(self, file: FileMetadata) -> AsyncIterator[bytes]:
+        # `object_name` is nullable at the model level (a file mid-upload
+        # has none yet), but every caller of `stream`/`download_range`/
+        # `get_signed_url` passes the result of `get_downloadable_file`
+        # above, which already raises unless `object_name` is truthy —
+        # the assert states that contract for mypy, which can't see it
+        # across the two methods' boundary (Phase 12 mypy pass).
+        assert file.object_name is not None
         return self._to_async_iterator(self._storage.stream_download(file.object_name))
 
     async def download_range(self, file: FileMetadata, start: int, end: int) -> bytes:
+        assert file.object_name is not None  # see stream()'s comment
         return await self._storage.download_range(file.object_name, start, end)
 
     @staticmethod
@@ -356,6 +375,7 @@ class FileUploadService(OutboxEmitterMixin):
         self, file_id: uuid.UUID, owner_id: uuid.UUID, expires_in_minutes: int | None
     ) -> str:
         file = await self.get_downloadable_file(file_id, owner_id)
+        assert file.object_name is not None  # see stream()'s comment
         return await self._storage.generate_signed_url(file.object_name, expiration_minutes=expires_in_minutes)
 
     # ------------------------------------------------------------------
