@@ -35,16 +35,24 @@ from app.exceptions.custom_exceptions import (
     UnsupportedFileTypeException,
 )
 from app.logging.logger import get_logger
-from app.schemas.response import APIResponse
+from app.schemas.response import APIResponse, ErrorDetail
 
 logger = get_logger(__name__)
 
 
 def _envelope(
-    request: Request, status_code: int, message: str, errors=None, headers: dict[str, str] | None = None
+    request: Request,
+    status_code: int,
+    message: str,
+    errors: list[ErrorDetail] | list[dict] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    body = APIResponse(
+    # Explicit `[None]` — `data=None` alone doesn't pin down `T` for
+    # mypy (every error response's `data` really is always `None`, but
+    # `None` type-checks against `T | None` for ANY `T`, so without
+    # this mypy has nothing to infer `T` from at all).
+    body = APIResponse[None](
         success=False,
         message=message,
         data=None,
