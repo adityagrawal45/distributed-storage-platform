@@ -3429,10 +3429,16 @@ new one:
   reviewed mechanical fixes — import sorting, `datetime.UTC`,
   redundant int casts, a handful of `# nosec`/documented-ignore
   annotations — 449/449 tests re-verified passing throughout), plus
-  `bandit`/`mypy` configuration. Deliberately-deferred findings
+  `bandit`/`mypy` configuration. `mypy`'s 53 pre-existing findings
+  were fixed outright, not suppressed (a shared typed `Redis.eval`
+  wrapper, a generic-repository lookup by mapper primary key, several
+  documented `assert`s narrowing real query/state invariants, and a
+  `cast`-based typed wrapper resolving `add_exception_handler`'s
+  parameter-contravariance mismatch) — `app/` now passes `mypy`
+  cleanly and it is a blocking CI gate. Deliberately-deferred findings
   (`BLE001`/`S110` broad-exception patterns, `ruff format`'s 59-file
-  reformat, 53 mostly-false-positive `mypy` findings) are catalogued,
-  not silently ignored — see `docs/ci-cd.md` §6.
+  reformat) remain catalogued, not silently ignored — see
+  `docs/ci-cd.md` §6.
 - **Terraform**: `versions.tf`'s already-anticipated GCS remote-state
   backend is documented as the concrete next step (bootstrap bucket +
   `terraform init -migrate-state`) but not executed (no real GCP
