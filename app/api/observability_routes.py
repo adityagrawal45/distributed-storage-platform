@@ -20,12 +20,32 @@ here — only the bounded-cardinality counters/histograms/gauges defined
 in `app/core/metrics.py`.
 """
 
+from collections.abc import Callable
+
 from fastapi import APIRouter, Response
 
 from app.core import metrics as app_metrics
 from app.database.session import engine
 
 router = APIRouter(tags=["Observability"])
+
+
+def _set_pool_gauge(state: str, getter: Callable[[], int]) -> None:
+    """
+    One gauge update, as its own named function rather than a lambda
+    (Phase 12 mypy pass): a lambda closing over a `for` loop's own
+    variables needs the `lambda x=x: ...` default-argument trick to
+    avoid late-binding to the loop's FINAL value — mypy cannot infer
+    that trick's parameter types from a `getattr(..., None)`-typed
+    tuple, and the trick itself is exactly the kind of "clever" code
+    this codebase otherwise avoids. A plain function called once per
+    loop iteration with `state`/`getter` as ordinary arguments has
+    neither problem.
+    """
+    app_metrics.safe_call(
+        lambda: app_metrics.DB_POOL_CONNECTIONS.labels(state=state).set(getter()),
+        operation="db_pool_gauge_update",
+    )
 
 
 def _update_pool_gauges() -> None:
@@ -45,10 +65,7 @@ def _update_pool_gauges() -> None:
     ):
         if getter is None:
             continue
-        app_metrics.safe_call(
-            lambda getter=getter, state=state: app_metrics.DB_POOL_CONNECTIONS.labels(state=state).set(getter()),
-            operation="db_pool_gauge_update",
-        )
+        _set_pool_gauge(state, getter)
 
 
 @router.get(
