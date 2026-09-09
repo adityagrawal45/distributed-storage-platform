@@ -63,23 +63,27 @@ jobs:
         run: ruff format --check . || true
 
   # ---------------------------------------------------------------
-  # Type check — informational for the same reason as ruff format:
-  # 53 pre-existing findings (mostly Starlette exception-handler
-  # variance and Optional-narrowing the runtime already guards) were
-  # found and catalogued (docs/ci-cd.md), not fixed, standing up CI
-  # itself. Kept in CI as a visible signal for new code, not as a gate
-  # that fails on Phase 1-11 debt.
+  # Type check — BLOCKING. The 53 findings this surfaced when CI was
+  # first stood up (mostly Starlette exception-handler variance and
+  # Optional-narrowing mypy couldn't see through a query filter/prior
+  # `raise` guard) were fixed, not suppressed — see pyproject.toml's
+  # [tool.mypy] docstring and docs/ci-cd.md §6 for what each fix
+  # actually was (a typed `eval` wrapper, a generic-repository lookup
+  # by mapper primary key instead of `.id`, several documented
+  # `assert`s narrowing a real invariant mypy can't see across a
+  # function boundary, and one `cast`-based typed wrapper around
+  # `add_exception_handler` for the parameter-contravariance issue
+  # every FastAPI exception handler hits). `app` now passes cleanly.
   # ---------------------------------------------------------------
   typecheck:
-    name: Type check (mypy, informational)
+    name: Type check (mypy)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - run: pip install -r requirements.txt mypy==1.13.0
+      - run: pip install -r requirements.txt mypy==2.3.0
       - run: mypy app
 
   # ---------------------------------------------------------------
@@ -161,7 +165,7 @@ jobs:
   build-and-push:
     name: Build, scan, and push image
     runs-on: ubuntu-latest
-    needs: [lint, secret-scan, dependency-audit, bandit, test]
+    needs: [lint, typecheck, secret-scan, dependency-audit, bandit, test]
     permissions:
       contents: read
       id-token: write
