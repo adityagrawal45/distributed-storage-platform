@@ -12,12 +12,15 @@ one interchangeable replica among N behind a load balancer (see
 CONTEXT.md / README §21 "Distributed Backend").
 """
 
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import TypeVar, cast
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import Response
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -198,6 +201,41 @@ async def lifespan(app: FastAPI):
     logger.info("application_shutdown_complete", instance_id=identity.instance_id)
 
 
+_ExcT = TypeVar("_ExcT", bound=Exception)
+
+
+def _register_handler(
+    application: FastAPI,
+    exc_class: type[_ExcT],
+    handler: Callable[[Request, _ExcT], Awaitable[Response]],
+) -> None:
+    """
+    Typed wrapper around `add_exception_handler` (Phase 12 mypy pass).
+
+    Every handler in `app/exceptions/handlers.py` is deliberately typed
+    against its OWN specific exception class (`exc:
+    AuthenticationException`, not `exc: Exception`) — that precision is
+    real and worth keeping: it's what lets each handler body reference
+    exception-specific attributes without an `isinstance` check or a
+    cast of its own. Starlette's `add_exception_handler` stub declares
+    its second parameter as `Callable[[Request, Exception], ...]`
+    (function parameters are contravariant, so a narrower-typed handler
+    is not structurally substitutable there) — mypy is correct that
+    `Callable[[Request, AuthenticationException], ...]` is not a
+    `Callable[[Request, Exception], ...]`, even though it's exactly
+    what Starlette needs: at runtime, Starlette only ever invokes a
+    registered handler with an instance of the class (or subclass) it
+    was registered for, never a bare `Exception`. This function is the
+    ONE place that documents and asserts that real, enforced contract
+    — via a single `cast`, exactly matched to what `exc_class` and
+    `handler` were called with — rather than a `# type: ignore` at each
+    of the ~20 registration call sites below.
+    """
+    application.add_exception_handler(
+        exc_class, cast(Callable[[Request, Exception], Awaitable[Response]], handler)
+    )
+
+
 def create_application() -> FastAPI:
     application = FastAPI(
         title=settings.APP_NAME,
@@ -252,27 +290,27 @@ def create_application() -> FastAPI:
     # registered exception type first, so subclasses are registered
     # before their parent classes where it matters).
     # ------------------------------------------------------------------
-    application.add_exception_handler(RequestValidationError, validation_exception_handler)
-    application.add_exception_handler(StarletteHTTPException, http_exception_handler)
-    application.add_exception_handler(AuthenticationException, authentication_exception_handler)
-    application.add_exception_handler(AuthorizationException, authorization_exception_handler)
-    application.add_exception_handler(NotFoundException, not_found_exception_handler)
-    application.add_exception_handler(IdempotencyKeyInProgressException, idempotency_key_in_progress_exception_handler)
-    application.add_exception_handler(IdempotencyKeyReplayedException, idempotency_key_replayed_exception_handler)
-    application.add_exception_handler(ConflictException, conflict_exception_handler)
-    application.add_exception_handler(FileTooLargeException, file_too_large_exception_handler)
-    application.add_exception_handler(UnsupportedFileTypeException, unsupported_file_type_exception_handler)
-    application.add_exception_handler(StorageObjectNotFoundException, storage_object_not_found_exception_handler)
-    application.add_exception_handler(StoragePermissionException, storage_permission_exception_handler)
-    application.add_exception_handler(StorageTimeoutException, storage_timeout_exception_handler)
-    application.add_exception_handler(StorageException, storage_exception_handler)
-    application.add_exception_handler(LockAcquisitionException, lock_acquisition_exception_handler)
-    application.add_exception_handler(CircuitBreakerOpenException, circuit_breaker_open_exception_handler)
-    application.add_exception_handler(ServiceUnavailableException, service_unavailable_exception_handler)
-    application.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_exception_handler)
-    application.add_exception_handler(NimbusFSException, domain_exception_handler)
-    application.add_exception_handler(SQLAlchemyError, sqlalchemy_exception_handler)
-    application.add_exception_handler(Exception, unhandled_exception_handler)
+    _register_handler(application, RequestValidationError, validation_exception_handler)
+    _register_handler(application, StarletteHTTPException, http_exception_handler)
+    _register_handler(application, AuthenticationException, authentication_exception_handler)
+    _register_handler(application, AuthorizationException, authorization_exception_handler)
+    _register_handler(application, NotFoundException, not_found_exception_handler)
+    _register_handler(application, IdempotencyKeyInProgressException, idempotency_key_in_progress_exception_handler)
+    _register_handler(application, IdempotencyKeyReplayedException, idempotency_key_replayed_exception_handler)
+    _register_handler(application, ConflictException, conflict_exception_handler)
+    _register_handler(application, FileTooLargeException, file_too_large_exception_handler)
+    _register_handler(application, UnsupportedFileTypeException, unsupported_file_type_exception_handler)
+    _register_handler(application, StorageObjectNotFoundException, storage_object_not_found_exception_handler)
+    _register_handler(application, StoragePermissionException, storage_permission_exception_handler)
+    _register_handler(application, StorageTimeoutException, storage_timeout_exception_handler)
+    _register_handler(application, StorageException, storage_exception_handler)
+    _register_handler(application, LockAcquisitionException, lock_acquisition_exception_handler)
+    _register_handler(application, CircuitBreakerOpenException, circuit_breaker_open_exception_handler)
+    _register_handler(application, ServiceUnavailableException, service_unavailable_exception_handler)
+    _register_handler(application, RateLimitExceeded, rate_limit_exceeded_exception_handler)
+    _register_handler(application, NimbusFSException, domain_exception_handler)
+    _register_handler(application, SQLAlchemyError, sqlalchemy_exception_handler)
+    _register_handler(application, Exception, unhandled_exception_handler)
 
     # ------------------------------------------------------------------
     # Routes
