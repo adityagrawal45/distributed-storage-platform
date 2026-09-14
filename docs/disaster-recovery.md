@@ -345,6 +345,12 @@ infrastructure, but it is the mechanism region-level failover reuses:
 
 ## 9. Failover runbook (manual, warm standby → active)
 
+**Phase 12 update**: steps 4 and 6 below (redeploying the region-
+agnostic manifests, then running startup verification) are now backed
+by the same CI/CD pipeline as a normal deploy — see
+`docs/disaster-recovery-deployment.md` for exactly which runbook steps
+that covers and which remain deliberately manual.
+
 **Label: STAGING/PRODUCTION-scale procedure — never rehearse this
 against a real production primary without an explicit maintenance
 window; rehearse in a dedicated STAGING project first (see failure-
