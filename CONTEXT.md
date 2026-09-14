@@ -1,6 +1,55 @@
 # NimbusFS — Project Context
 
-Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10; updated 2026-09-06 after completing Phase 11; updated 2026-09-08 after completing Phase 12.
+Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10; updated 2026-09-06 after completing Phase 11; updated 2026-09-08 after completing Phase 12; updated 2026-09-14 after a Phase 12 supply-chain/coverage/DR-deployment addendum.
+
+## Phase 12 addendum (2026-09-14): supply chain, coverage gate, DR-deployment mapping
+
+A second Phase 12 pass (re-inspecting the already-complete pipeline
+against a broader restatement of the same brief) found the core
+pipeline unchanged and correct, and closed four specific gaps rather
+than redoing anything:
+
+- **Test coverage is now a real, measured, blocking gate**: `pytest
+  --cov=app` was actually run — **82.37% overall**, MEASURED — and
+  `--cov-fail-under=75` is enforced in both `ci.yml`'s `test` job and
+  `make test`. Documented honestly in `docs/ci-cd.md` §6: coverage is
+  NOT even across the modules the brief calls out as critical
+  (`auth_service.py` 56%, `folder_service.py` 44%,
+  `metadata_service.py` 46%, `chunked_upload_service.py` 57%) — a real
+  gap for a dedicated testing pass, not papered over by the passing
+  global number.
+- **SBOM generation** (CycloneDX, via Trivy) added to `ci.yml`'s
+  `build-and-push` job for every PR and push, uploaded as a workflow
+  artifact — visibility, not a registry.
+- **Keyless artifact signing** (Sigstore `cosign`, via GitHub Actions'
+  own OIDC token — no new key/secret/IAM identity) added for images
+  pushed to Artifact Registry on `main`, signing the image digest.
+- **New: `docs/disaster-recovery-deployment.md`** — maps Phase 9's
+  9-step DR failover runbook (`docs/disaster-recovery.md` §9) against
+  the now-existing pipeline: steps 4 (redeploy region-agnostic
+  manifests) and 6 (startup verification) are now backed by
+  `scripts/ci-deploy.sh`/`scripts/k8s-smoke-test.sh`; the data-restore,
+  Secret Manager, DNS, and incident-declaration steps remain
+  deliberately manual, exactly as Phase 9 designed. `docs/environments.md`
+  was deliberately NOT created as a separate file — `docs/deployment.md`
+  §1 already covers the dev/staging/production environment model in
+  depth, and the brief's own anti-duplication instruction governed
+  that call.
+- Explicit vulnerability severity policy (CRITICAL/HIGH block, MEDIUM/
+  LOW tracked-not-blocking) documented in `docs/ci-cd.md` §10, matching
+  the CI behavior that was already implemented but not previously
+  spelled out as a policy in its own right.
+- `.gitignore` gained `.mypy_cache/`/`.ruff_cache/`/`.coverage`/`htmlcov/`
+  — a real, small pre-existing gap (these were never committed, but
+  were also never explicitly ignored).
+- Re-verified: `ruff check .`, `mypy app`, `bandit`, and the full
+  449-test suite (now with coverage) all still pass after every change
+  in this addendum.
+- **Nothing new in this addendum was run against real infrastructure**
+  — SBOM generation and image signing are DESIGNED only (no Docker
+  daemon available this session, same constraint as the original
+  Phase 12 pass); the DR-deployment mapping is an analysis of existing
+  code, not a rehearsed recovery.
 
 ## Phase 12 (2026-09-08): CI/CD, Infrastructure as Code, GitOps & Release Engineering
 
