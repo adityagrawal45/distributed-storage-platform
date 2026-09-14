@@ -140,6 +140,22 @@ feature/* branch -> Pull Request into main
 run independently of the above — see `docs/infrastructure.md` and
 `docs/rollback.md` respectively.
 
+**Test pyramid, honestly** (Phase 12 §8): the 449-test suite is
+overwhelmingly INTEGRATION-shaped, not a formal unit/integration/E2E
+split — most tests drive the real FastAPI app through `httpx.AsyncClient`
+against real route/service/repository code, with only the process
+boundary (Postgres, Redis, GCS, Pub/Sub) faked (`tests/conftest.py`,
+`tests/fakes/`). A smaller subset are true unit tests of pure logic in
+isolation (`app/core/retry.py`, `circuit_breaker.py`, `path_utils.py`).
+There is no E2E tier (a real cluster, real GCP) — that would require
+infrastructure this project has never had access to in any session.
+This works here specifically BECAUSE the fakes are real in-memory
+implementations of the actual wire protocol (not mocks asserting call
+counts), not despite skipping a "real" integration tier — the whole
+suite still runs in ~2 minutes with no external services, which is
+what keeps `ci.yml`'s `test` job fast enough to run on every single PR
+rather than being gated behind a slower, separate "integration" label.
+
 ## 4. Authentication (Phase 12 §15-16)
 
 No GCP service-account JSON key exists anywhere in this repository,
@@ -186,6 +202,9 @@ any of them or vice versa.
 | Code quality | `ruff check` | `.` | **Yes** (curated rule set — see §6) |
 | Formatting | `ruff format --check` | `.` | **No** — informational (see §6) |
 | Type checking | `mypy` | `app/` | **Yes** (53 pre-existing findings — fixed, not suppressed; see §6) |
+| Test coverage | `pytest-cov` | `app/` | **Yes** — 75% floor (measured baseline: 82%; see §6) |
+| SBOM generation | Trivy (`cyclonedx` format) | the built image | No — visibility only, every PR+push (see §11) |
+| Artifact signing | `cosign` (keyless/Sigstore) | the pushed image, main only | N/A — provenance, not a pass/fail gate (see §11) |
 
 ## 6. Lint/type/security scope — what's enforced, what's deferred, and why
 
@@ -265,6 +284,25 @@ reviewed (not blanket-suppressed) and falls into one of three buckets:
      `SIM105` (`contextlib.suppress`), `RUF022` (deliberately
      phase-grouped `__all__` in `app/models/__init__.py`): pure
      modernization/style, ignored in `pyproject.toml` with reasons.
+4. **Measured and set as a real, non-trivial gate** — test coverage.
+   `pytest --cov=app` was run for real against the actual 449-test
+   suite: **82% overall**, MEASURED, not assumed. The CI/`make test`
+   floor is set to **75%** (not 100% — Phase 12 §9 explicitly warns
+   against an arbitrary maximal target), a genuine margin below the
+   measured baseline rather than a number picked to always pass.
+   Coverage is NOT evenly distributed across the specific areas §9
+   calls out as deserving focus: `auth_service.py` 56%,
+   `folder_service.py` 44%, `metadata_service.py` 46%,
+   `chunked_upload_service.py` 57%, `version_service.py` 62%. Every
+   one of these IS exercised by integration tests through the real
+   HTTP API (`test_login.py`, `test_folders.py`, `test_metadata.py`,
+   `test_chunked_upload.py`) — the uncovered lines are disproportionately
+   error/retry/admin-only branches, not the primary success path — but
+   that is a real, honest gap against the brief's own stated priority,
+   not a claim that these modules are thoroughly tested. Left as a
+   catalogued gap for a dedicated testing pass, exactly like the
+   `BLE001`/`S110` gap above; writing new tests to close it is a
+   larger, separate effort than standing up the coverage GATE itself.
 
 This is the honest state of lint/type debt in this codebase as of
 Phase 12 — a real baseline CI now protects going forward, not a claim
@@ -306,7 +344,56 @@ truth for "what gets deployed." Fixing the human script's scope was
 deliberately left alone — a smaller, separate, easily-reviewable
 change from "add CI," not folded in as a silent side effect.
 
-## 10. Implementation status
+## 10. Supply-chain security: SBOM, signing, and the severity policy (Phase 12 §11, §14)
+
+Added on top of the security gates in §5, both in `ci.yml`'s
+`build-and-push` job:
+
+**Vulnerability severity policy** (Phase 12 §11 — "define handling for
+CRITICAL/HIGH/MEDIUM/LOW"):
+
+| Severity | Policy |
+|---|---|
+| CRITICAL / HIGH (fix available) | **Blocks the build**, always, no override in CI itself. `ignore-unfixed: true` so an upstream-unpatched base-image finding doesn't permanently wedge every build — the same reasoning `docs/security/dependency-audit.md` already applies to `pip-audit`. |
+| MEDIUM / LOW | **Not a blocking gate.** Still visible in the Trivy scan step's own log for every run. Triaged like any other accepted-risk finding — via the same "documented, reviewed, one-line reason" pattern `pyproject.toml`'s `[tool.bandit]`/`[tool.ruff.lint]` sections and `docs/security/dependency-audit.md`'s CVE allow-list already use — rather than either auto-failing on routinely-low-exploitability findings or silently ignoring them. No MEDIUM/LOW container findings have been triaged into that allow-list yet; none has been found to date (Trivy has never actually been run against a built image this session — see §11 below). |
+| An exception is needed | Documented at the exact point of suppression (a `pyproject.toml` skip entry, a `--ignore-vuln`, a `# nosec`), never a blanket `--severity` downgrade or a disabled step. |
+
+**SBOM (Software Bill of Materials)**: every build (PR and push alike)
+generates a CycloneDX SBOM via Trivy and uploads it as a workflow-run
+artifact (`actions/upload-artifact`, 90-day retention). This is
+deliberately the SIMPLEST version of "have an SBOM" that's genuinely
+useful — a PR reviewer or an incident responder can download the exact
+dependency manifest for the exact commit in question — without
+standing up a dedicated SBOM registry/database, which nothing about
+NimbusFS's current scale or threat model justifies yet (Phase 12's own
+"do not add complexity without justification" instruction, applied
+here the same way Phase 11 applied it to Prometheus/Grafana).
+
+**Artifact signing**: every image pushed to Artifact Registry (main
+branch only) is signed, keyless, via `sigstore/cosign-installer` +
+`cosign sign`. "Keyless" is the specific reason this was judged worth
+adding rather than deferred: it costs no new secret, key, or IAM
+identity to manage — the signature is bound to the GitHub Actions
+OIDC token that already exists for this exact workflow run (the same
+mechanism, applied to a different purpose, as the WIF authentication
+already used for every GCP call in this pipeline), and is publicly
+verifiable against Sigstore's Rekor transparency log. Signs the image
+**digest**, not the mutable `:<sha>` tag pointer, so the signature is
+bound to the exact bytes, independent of whatever the tag happens to
+resolve to later.
+
+**What this deliberately is NOT**: a full provenance/attestation
+system (e.g. SLSA Build Level 3 in-toto attestations tying the
+signature to the exact build inputs/steps), a private/paid container-
+scanning SaaS, or a policy-enforcement admission controller in GKE
+that actually REQUIRES a valid cosign signature before a Pod can run
+(Kyverno/Gatekeeper policy — a real, reasonable next step once a
+cluster exists to enforce it against; not added now because there is
+no cluster to test it against, and an unenforced policy is a false
+sense of security). Recorded as a deliberate scope boundary, not an
+oversight.
+
+## 11. Implementation status
 
 | Capability | Status |
 |---|---|
@@ -316,3 +403,7 @@ change from "add CI," not folded in as a silent side effect.
 | Staging/production deploy workflows | DESIGNED — NOT executed against a real cluster |
 | Rollback | DESIGNED — `kubectl rollout undo` is Kubernetes' own documented rollback mechanism; NEITHER it nor this phase's wrapper scripts (`scripts/ci-rollback.sh`) have been executed against a real cluster in this or any prior session (no real cluster has ever been reachable — see `docs/deployment.md` §6) |
 | Terraform plan/apply pipeline | DESIGNED — NOT validated with a real `terraform` binary this session (none installed) |
+| Test coverage gate | IMPLEMENTED, MEASURED — `pytest --cov=app` actually run this session; 82% real baseline, 75% floor enforced |
+| Type-check gate (mypy) | IMPLEMENTED, TESTED — all 53 pre-existing findings fixed for real and re-verified; `app` passes `mypy` cleanly, gate is blocking |
+| SBOM generation | DESIGNED (workflow written, schema-reviewed) — NOT executed this session (same no-Docker-daemon constraint as the Trivy scan itself) |
+| Artifact signing (cosign) | DESIGNED — NOT executed this session; no image was ever built or pushed to sign |
