@@ -4,7 +4,7 @@
 .PHONY: install lint format security test build ci clean
 
 install:
-	pip install -r requirements.txt
+	pip install -r requirements.txt ruff==0.16.0 mypy==2.3.0 bandit==1.9.4 pip-audit==2.10.1 pytest-cov==7.1.0
 
 lint:
 	ruff check .
@@ -24,7 +24,7 @@ security:
 	@echo "(gitleaks not run here — install separately: https://github.com/gitleaks/gitleaks#installing. CI always runs it.)"
 
 test:
-	pytest -q
+	pytest -q --cov=app --cov-report=term-missing --cov-fail-under=75
 
 build:
 	docker build -f docker/Dockerfile \
@@ -42,4 +42,4 @@ ci: lint typecheck test security
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	rm -rf .pytest_cache .ruff_cache .mypy_cache
+	rm -rf .pytest_cache .ruff_cache .mypy_cache .coverage
