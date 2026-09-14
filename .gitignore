@@ -4,6 +4,10 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Phase 5: real Kubernetes Secret manifest — never commit actual
 # secrets. Copy k8s/06-secret.example.yaml to k8s/06-secret.yaml
