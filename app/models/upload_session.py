@@ -60,9 +60,15 @@ class UploadSession(Base, AuditMixin):
         Index("ix_upload_sessions_owner_id", "owner_id"),
         Index("ix_upload_sessions_status", "status"),
         Index("ix_upload_sessions_owner_status", "owner_id", "status"),
+        Index("ix_upload_sessions_organization_id", "organization_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Phase 13 tenant boundary — see Folder.organization_id's docstring.
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
 
     owner_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
