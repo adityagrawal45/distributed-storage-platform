@@ -156,10 +156,32 @@ class CacheKeyBuilder:
         return self._key("file", file_id) + "*"
 
     # -- search --------------------------------------------------------
-    def search(self, owner_id: uuid.UUID | str, params: dict[str, Any]) -> str:
-        return self._key("search", owner_id, _fingerprint(params))
+    def search(self, owner_id: uuid.UUID | str, organization_id: uuid.UUID | str, params: dict[str, Any]) -> str:
+        """
+        `organization_id` (Phase 13) is a REQUIRED structural key
+        segment, same reasoning as `owner_id` — a user belonging to
+        more than one organization must never have Organization A's
+        cached search results served back to them while acting in
+        Organization B's context just because the query text and
+        owner_id happened to match. Without this, two organizations
+        sharing one member would be a real, exploitable cross-tenant
+        cache leak (Phase 13 §33), not merely a correctness bug.
+        """
+        return self._key("search", owner_id, organization_id, _fingerprint(params))
 
     def search_pattern(self, owner_id: uuid.UUID | str) -> str:
+        """
+        Deliberately still keyed by `owner_id` ALONE (unlike `search()`
+        above) — invalidation is safe to be BROADER than strictly
+        necessary (it just means an extra cache miss), where the READ
+        path (`search()`) must never be broader than strictly correct.
+        `nimbusfs:search:{owner_id}:*` matches every organization's
+        cached search results for this owner, so any file mutation
+        clears all of them regardless of which organization the
+        mutation happened in — simpler than threading `organization_id`
+        through every `CacheInvalidator` call site for a purely
+        defensive, over-inclusive operation.
+        """
         return self._key("search", owner_id) + ":*"
 
     # -- coordination --------------------------------------------------
