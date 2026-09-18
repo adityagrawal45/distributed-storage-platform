@@ -88,6 +88,7 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
         causation_id: uuid.UUID | None,
         user_id: uuid.UUID,
         payload: dict,
+        organization_id: uuid.UUID | None = None,
     ) -> OutboxEvent:
         """
         Inserts one PENDING outbox row into the CALLER'S transaction.
@@ -105,6 +106,7 @@ class OutboxRepository(BaseRepository[OutboxEvent]):
             causation_id=causation_id,
             user_id=user_id,
             payload=payload,
+            organization_id=organization_id,
             status=OutboxEventStatus.PENDING,
             attempt_count=0,
         )
