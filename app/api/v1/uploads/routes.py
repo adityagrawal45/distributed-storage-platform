@@ -24,6 +24,7 @@ from app.core.config import get_settings
 from app.core.enums import UploadSessionStatus
 from app.core.rate_limiter import RateLimitCategory
 from app.dependencies.auth import CurrentUser
+from app.dependencies.organization import CurrentOrganization
 from app.dependencies.providers import ChunkedUploadServiceDep, IdempotencyServiceDep
 from app.dependencies.rate_limit import rate_limit
 from app.exceptions.custom_exceptions import ChunkSizeInvalidException
@@ -90,6 +91,7 @@ async def _read_body_bounded(request: Request, max_bytes: int) -> bytes:
 )
 async def initiate_upload(
     current_user: CurrentUser,
+    org: CurrentOrganization,
     upload_service: ChunkedUploadServiceDep,
     idempotency_service: IdempotencyServiceDep,
     body: UploadInitiateRequest,
@@ -111,6 +113,7 @@ async def initiate_upload(
     try:
         session = await upload_service.initiate_upload(
             current_user.id,
+            org.organization_id,
             filename=body.filename,
             total_size=body.size,
             mime_type=body.mime_type,
@@ -151,10 +154,11 @@ async def initiate_upload(
 )
 async def get_upload_status(
     current_user: CurrentUser,
+    org: CurrentOrganization,
     upload_service: ChunkedUploadServiceDep,
     upload_id: uuid.UUID = Path(...),
 ) -> APIResponse[UploadProgressRead]:
-    progress = await upload_service.get_progress(upload_id, current_user.id)
+    progress = await upload_service.get_progress(upload_id, current_user.id, org.organization_id)
     session = progress.session
     data = UploadProgressRead(
         upload_id=session.id,
@@ -180,10 +184,11 @@ async def get_upload_status(
 )
 async def list_upload_chunks(
     current_user: CurrentUser,
+    org: CurrentOrganization,
     upload_service: ChunkedUploadServiceDep,
     upload_id: uuid.UUID = Path(...),
 ) -> APIResponse[list[ChunkRead]]:
-    chunks = await upload_service.list_chunks(upload_id, current_user.id)
+    chunks = await upload_service.list_chunks(upload_id, current_user.id, org.organization_id)
     return APIResponse(
         message="Chunks retrieved.", data=[ChunkRead.model_validate(chunk) for chunk in chunks]
     )
@@ -203,6 +208,7 @@ async def list_upload_chunks(
 async def upload_chunk(
     request: Request,
     current_user: CurrentUser,
+    org: CurrentOrganization,
     upload_service: ChunkedUploadServiceDep,
     upload_id: uuid.UUID = Path(...),
     chunk_number: int = Path(..., ge=1),
@@ -212,9 +218,9 @@ async def upload_chunk(
     data = await _read_body_bounded(request, settings.CHUNK_MAX_SIZE_BYTES)
 
     chunk = await upload_service.upload_chunk(
-        upload_id, current_user.id, chunk_number, data, declared_checksum=x_chunk_checksum
+        upload_id, current_user.id, org.organization_id, chunk_number, data, declared_checksum=x_chunk_checksum
     )
-    progress = await upload_service.get_progress(upload_id, current_user.id)
+    progress = await upload_service.get_progress(upload_id, current_user.id, org.organization_id)
 
     return APIResponse(
         message="Chunk uploaded successfully.",
@@ -245,6 +251,7 @@ async def upload_chunk(
 )
 async def complete_upload(
     current_user: CurrentUser,
+    org: CurrentOrganization,
     upload_service: ChunkedUploadServiceDep,
     idempotency_service: IdempotencyServiceDep,
     upload_id: uuid.UUID = Path(...),
@@ -262,7 +269,7 @@ async def complete_upload(
             return JSONResponse(status_code=check.cached_status_code, content=check.cached_body)
 
     try:
-        file = await upload_service.complete_upload(upload_id, current_user.id, current_user.id)
+        file = await upload_service.complete_upload(upload_id, current_user.id, org.organization_id, current_user.id)
     except Exception:
         if idempotency_key:
             await idempotency_service.fail(current_user.id, idempotency_key)
@@ -296,10 +303,11 @@ async def complete_upload(
 )
 async def cancel_upload(
     current_user: CurrentUser,
+    org: CurrentOrganization,
     upload_service: ChunkedUploadServiceDep,
     upload_id: uuid.UUID = Path(...),
 ) -> APIResponse[UploadCancelResponse]:
-    session = await upload_service.cancel_upload(upload_id, current_user.id)
+    session = await upload_service.cancel_upload(upload_id, current_user.id, org.organization_id)
     return APIResponse(
         message="Upload cancelled.",
         data=UploadCancelResponse(upload_id=session.id, status=session.status, cancelled_at=session.cancelled_at),
@@ -313,8 +321,9 @@ async def cancel_upload(
 )
 async def delete_upload(
     current_user: CurrentUser,
+    org: CurrentOrganization,
     upload_service: ChunkedUploadServiceDep,
     upload_id: uuid.UUID = Path(...),
 ) -> APIResponse[None]:
-    await upload_service.delete_upload(upload_id, current_user.id)
+    await upload_service.delete_upload(upload_id, current_user.id, org.organization_id)
     return APIResponse(message="Upload session deleted.")
