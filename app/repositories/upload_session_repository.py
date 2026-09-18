@@ -22,8 +22,16 @@ from app.repositories.base import BaseRepository
 class UploadSessionRepository(BaseRepository[UploadSession]):
     model = UploadSession
 
-    async def get_owned(self, upload_id: uuid.UUID, owner_id: uuid.UUID) -> UploadSession | None:
+    async def get_owned(
+        self, upload_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> UploadSession | None:
+        """`organization_id` required (Phase 13) — see `FolderRepository.get_active_by_id`'s docstring
+        for why this is a required parameter, not an optional filter."""
         result = await self._session.execute(
-            select(UploadSession).where(UploadSession.id == upload_id, UploadSession.owner_id == owner_id)
+            select(UploadSession).where(
+                UploadSession.id == upload_id,
+                UploadSession.owner_id == owner_id,
+                UploadSession.organization_id == organization_id,
+            )
         )
         return result.scalar_one_or_none()
