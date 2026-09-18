@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from app.core.config import get_settings
 from app.core.enums import AuditEventType, AuditResult
 from app.dependencies.auth import CurrentUser
+from app.dependencies.organization import CurrentOrganization
 from app.dependencies.providers import AuditServiceDep, FileUploadServiceDep, IdempotencyServiceDep
 from app.exceptions.custom_exceptions import ValidationException
 from app.schemas.file_metadata import FileMetadataRead, FileUploadResponse, SignedUrlResponse
@@ -85,6 +86,7 @@ def _parse_range_header(range_header: str, total_size: int) -> tuple[int, int]:
 )
 async def upload_file(
     current_user: CurrentUser,
+    org: CurrentOrganization,
     file_upload_service: FileUploadServiceDep,
     idempotency_service: IdempotencyServiceDep,
     file: UploadFile = File(...),
@@ -106,7 +108,9 @@ async def upload_file(
             return JSONResponse(status_code=check.cached_status_code, content=check.cached_body)
 
     try:
-        file_metadata, is_duplicate = await file_upload_service.upload_file(current_user.id, folder_id, file)
+        file_metadata, is_duplicate = await file_upload_service.upload_file(
+            current_user.id, org.organization_id, folder_id, file
+        )
     except Exception:
         if idempotency_key:
             # Release the claim so a genuine failure (e.g. transient GCS
@@ -141,15 +145,17 @@ async def upload_file(
 async def download_file(
     file_id: uuid.UUID,
     current_user: CurrentUser,
+    org: CurrentOrganization,
     file_upload_service: FileUploadServiceDep,
     audit_service: AuditServiceDep,
     request: Request,
 ):
-    file = await file_upload_service.get_downloadable_file(file_id, current_user.id)
+    file = await file_upload_service.get_downloadable_file(file_id, current_user.id, org.organization_id)
     await audit_service.record(
         AuditEventType.FILE_DOWNLOAD,
         result=AuditResult.SUCCESS,
         actor_user_id=current_user.id,
+        organization_id=org.organization_id,
         resource_type="file",
         resource_id=file_id,
         ip_address=_client_ip(request),
@@ -193,6 +199,7 @@ async def download_file(
 async def get_signed_url(
     file_id: uuid.UUID,
     current_user: CurrentUser,
+    org: CurrentOrganization,
     file_upload_service: FileUploadServiceDep,
     audit_service: AuditServiceDep,
     request: Request,
@@ -202,16 +209,18 @@ async def get_signed_url(
 ) -> APIResponse[SignedUrlResponse]:
     settings = get_settings()
     # `get_signed_url` calls `get_downloadable_file` internally FIRST
-    # (ownership check via `get_active_by_id(file_id, owner_id)`), so a
-    # request for another user's file never reaches URL generation at
+    # (ownership+tenant check via `get_active_by_id(file_id, owner_id,
+    # organization_id)` — Phase 13 §20), so a request for another
+    # user's OR another tenant's file never reaches URL generation at
     # all — this audit call only runs once that authorization has
     # already passed. Never logs the URL itself (a bearer credential —
     # see AuditService's class docstring), only that one was issued.
-    url = await file_upload_service.get_signed_url(file_id, current_user.id, expires_in_minutes)
+    url = await file_upload_service.get_signed_url(file_id, current_user.id, org.organization_id, expires_in_minutes)
     await audit_service.record(
         AuditEventType.FILE_DOWNLOAD,
         result=AuditResult.SUCCESS,
         actor_user_id=current_user.id,
+        organization_id=org.organization_id,
         resource_type="file",
         resource_id=file_id,
         ip_address=_client_ip(request),
@@ -231,10 +240,11 @@ async def get_signed_url(
 async def replace_file(
     file_id: uuid.UUID,
     current_user: CurrentUser,
+    org: CurrentOrganization,
     file_upload_service: FileUploadServiceDep,
     file: UploadFile = File(...),
 ) -> APIResponse[FileMetadataRead]:
-    updated = await file_upload_service.replace_file(file_id, current_user.id, file, current_user.id)
+    updated = await file_upload_service.replace_file(file_id, current_user.id, org.organization_id, file, current_user.id)
     return APIResponse(message="File replaced successfully.", data=FileMetadataRead.model_validate(updated))
 
 
@@ -244,7 +254,7 @@ async def replace_file(
     summary="Permanently delete a trashed file: removes its bytes from storage and its metadata row",
 )
 async def permanent_delete_file(
-    file_id: uuid.UUID, current_user: CurrentUser, file_upload_service: FileUploadServiceDep
+    file_id: uuid.UUID, current_user: CurrentUser, org: CurrentOrganization, file_upload_service: FileUploadServiceDep
 ) -> APIResponse[None]:
-    await file_upload_service.permanent_delete(file_id, current_user.id)
+    await file_upload_service.permanent_delete(file_id, current_user.id, org.organization_id)
     return APIResponse(message="File permanently deleted from storage and metadata.")
