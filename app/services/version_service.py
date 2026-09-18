@@ -37,20 +37,25 @@ class VersionService:
         self._cache = cache
         self._invalidator = invalidator
 
-    async def list_versions(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> list[FileVersion]:
-        file = await self._files.get_active_by_id(file_id, owner_id)
+    async def list_versions(self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[FileVersion]:
+        file = await self._files.get_active_by_id(file_id, owner_id, organization_id)
         if file is None:
             raise FileNotFoundException()
         return await self._versions.list_for_file(file_id)
 
-    async def list_versions_cached(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> list[FileVersionRead]:
+    async def list_versions_cached(
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> list[FileVersionRead]:
         if self._cache is None or not self._cache.enabled:
-            return [FileVersionRead.model_validate(v) for v in await self.list_versions(file_id, owner_id)]
+            return [
+                FileVersionRead.model_validate(v)
+                for v in await self.list_versions(file_id, owner_id, organization_id)
+            ]
 
-        # Ownership is enforced here, against Postgres, and is NOT what is
-        # being cached: the version list is only reachable once this
-        # ownership-filtered lookup has already succeeded.
-        file = await self._files.get_active_by_id(file_id, owner_id)
+        # Ownership+tenant is enforced here, against Postgres, and is NOT
+        # what is being cached: the version list is only reachable once
+        # this ownership-filtered lookup has already succeeded.
+        file = await self._files.get_active_by_id(file_id, owner_id, organization_id)
         if file is None:
             raise FileNotFoundException()
 
