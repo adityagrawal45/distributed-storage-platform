@@ -43,6 +43,7 @@ class AuditLog(Base):
         Index("ix_audit_logs_event_type", "event_type"),
         Index("ix_audit_logs_resource", "resource_type", "resource_id"),
         Index("ix_audit_logs_created_at", "created_at"),
+        Index("ix_audit_logs_organization_id", "organization_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -83,6 +84,19 @@ class AuditLog(Base):
 
     resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     resource_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    # Phase 13: nullable — platform-level events (LOGIN_SUCCESS/FAILURE,
+    # a platform admin's cross-tenant action) have no single owning
+    # tenant; every organization-scoped event (MEMBER_ADDED,
+    # PERMISSION_GRANTED, SHARE_CREATED, ...) sets it, which is what
+    # lets `AuditLogRepository.search` filter to exactly one
+    # organization's events (Phase 13 §27) with an indexed equality
+    # check instead of joining out to whatever resource_id happens to
+    # point at. ON DELETE SET NULL, not CASCADE — deleting/purging an
+    # organization must never delete the audit trail OF that deletion.
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True
+    )
 
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
