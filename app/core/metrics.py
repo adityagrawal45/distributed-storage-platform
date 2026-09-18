@@ -207,6 +207,51 @@ WORKER_JOBS_TOTAL = Counter(
 )
 
 # ---------------------------------------------------------------------
+# Multi-tenancy / sharing / administration (Phase 13)
+# ---------------------------------------------------------------------
+# Deliberately NOT labeled by organization_id/user_id/resource_id/
+# request_id (Phase 13 §41's explicit warning, the same cardinality
+# discipline every metric above already follows) — those identifiers
+# belong in logs (every event below also gets a structured log line
+# with the real ID) and in the audit trail (`AuditLog`), not in a
+# Prometheus label.
+ORGANIZATIONS_TOTAL = Gauge(
+    "nimbusfs_organizations_total",
+    "Organizations by status, refreshed at scrape time.",
+    ["status"],  # active | suspended | deleted
+    registry=REGISTRY,
+)
+ORGANIZATION_MEMBERS_TOTAL = Counter(
+    "nimbusfs_organization_members_total",
+    "Membership changes by outcome.",
+    ["action"],  # added | removed | role_changed
+    registry=REGISTRY,
+)
+AUTHORIZATION_DENIALS_TOTAL = Counter(
+    "nimbusfs_authorization_denials_total",
+    "Resource-level authorization denials by reason.",
+    ["reason"],  # no_grant | not_a_member | suspended_organization
+    registry=REGISTRY,
+)
+SHARES_CREATED_TOTAL = Counter(
+    "nimbusfs_shares_created_total",
+    "Share links created, by resource type.",
+    ["resource_type"],  # folder | file
+    registry=REGISTRY,
+)
+SHARES_REVOKED_TOTAL = Counter(
+    "nimbusfs_shares_revoked_total",
+    "Share links revoked.",
+    ["resource_type"],
+    registry=REGISTRY,
+)
+QUOTA_EXCEEDED_TOTAL = Counter(
+    "nimbusfs_quota_exceeded_total",
+    "Operations rejected because they would exceed an organization's storage quota.",
+    registry=REGISTRY,
+)
+
+# ---------------------------------------------------------------------
 # Route-template cache — avoids recomputing per request
 # ---------------------------------------------------------------------
 
