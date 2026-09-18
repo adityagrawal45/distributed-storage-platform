@@ -139,6 +139,14 @@ def valid_user_payload() -> dict:
     }
 
 
+async def _register_and_login(client: AsyncClient, payload: dict) -> str:
+    await client.post("/api/v1/auth/register", json=payload)
+    login_response = await client.post(
+        "/api/v1/auth/login", data={"username": payload["email"], "password": payload["password"]}
+    )
+    return login_response.json()["data"]["access_token"]
+
+
 @pytest_asyncio.fixture
 async def authed_client(client: AsyncClient, valid_user_payload: dict) -> AsyncClient:
     """
@@ -147,11 +155,27 @@ async def authed_client(client: AsyncClient, valid_user_payload: dict) -> AsyncC
     metadata) that need an authenticated owner but aren't testing auth
     itself.
     """
-    await client.post("/api/v1/auth/register", json=valid_user_payload)
-    login_response = await client.post(
-        "/api/v1/auth/login",
-        data={"username": valid_user_payload["email"], "password": valid_user_payload["password"]},
-    )
-    access_token = login_response.json()["data"]["access_token"]
+    access_token = await _register_and_login(client, valid_user_payload)
     client.headers["Authorization"] = f"Bearer {access_token}"
     return client
+
+
+@pytest_asyncio.fixture
+async def second_user_token(client: AsyncClient) -> str:
+    """
+    A SECOND registered user's bearer token, distinct from `authed_client`'s
+    — every user gets their own personal `Organization` at registration
+    (Phase 13), so this is also the cheapest way to get a second, isolated
+    tenant for cross-tenant security tests. Deliberately returns only the
+    raw token (not a client with `Authorization` pre-set) — cross-tenant
+    tests need to switch between two identities on requests against the
+    SAME underlying `client`/transport, which a shared `client.headers`
+    mutation can't do for two callers at once.
+    """
+    payload = {
+        "first_name": "Bob",
+        "last_name": "Second",
+        "email": "bob.second@nimbusfs.io",
+        "password": "StrongP@ssw0rd",
+    }
+    return await _register_and_login(client, payload)
