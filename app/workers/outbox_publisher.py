@@ -108,6 +108,7 @@ class OutboxPublisherWorker(WorkerRuntimeMixin):
             producer="api",
             correlation_id=event.correlation_id,
             causation_id=event.causation_id,
+            tenant_id=event.organization_id,
             user_id=event.user_id,
             payload=event.payload or {},
         )
