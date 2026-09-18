@@ -57,6 +57,7 @@ class FileMetadataRead(BaseModel):
 
     id: uuid.UUID
     owner_id: uuid.UUID
+    organization_id: uuid.UUID
     folder_id: uuid.UUID | None
     original_filename: str
     stored_filename: str
