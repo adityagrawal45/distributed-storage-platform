@@ -547,7 +547,7 @@ async def test_database_failure_returns_503(authed_client: AsyncClient, monkeypa
 
     from app.repositories.upload_session_repository import UploadSessionRepository
 
-    async def _boom(self, upload_id, owner_id):
+    async def _boom(self, upload_id, owner_id, organization_id):
         raise OperationalError("statement", {}, Exception("connection lost"))
 
     monkeypatch.setattr(UploadSessionRepository, "get_owned", _boom)
