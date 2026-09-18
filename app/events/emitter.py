@@ -91,6 +91,7 @@ class OutboxEmitterMixin:
         aggregate_type: str,
         aggregate_id: uuid.UUID,
         user_id: uuid.UUID,
+        organization_id: uuid.UUID | None = None,
         payload: dict[str, Any] | None = None,
         event_version: int = 1,
     ) -> EventEnvelope | None:
@@ -99,6 +100,12 @@ class OutboxEmitterMixin:
 
         Returns the envelope (useful in tests and for chaining a
         `causation_id`), or `None` when no outbox is wired.
+
+        `organization_id` (Phase 13 §34) fills the envelope's
+        previously-reserved `tenant_id` field — every call site now has
+        one in scope (every tenant-owned aggregate carries its own
+        `organization_id`), so this is populated on every event from
+        this phase onward rather than staying permanently null.
         """
         if self._outbox is None:
             return None
@@ -110,6 +117,7 @@ class OutboxEmitterMixin:
                 producer=self._event_producer,
                 correlation_id=_context_uuid("correlation_id") or uuid.uuid4(),
                 causation_id=_context_uuid("causation_id"),
+                tenant_id=organization_id,
                 user_id=user_id,
                 payload=payload or {},
                 # Phase 11: same contextvars source as correlation_id (see
@@ -126,6 +134,7 @@ class OutboxEmitterMixin:
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.causation_id,
                 user_id=envelope.user_id,
+                organization_id=envelope.tenant_id,
                 # `mode="json"` so UUIDs/datetimes in the payload are
                 # already JSON-native — the column is JSONB, and a raw
                 # `uuid.UUID` would fail to serialize at flush time.
