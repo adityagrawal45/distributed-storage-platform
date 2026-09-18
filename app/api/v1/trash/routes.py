@@ -11,6 +11,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.dependencies.auth import CurrentUser
+from app.dependencies.organization import CurrentOrganization
 from app.dependencies.providers import TrashServiceDep
 from app.schemas.file_metadata import FileMetadataRead
 from app.schemas.folder import FolderRead
@@ -25,8 +26,10 @@ class TrashContents(BaseModel):
 
 
 @router.get("", response_model=APIResponse[TrashContents], summary="List everything currently in the trash")
-async def list_trash(current_user: CurrentUser, trash_service: TrashServiceDep) -> APIResponse[TrashContents]:
-    folders, files = await trash_service.list_trash(current_user.id)
+async def list_trash(
+    current_user: CurrentUser, org: CurrentOrganization, trash_service: TrashServiceDep
+) -> APIResponse[TrashContents]:
+    folders, files = await trash_service.list_trash(current_user.id, org.organization_id)
     contents = TrashContents(
         folders=[FolderRead.model_validate(f) for f in folders],
         files=[FileMetadataRead.model_validate(f) for f in files],
