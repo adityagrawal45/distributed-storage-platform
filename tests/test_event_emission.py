@@ -285,7 +285,7 @@ async def test_a_service_built_without_an_outbox_emits_nothing(db_session):
     )
     await db_session.flush()
 
-    await service.create_folder(owner_id, "Silent", None)
+    await service.create_folder(owner_id, uuid.uuid4(), "Silent", None)
     assert await _events(db_session) == []
 
 
