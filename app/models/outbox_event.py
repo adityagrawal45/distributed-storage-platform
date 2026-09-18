@@ -148,6 +148,17 @@ class OutboxEvent(Base):
     causation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
 
+    # Phase 13 §34: the envelope's `tenant_id` field, persisted so a
+    # republish (this row read back later, possibly by a different
+    # process) reconstructs the SAME tenant-scoped envelope the original
+    # publish attempt built — not recomputed from `aggregate_id` at
+    # publish time. No FK to `organizations`: this table predates Phase
+    # 13 and an outbox row legitimately outlives the tenant that
+    # produced it (published, then the org is later suspended/deleted);
+    # nullable because pre-Phase-13 rows and any future non-tenant-scoped
+    # event (none exist yet) have no organization to record.
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
     # JSONB (not JSON, not TEXT): queryable during an incident
     # (`payload->>'file_id'`) and stored pre-parsed, so a replay tool does
     # not re-parse every row. `.with_variant(JSON)` keeps the SQLite test
