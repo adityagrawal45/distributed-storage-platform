@@ -58,9 +58,9 @@ class SearchService:
         self._cache = cache
 
     async def search_files(
-        self, owner_id: uuid.UUID, params: FileSearchParams, offset: int, limit: int
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, params: FileSearchParams, offset: int, limit: int
     ) -> tuple[list[FileMetadata], int]:
-        return await self._files.search(owner_id, params, offset, limit)
+        return await self._files.search(owner_id, organization_id, params, offset, limit)
 
     @staticmethod
     def _key_params(params: FileSearchParams, page: int, page_size: int) -> dict:
@@ -97,7 +97,7 @@ class SearchService:
         }
 
     async def search_files_page(
-        self, owner_id: uuid.UUID, params: FileSearchParams, page: int, page_size: int
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, params: FileSearchParams, page: int, page_size: int
     ) -> Page[FileMetadataRead]:
         """
         Cache-aside search returning the fully-built `Page` the route used
@@ -111,7 +111,7 @@ class SearchService:
         offset = (page - 1) * page_size
 
         if self._cache is None or not self._cache.enabled:
-            items, total = await self.search_files(owner_id, params, offset, page_size)
+            items, total = await self.search_files(owner_id, organization_id, params, offset, page_size)
             return Page.create(
                 items=[FileMetadataRead.model_validate(f) for f in items],
                 total=total,
@@ -119,11 +119,11 @@ class SearchService:
                 page_size=page_size,
             )
 
-        key = self._cache.keys.search(owner_id, self._key_params(params, page, page_size))
+        key = self._cache.keys.search(owner_id, organization_id, self._key_params(params, page, page_size))
         max_items = self._cache.policy.search_max_items
 
         async def _load() -> dict:
-            items, total = await self.search_files(owner_id, params, offset, page_size)
+            items, total = await self.search_files(owner_id, organization_id, params, offset, page_size)
             built = Page.create(
                 items=[FileMetadataRead.model_validate(f) for f in items],
                 total=total,
