@@ -55,7 +55,8 @@ class FileMetadata(Base, AuditMixin, SoftDeleteMixin):
     __tablename__ = "file_metadata"
     __table_args__ = (
         Index(
-            "ux_file_metadata_folder_filename_active",
+            "ux_file_metadata_org_folder_filename_active",
+            "organization_id",
             "owner_id",
             "folder_id",
             "original_filename",
@@ -69,9 +70,16 @@ class FileMetadata(Base, AuditMixin, SoftDeleteMixin):
         Index("ix_file_metadata_checksum", "checksum"),
         Index("ix_file_metadata_upload_status", "upload_status"),
         Index("ix_file_metadata_object_name", "object_name"),
+        Index("ix_file_metadata_organization_id", "organization_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Phase 13 tenant boundary — see Folder.organization_id's docstring;
+    # same reasoning applies verbatim.
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
 
     owner_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
