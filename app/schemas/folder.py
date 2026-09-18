@@ -61,6 +61,7 @@ class FolderRead(BaseModel):
 
     id: uuid.UUID
     owner_id: uuid.UUID
+    organization_id: uuid.UUID
     parent_folder_id: uuid.UUID | None
     name: str
     path: str
