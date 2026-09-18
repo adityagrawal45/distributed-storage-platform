@@ -1,6 +1,75 @@
 # NimbusFS — Project Context
 
-Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10; updated 2026-09-06 after completing Phase 11; updated 2026-09-08 after completing Phase 12; updated 2026-09-14 after a Phase 12 supply-chain/coverage/DR-deployment addendum.
+Purpose of this file: give a fresh AI session (or human) full context on this project in one read, without needing to re-explore the codebase from scratch. Written 2026-08-04; updated 2026-08-05 after completing Phase 4; updated 2026-08-08 after completing Phase 5; updated 2026-08-10 after completing Phase 6; updated 2026-08-15 after completing Phase 7; updated 2026-08-18 after completing Phase 8; updated 2026-09-01 after completing Phase 9; updated 2026-09-02 to record the canonical remote; updated 2026-09-03 after adding the Phase 9 extension `terraform/` module; updated 2026-09-04 after completing Phase 10; updated 2026-09-06 after completing Phase 11; updated 2026-09-08 after completing Phase 12; updated 2026-09-14 after a Phase 12 supply-chain/coverage/DR-deployment addendum; updated 2026-09-18 after completing Phase 13.
+
+## Phase 13 (2026-09-18): Enterprise Multi-Tenancy, Sharing, Collaboration & Administration
+
+`Organization` is now the sole tenant boundary, built on top of (not
+duplicating) Phase 10's RBAC. Full detail lives in the six dedicated
+docs this phase added — `docs/multi-tenancy.md`, `docs/authorization.md`,
+`docs/permissions.md`, `docs/sharing.md`, `docs/quotas.md`,
+`docs/administration.md` — this entry is a pointer, not a restatement.
+
+- **New tables** (`alembic/versions/0007_multi_tenancy_...py`):
+  `organizations`, `organization_memberships`, `groups`,
+  `group_memberships`, `resource_permissions`, `shares`.
+  `organization_id` added to `folders`/`file_metadata`/`upload_sessions`
+  (required) and `audit_logs`/`outbox_events` (nullable — platform-level
+  events/messages have no single owning tenant).
+- **Every repository method touching a tenant-owned table now
+  requires `organization_id`** as a parameter — omitting it is a
+  `TypeError` at the call site, not a silently-unscoped query. This is
+  the actual enforcement mechanism, not a convention (see
+  `docs/multi-tenancy.md`'s isolation-architecture comparison for why
+  application-level filtering was chosen over Postgres RLS or
+  separate-schema-per-tenant).
+- **`PermissionResolver`** (`app/core/authorization.py`) is the one
+  centralized authorization decision-maker for resource-level access —
+  ownership → org-wide role → direct grant → inherited folder grant →
+  deny-by-default, fail-closed on every path. New `app/schemas/permission.py`.
+- **Secure sharing links** (`app/services/share_service.py`,
+  `app/api/v1/shares/routes.py`) — opaque 256-bit bearer tokens, hashed
+  at rest, expiring, revocable, optionally password-protected; every
+  redemption failure mode except a wrong password collapses into the
+  same 404 to avoid an existence oracle.
+- **Atomic, race-free storage quotas** (`QuotaService`,
+  `OrganizationRepository.try_reserve_storage`) — one guarded `UPDATE`
+  with the limit check in the `WHERE` clause, no check-then-act window.
+- **Backward-compatible migration**: every pre-existing user gets one
+  auto-created, unlimited-quota personal `Organization`
+  (`is_personal=True`) via the Alembic backfill, and every new
+  registration gets one via `AuthService.register` →
+  `OrganizationService.create_personal`. No pre-Phase-13 client needs
+  to send the new `X-Organization-ID` header to keep working.
+- **Two real cross-tenant leaks found and fixed during implementation**
+  (not in the original spec's own examples): the search-results cache
+  key was `owner_id`-only (a user in 2 orgs could get one org's cached
+  results served while acting in the other — fixed by adding
+  `organization_id` as a structural key segment), and
+  `FileMetadataRepository.get_by_checksum` (content-dedup lookup) was
+  `owner_id`-only (two orgs sharing a member could end up with rows
+  from different tenants pointing at the same GCS object — fixed by
+  adding `organization_id` to the query).
+- **New router files**: `app/api/v1/organizations/routes.py` (org
+  lifecycle, members, groups, permission grants, quota, audit search)
+  and `app/api/v1/shares/routes.py`.
+- **New cross-tenant security tests**: `tests/test_multi_tenancy.py` —
+  IDOR/forged-ID attempts across two independently-registered users
+  (each with their own personal org), share redemption across tenants,
+  revoked/expired-share and wrong-password distinguishability, search
+  isolation, permission-grant rejection for an out-of-org principal,
+  forged `X-Organization-ID` header rejection.
+- Full suite re-verified after every signature change this phase
+  introduced: `mypy app` (0 findings), `ruff check app` (clean),
+  `bandit -r app` (no new findings), and the full test suite —
+  **460 passed** (449 pre-existing + 11 new cross-tenant tests) — all
+  MEASURED this session.
+- **Explicitly out of scope, recorded not silently skipped**: no
+  explicit-deny permission grants, no nested/cross-org groups, no
+  email-invitation flow for adding members, no hard-delete/purge path
+  for a `DELETED` organization's data, no rate-limiting on share
+  redemption. See each doc's own "what this phase does not build"
+  section.
 
 ## Phase 12 addendum (2026-09-14): supply chain, coverage gate, DR-deployment mapping
 
