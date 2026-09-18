@@ -24,7 +24,7 @@ class TrashService:
         self._folders = folder_repository
         self._files = file_repository
 
-    async def list_trash(self, owner_id: uuid.UUID) -> tuple[list[Folder], list[FileMetadata]]:
-        folders = await self._folders.list_trash(owner_id)
-        files = await self._files.list_trash(owner_id)
+    async def list_trash(self, owner_id: uuid.UUID, organization_id: uuid.UUID) -> tuple[list[Folder], list[FileMetadata]]:
+        folders = await self._folders.list_trash(owner_id, organization_id)
+        files = await self._files.list_trash(owner_id, organization_id)
         return folders, files
