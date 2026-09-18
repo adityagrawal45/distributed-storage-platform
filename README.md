@@ -3280,19 +3280,21 @@ Total: **416 tests passing** (57 Phase 1/2 + 19 Phase 3 + 28 Phase 4 +
 infrastructure/manifests, not application tests). Zero regressions: all
 410 pre-Phase-9 tests still pass unchanged.
 
-## 24. Future Roadmap (Phases 10–15, not yet built)
+## 24. Future Roadmap (Phases 14–15, not yet built)
 
-Sharing & permissions between users, virus scanning integration,
-full-text content search, content-dedup extension to the chunked-upload
-path, CI/CD via GitHub Actions, Terraform IaC, Cloud Armor, Cloud CDN,
-observability (Cloud Monitoring/Logging dashboards, OpenTelemetry
-tracing). Kubernetes/GKE deployment and autoscaling (HPA) shipped in
-Phase 5 (§12); chunked/resumable uploads shipped in Phase 6 (§13); real
-rate limiting and Redis metadata caching shipped in Phase 7 (§14);
-Pub/Sub-driven background workers and thumbnail generation shipped in
-Phase 8 (§15); **multi-zone high availability, disaster recovery design,
-and read-only Postgres↔GCS reconciliation shipped in Phase 9 (§16)** —
-all previously listed here.
+Virus scanning integration, full-text content search, content-dedup
+extension to the chunked-upload path, Cloud Armor, Cloud CDN. Kubernetes/
+GKE deployment and autoscaling (HPA) shipped in Phase 5 (§12);
+chunked/resumable uploads shipped in Phase 6 (§13); real rate limiting
+and Redis metadata caching shipped in Phase 7 (§14); Pub/Sub-driven
+background workers and thumbnail generation shipped in Phase 8 (§15);
+**multi-zone high availability, disaster recovery design, and read-only
+Postgres↔GCS reconciliation shipped in Phase 9 (§16)**; observability
+(structured logging, tracing, metrics, alerting) shipped in Phase 11
+(§24a); CI/CD, IaC, GitOps shipped in Phase 12 (§24b); **enterprise
+multi-tenancy, resource-level permissions, secure sharing links, and
+organization administration shipped in Phase 13 (§24c)** — all
+previously listed here.
 
 Three things stay on this list even though Phase 9 made some of them
 easier to eventually build: reconciliation of stuck `COMPLETING`-state
@@ -3458,6 +3460,77 @@ new one:
   suite (449/449 passing) — see `docs/ci-cd.md`'s
   DESIGNED/IMPLEMENTED/TESTED/MEASURED table for the precise line
   between the two.
+
+## 24c. Phase 13 — Enterprise Multi-Tenancy, Sharing, Collaboration & Administration
+
+An inspection-first pass found identity (Phase 1), RBAC (Phase 1/10),
+metadata/sharing repositories (Phase 2), and audit logging (Phase 10)
+all real and reusable, but genuinely single-tenant — `owner_id` alone
+scoped every query, with no concept of an organization anywhere.
+Phase 13 adds that concept as a hard boundary rather than a convention:
+
+- **`Organization`** is the sole tenant boundary — new tables
+  `organizations`, `organization_memberships`, `groups`,
+  `group_memberships`, `resource_permissions`, `shares`
+  (`alembic/versions/0007_multi_tenancy_...py`); `organization_id`
+  added to `folders`/`file_metadata`/`upload_sessions` (required) and
+  `audit_logs`/`outbox_events` (nullable). Application-level filtering
+  was chosen over Postgres RLS or a separate schema/DB per tenant —
+  see `docs/multi-tenancy.md`'s comparison table for the explicit
+  trade-off, including RLS's honest advantage this approach gives up.
+- **Enforced structurally, not by convention**: every repository
+  method touching a tenant-owned table now takes `organization_id` as
+  a *required* parameter — an omitted one is a `TypeError` at the call
+  site, the same discipline `owner_id` already had since Phase 2,
+  extended one column.
+- **`PermissionResolver`** (`app/core/authorization.py`) — one
+  centralized, deterministic authorization decision-maker: ownership →
+  org-wide role (`OWNER`/`ADMIN`) → direct `ResourcePermission` grant →
+  inherited grant on an ancestor folder (via the materialized `path`
+  Phase 2 already maintains) → deny-by-default, fail-closed on every
+  path. Six permissions (`READ`/`WRITE`/`DELETE`/`SHARE`/`DOWNLOAD`/
+  `MANAGE`) — see `docs/permissions.md`.
+- **Secure sharing links** (`app/services/share_service.py`,
+  `POST/GET/DELETE /shares`) — 256-bit opaque bearer tokens, SHA-256-
+  hashed at rest, the raw token shown exactly once; expiring, revocable,
+  optionally bcrypt-password-protected; every redemption failure short
+  of a wrong password (nonexistent/expired/revoked/max-downloads)
+  collapses into the identical 404 to avoid an existence oracle. See
+  `docs/sharing.md`.
+- **Race-free storage quotas** (`QuotaService`,
+  `OrganizationRepository.try_reserve_storage`) — one guarded SQL
+  `UPDATE` with the limit check inside the `WHERE` clause; no
+  check-then-act window between two concurrent uploads. See
+  `docs/quotas.md`.
+- **Backward-compatible by construction**: every pre-existing user
+  gets one auto-created, unlimited personal `Organization` via the
+  migration's backfill; every new registration gets one via
+  `AuthService.register`. No pre-Phase-13 client needs to change
+  anything — omitting the new `X-Organization-ID` header resolves
+  unambiguously to a single-org user's one organization.
+- **Two real cross-tenant leaks found and fixed while implementing,
+  not in the original brief's own examples**: the search-cache key was
+  `owner_id`-only (fixed by adding `organization_id` as a structural
+  key segment — `docs/multi-tenancy.md`), and content-dedup lookup
+  (`get_by_checksum`) was `owner_id`-only, which could have let two
+  organizations sharing a member collide on the same GCS object.
+- **New**: `app/api/v1/organizations/routes.py`,
+  `app/api/v1/shares/routes.py`, `tests/test_multi_tenancy.py` (11
+  cross-tenant IDOR/forged-ID/share-isolation/permission-isolation
+  tests), `docs/multi-tenancy.md`, `docs/authorization.md`,
+  `docs/permissions.md`, `docs/sharing.md`, `docs/quotas.md`,
+  `docs/administration.md`.
+- **Explicitly out of scope, recorded not silently skipped**: no
+  explicit-deny grants, no nested/cross-org groups, no
+  email-invitation flow, no hard-delete/purge for a `DELETED`
+  organization, no rate-limiting on share redemption.
+- Full suite re-verified after every signature change: `mypy app` (0
+  findings), `ruff check app` (clean), `bandit -r app` (no new
+  findings), full test suite **460/460 passing** (449 pre-existing +
+  11 new) — all MEASURED this session. **Not run against real
+  infrastructure**: the Alembic migration's `ALTER TYPE ... ADD VALUE`
+  step and the full backfill logic have never executed against a real
+  Postgres — same honest caveat every migration since 0005 carries.
 
 ## 25. Contribution Guide
 
