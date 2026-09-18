@@ -62,6 +62,7 @@ from app.repositories.user_repository import UserRepository
 from app.schemas.auth import TokenPair
 from app.schemas.user import UserCreate
 from app.services.audit_service import AuditService
+from app.services.organization_service import OrganizationService
 
 settings = get_settings()
 
@@ -73,10 +74,17 @@ class AuthService:
         refresh_token_repository: RefreshTokenRepository,
         *,
         audit: AuditService | None = None,
+        organizations: OrganizationService | None = None,
     ):
         self._users = user_repository
         self._refresh_tokens = refresh_token_repository
         self._audit = audit
+        # Phase 13: keyword-only, defaulting to None — the exact same
+        # backward-compatible pattern `audit=`/`outbox=`/`cache=` already
+        # established (Phases 7/8/10). Every pre-Phase-13 construction of
+        # this service keeps working unchanged and simply skips personal-
+        # organization creation; only the DI provider passes a real one.
+        self._organizations = organizations
 
     async def _record_audit(
         self,
@@ -109,7 +117,18 @@ class AuthService:
             email=payload.email,
             hashed_password=hash_password(payload.password),
         )
-        return await self._users.add(user)
+        user = await self._users.add(user)
+
+        # Phase 13: every user gets exactly one personal organization,
+        # created here rather than lazily on first use — see
+        # `OrganizationService.create_personal`'s docstring and
+        # `docs/multi-tenancy.md` "Migration strategy" for why this
+        # (not "no org until you create/join one") is what keeps a
+        # solo user's experience identical to pre-Phase-13 NimbusFS.
+        if self._organizations is not None:
+            await self._organizations.create_personal(user.id, f"{payload.first_name} {payload.last_name}")
+
+        return user
 
     async def _issue_token_pair(self, user: User) -> TokenPair:
         access_token = create_access_token(user_id=user.id, role=user.role.value)
