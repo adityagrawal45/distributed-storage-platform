@@ -34,6 +34,20 @@ class AuditEventType(str, Enum):
     FILE_DELETE = "file_delete"
     ADMIN_ACTION = "admin_action"
 
+    # Phase 13: multi-tenancy / sharing / administration events.
+    ORGANIZATION_CREATED = "organization_created"
+    ORGANIZATION_SUSPENDED = "organization_suspended"
+    ORGANIZATION_REACTIVATED = "organization_reactivated"
+    MEMBER_ADDED = "member_added"
+    MEMBER_REMOVED = "member_removed"
+    MEMBER_ROLE_CHANGED = "member_role_changed"
+    PERMISSION_GRANTED = "permission_granted"
+    PERMISSION_REVOKED = "permission_revoked"
+    SHARE_CREATED = "share_created"
+    SHARE_REVOKED = "share_revoked"
+    SHARE_ACCESSED = "share_accessed"
+    QUOTA_CHANGED = "quota_changed"
+
 
 class AuditResult(str, Enum):
     SUCCESS = "success"
@@ -65,3 +79,74 @@ class ChunkStatus(str, Enum):
     UPLOADED = "uploaded"  # bytes received and written to a temp GCS object; not yet checksum-verified
     VERIFIED = "verified"  # checksum confirmed — eligible to be included in the final compose
     FAILED = "failed"  # upload or verification failed; chunk_number remains free for retry
+
+
+# ---------------------------------------------------------------------
+# Phase 13 — multi-tenancy, sharing, permissions
+# ---------------------------------------------------------------------
+class OrganizationStatus(str, Enum):
+    """
+    Lifecycle status of an `Organization` (the tenant boundary — see
+    `docs/multi-tenancy.md`).
+
+    `SUSPENDED` blocks all data-plane access (uploads, downloads,
+    listing) but is reversible and preserves every row — the platform-
+    admin equivalent of `User.is_active=False`. `DELETED` is a soft
+    marker only; nothing in this phase adds a hard-delete path for an
+    organization's data (see `docs/administration.md` "secure deletion"
+    for why that is explicitly deferred, not silently skipped).
+    """
+
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    DELETED = "deleted"
+
+
+class OrganizationRole(str, Enum):
+    """
+    A user's role WITHIN one organization (via `OrganizationMembership`)
+    — orthogonal to `UserRole` (`app/models/user.py`), which is a
+    PLATFORM-wide role (regular user vs. platform administrator, Phase
+    1). See `docs/authorization.md` "Two role systems, on purpose" for
+    why these are not merged into one enum.
+    """
+
+    OWNER = "owner"
+    ADMIN = "admin"
+    MEMBER = "member"
+    VIEWER = "viewer"
+
+
+class MembershipStatus(str, Enum):
+    ACTIVE = "active"
+    REMOVED = "removed"
+
+
+class ResourceType(str, Enum):
+    """The closed set of resource kinds `ResourcePermission`/`Share` can point at."""
+
+    FOLDER = "folder"
+    FILE = "file"
+
+
+class PrincipalType(str, Enum):
+    """Who a `ResourcePermission` grant applies to."""
+
+    USER = "user"
+    GROUP = "group"
+
+
+class Permission(str, Enum):
+    """
+    Resource-level capabilities (Phase 13 §11). Deliberately six, not
+    dozens — see `docs/permissions.md` for what each one actually gates
+    and why finer-grained splits (e.g. separating "rename" from "move")
+    were rejected as complexity with no current authorization need.
+    """
+
+    READ = "read"
+    WRITE = "write"
+    DELETE = "delete"
+    SHARE = "share"
+    DOWNLOAD = "download"
+    MANAGE = "manage"
