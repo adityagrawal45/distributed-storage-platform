@@ -416,6 +416,27 @@ class Settings(BaseSettings):
     # CronJob into an unbounded GCS API bill.
     RECONCILIATION_MAX_ISSUES: int = 5000
 
+    # Multi-tenancy / sharing (Phase 13).
+    # NULL/unset per-organization limit (Organization.storage_limit_bytes)
+    # means unlimited — this is the DEFAULT applied to a newly-created,
+    # non-personal organization only; personal organizations (one per
+    # user, auto-created at registration) are always unlimited, by
+    # design, so Phase 13 never silently caps an existing single-user
+    # workflow — see OrganizationService.create_personal.
+    ORG_DEFAULT_STORAGE_LIMIT_BYTES: int | None = None
+    # Random bytes of entropy in a share token BEFORE base64url-encoding
+    # (32 bytes = 256 bits) — see ShareService.create's docstring for
+    # why this, not the hash function, is what makes a share token
+    # infeasible to guess.
+    SHARE_TOKEN_BYTES: int = 32
+    SHARE_DEFAULT_EXPIRATION_HOURS: int = 168  # 7 days
+    SHARE_MAX_EXPIRATION_HOURS: int = 8760  # 1 year — a share is never permanent (Phase 13 §15)
+    # Bounded pagination for the new organization/member/group/audit
+    # list endpoints — same MAX_PAGE_SIZE concept `app/schemas/
+    # pagination.py` already enforces for folders/files, applied to
+    # Phase 13's own endpoints via the same PaginationParams dependency
+    # rather than a second, endpoint-specific cap.
+
     @property
     def THUMBNAIL_SUPPORTED_CONTENT_TYPES(self) -> list[str]:
         return [
