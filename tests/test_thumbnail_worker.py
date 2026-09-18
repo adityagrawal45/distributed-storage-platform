@@ -80,6 +80,7 @@ async def seed_file(factory, *, object_name: str, content_type: str) -> uuid.UUI
         session.add(
             FileMetadata(
                 id=file_id,
+                organization_id=uuid.uuid4(),
                 owner_id=owner_id,
                 original_filename="photo.png",
                 stored_filename=f"{file_id}.png",
