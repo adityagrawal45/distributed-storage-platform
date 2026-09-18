@@ -71,6 +71,7 @@ async def seed_row(
         session.add(
             FileMetadata(
                 id=file_id,
+                organization_id=uuid.uuid4(),
                 owner_id=owner_id,
                 original_filename="doc.txt",
                 stored_filename=f"{file_id}.txt",
