@@ -15,6 +15,7 @@ from fastapi import Depends
 from google.cloud import storage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.authorization import PermissionResolver
 from app.core.cache.keys import CacheKeyBuilder
 from app.core.cache.policy import CachePolicy
 from app.core.config import get_settings
@@ -28,9 +29,14 @@ from app.repositories.audit_log_repository import AuditLogRepository
 from app.repositories.file_metadata_repository import FileMetadataRepository
 from app.repositories.file_version_repository import FileVersionRepository
 from app.repositories.folder_repository import FolderRepository
+from app.repositories.group_repository import GroupRepository
+from app.repositories.membership_repository import MembershipRepository
+from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.outbox_repository import OutboxRepository
 from app.repositories.processed_event_repository import ProcessedEventRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
+from app.repositories.resource_permission_repository import ResourcePermissionRepository
+from app.repositories.share_repository import ShareRepository
 from app.repositories.upload_chunk_repository import UploadChunkRepository
 from app.repositories.upload_session_repository import UploadSessionRepository
 from app.repositories.user_repository import UserRepository
@@ -42,9 +48,15 @@ from app.services.chunked_upload_service import ChunkedUploadService
 from app.services.file_upload_service import FileUploadService
 from app.services.file_validation_service import FileValidationService
 from app.services.folder_service import FolderService
+from app.services.group_service import GroupService
 from app.services.idempotency_service import IdempotencyService
+from app.services.membership_service import MembershipService
 from app.services.metadata_service import MetadataService
+from app.services.organization_service import OrganizationService
+from app.services.permission_service import PermissionService
+from app.services.quota_service import QuotaService
 from app.services.search_service import SearchService
+from app.services.share_service import ShareService
 from app.services.storage_service import StorageService
 from app.services.trash_service import TrashService
 from app.services.user_service import UserService
@@ -251,12 +263,108 @@ UploadSessionRepositoryDep = Annotated[UploadSessionRepository, Depends(get_uplo
 UploadChunkRepositoryDep = Annotated[UploadChunkRepository, Depends(get_upload_chunk_repository)]
 
 
+def get_organization_repository(session: DbSession) -> OrganizationRepository:
+    return OrganizationRepository(session)
+
+
+def get_membership_repository(session: DbSession) -> MembershipRepository:
+    return MembershipRepository(session)
+
+
+def get_group_repository(session: DbSession) -> GroupRepository:
+    return GroupRepository(session)
+
+
+def get_resource_permission_repository(session: DbSession) -> ResourcePermissionRepository:
+    return ResourcePermissionRepository(session)
+
+
+def get_share_repository(session: DbSession) -> ShareRepository:
+    return ShareRepository(session)
+
+
+OrganizationRepositoryDep = Annotated[OrganizationRepository, Depends(get_organization_repository)]
+MembershipRepositoryDep = Annotated[MembershipRepository, Depends(get_membership_repository)]
+GroupRepositoryDep = Annotated[GroupRepository, Depends(get_group_repository)]
+ResourcePermissionRepositoryDep = Annotated[ResourcePermissionRepository, Depends(get_resource_permission_repository)]
+ShareRepositoryDep = Annotated[ShareRepository, Depends(get_share_repository)]
+
+
+def get_organization_service(
+    organization_repository: OrganizationRepositoryDep,
+    membership_repository: MembershipRepositoryDep,
+    audit: AuditServiceDep,
+) -> OrganizationService:
+    return OrganizationService(organization_repository, membership_repository, audit=audit)
+
+
+OrganizationServiceDep = Annotated[OrganizationService, Depends(get_organization_service)]
+
+
+def get_membership_service(
+    membership_repository: MembershipRepositoryDep,
+    user_repository: UserRepositoryDep,
+    audit: AuditServiceDep,
+) -> MembershipService:
+    return MembershipService(membership_repository, user_repository, audit=audit)
+
+
+MembershipServiceDep = Annotated[MembershipService, Depends(get_membership_service)]
+
+
+def get_group_service(
+    group_repository: GroupRepositoryDep, membership_repository: MembershipRepositoryDep
+) -> GroupService:
+    return GroupService(group_repository, membership_repository)
+
+
+GroupServiceDep = Annotated[GroupService, Depends(get_group_service)]
+
+
+def get_permission_resolver(
+    folder_repository: FolderRepositoryDep,
+    group_repository: GroupRepositoryDep,
+    permission_repository: ResourcePermissionRepositoryDep,
+) -> PermissionResolver:
+    return PermissionResolver(folder_repository, group_repository, permission_repository)
+
+
+PermissionResolverDep = Annotated[PermissionResolver, Depends(get_permission_resolver)]
+
+
+def get_permission_service(
+    permission_repository: ResourcePermissionRepositoryDep,
+    membership_repository: MembershipRepositoryDep,
+    group_repository: GroupRepositoryDep,
+    audit: AuditServiceDep,
+) -> PermissionService:
+    return PermissionService(permission_repository, membership_repository, group_repository, audit=audit)
+
+
+PermissionServiceDep = Annotated[PermissionService, Depends(get_permission_service)]
+
+
+def get_share_service(share_repository: ShareRepositoryDep, audit: AuditServiceDep) -> ShareService:
+    return ShareService(share_repository, audit=audit)
+
+
+ShareServiceDep = Annotated[ShareService, Depends(get_share_service)]
+
+
+def get_quota_service(organization_repository: OrganizationRepositoryDep) -> QuotaService:
+    return QuotaService(organization_repository)
+
+
+QuotaServiceDep = Annotated[QuotaService, Depends(get_quota_service)]
+
+
 def get_auth_service(
     user_repository: UserRepositoryDep,
     refresh_token_repository: RefreshTokenRepositoryDep,
     audit: AuditServiceDep,
+    organizations: OrganizationServiceDep,
 ) -> AuthService:
-    return AuthService(user_repository, refresh_token_repository, audit=audit)
+    return AuthService(user_repository, refresh_token_repository, audit=audit, organizations=organizations)
 
 
 def get_user_service(
@@ -334,12 +442,14 @@ def get_file_upload_service(
     invalidator: CacheInvalidatorDep,
     outbox: OutboxRepositoryDep,
     audit: AuditServiceDep,
+    quota: QuotaServiceDep,
 ) -> FileUploadService:
     return FileUploadService(
         file_repository, folder_repository, version_repository, storage_service, validator,
         invalidator=invalidator,
         outbox=outbox,
         audit=audit,
+        quota=quota,
     )
 
 
@@ -357,6 +467,7 @@ def get_chunked_upload_service(
     lock_factory: DistributedLockFactoryDep,
     invalidator: CacheInvalidatorDep,
     outbox: OutboxRepositoryDep,
+    quota: QuotaServiceDep,
 ) -> ChunkedUploadService:
     return ChunkedUploadService(
         upload_session_repository,
@@ -369,6 +480,7 @@ def get_chunked_upload_service(
         lock_factory,
         invalidator,
         outbox=outbox,
+        quota=quota,
     )
 
 
