@@ -109,9 +109,10 @@ class TestCacheKeyBuilder:
     def test_search_key_is_user_scoped_before_the_hash(self):
         keys = CacheKeyBuilder(PREFIX)
         alice, bob = uuid.uuid4(), uuid.uuid4()
+        org = uuid.uuid4()
         params = {"q": "report", "page": 1}
-        assert keys.search(alice, params) != keys.search(bob, params)
-        assert keys.search(alice, params).startswith(f"nimbusfs:search:{alice}:")
+        assert keys.search(alice, org, params) != keys.search(bob, org, params)
+        assert keys.search(alice, org, params).startswith(f"nimbusfs:search:{alice}:{org}:")
         assert keys.search_pattern(alice) == f"nimbusfs:search:{alice}:*"
 
     def test_redact_is_stable_and_non_reversible(self):
@@ -459,33 +460,34 @@ class TestCacheInvalidator:
         cache = build_cache(fake_redis_client)
         keys = cache.keys
         invalidator = CacheInvalidator(cache)
-        owner, folder, file_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        owner, folder, file_id, org = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
 
         await cache.set(keys.file(file_id), {"a": 1}, 60)
         await cache.set(keys.file_versions(file_id), [], 60)
         await cache.set(keys.folder_children(folder, owner, {}), [], 60)
-        await cache.set(keys.search(owner, {"q": "report"}), {"items": []}, 60)
+        await cache.set(keys.search(owner, org, {"q": "report"}), {"items": []}, 60)
 
         await invalidator.file_changed(file_id, owner, folder)
 
         assert await cache.get(keys.file(file_id)) is None
         assert await cache.get(keys.file_versions(file_id)) is None
         assert await cache.get(keys.folder_children(folder, owner, {})) is None
-        assert await cache.get(keys.search(owner, {"q": "report"})) is None
+        assert await cache.get(keys.search(owner, org, {"q": "report"})) is None
 
     async def test_search_invalidation_is_scoped_to_one_user(self, fake_redis_client):
         cache = build_cache(fake_redis_client)
         keys = cache.keys
         invalidator = CacheInvalidator(cache)
         alice, bob = uuid.uuid4(), uuid.uuid4()
+        org = uuid.uuid4()
 
-        await cache.set(keys.search(alice, {"q": "x"}), {"items": []}, 60)
-        await cache.set(keys.search(bob, {"q": "x"}), {"items": []}, 60)
+        await cache.set(keys.search(alice, org, {"q": "x"}), {"items": []}, 60)
+        await cache.set(keys.search(bob, org, {"q": "x"}), {"items": []}, 60)
 
         await invalidator.search_changed(alice)
 
-        assert await cache.get(keys.search(alice, {"q": "x"})) is None
-        assert await cache.get(keys.search(bob, {"q": "x"})) is not None
+        assert await cache.get(keys.search(alice, org, {"q": "x"})) is None
+        assert await cache.get(keys.search(bob, org, {"q": "x"})) is not None
 
 
 # =====================================================================
