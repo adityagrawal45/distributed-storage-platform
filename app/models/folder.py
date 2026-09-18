@@ -43,9 +43,14 @@ class Folder(Base, AuditMixin, SoftDeleteMixin):
         # A given owner cannot have two non-deleted folders with the same
         # name under the same parent. Partial index (WHERE is_deleted =
         # false) so a soft-deleted "Reports" doesn't block creating a new
-        # "Reports" in the same location.
+        # "Reports" in the same location. Scoped by organization_id too
+        # (Phase 13) even though owner_id alone was already unique enough
+        # pre-multi-tenancy — a user could theoretically belong to two
+        # organizations and the uniqueness is a per-TENANT concept now,
+        # not a per-USER one.
         Index(
-            "ux_folders_owner_parent_name_active",
+            "ux_folders_org_owner_parent_name_active",
+            "organization_id",
             "owner_id",
             "parent_folder_id",
             "name",
@@ -54,9 +59,22 @@ class Folder(Base, AuditMixin, SoftDeleteMixin):
         ),
         Index("ix_folders_path", "path"),
         Index("ix_folders_owner_id", "owner_id"),
+        Index("ix_folders_organization_id", "organization_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Phase 13: the tenant boundary. NOT nullable — every folder belongs
+    # to exactly one organization (a user's personal org, by default),
+    # enforced at the repository layer on every query (see
+    # `docs/multi-tenancy.md` "Tenant isolation"), not left to each
+    # query author to remember. `ondelete="CASCADE"` mirrors this
+    # phase's explicit decision NOT to build organization hard-delete
+    # (see `Organization`'s docstring) — the constraint exists for
+    # schema correctness, not because anything issues that DELETE today.
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
 
     owner_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
