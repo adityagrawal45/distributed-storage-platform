@@ -207,6 +207,7 @@ class FileProcessingWorker(BaseWorker):
             # operation); causation points at the event that caused it.
             correlation_id=parent.correlation_id,
             causation_id=parent.event_id,
+            tenant_id=parent.tenant_id,
             user_id=parent.user_id,
             payload=payload,
         )
