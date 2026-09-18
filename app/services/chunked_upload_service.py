@@ -150,6 +150,7 @@ from app.exceptions.custom_exceptions import (
     FinalChecksumMismatchException,
     FolderNotFoundException,
     LockAcquisitionException,
+    QuotaExceededException,
     ServiceUnavailableException,
     StorageException,
     UploadAlreadyFinalizedException,
@@ -171,6 +172,7 @@ from app.repositories.upload_chunk_repository import UploadChunkRepository
 from app.repositories.upload_session_repository import UploadSessionRepository
 from app.services.cache_invalidator import CacheInvalidator
 from app.services.file_validation_service import FileValidationService
+from app.services.quota_service import QuotaService
 from app.services.storage_service import StorageService
 
 logger = get_logger(__name__)
@@ -205,6 +207,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
         invalidator: CacheInvalidator | None = None,
         *,
         outbox: OutboxRepository | None = None,
+        quota: QuotaService | None = None,
     ):
         self._sessions = upload_session_repository
         self._chunks = upload_chunk_repository
@@ -223,13 +226,18 @@ class ChunkedUploadService(OutboxEmitterMixin):
         # for `invalidator`) so every pre-existing construction — including
         # all 41 Phase 6 tests — keeps working with no events emitted.
         self._outbox = outbox
+        # Phase 13: same technique, for storage-quota enforcement — see
+        # `FileUploadService.__init__`'s identical `quota=` parameter.
+        self._quota = quota
         self._settings = get_settings()
 
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
-    async def _get_owned_session(self, upload_id: uuid.UUID, owner_id: uuid.UUID) -> UploadSession:
-        session = await self._sessions.get_owned(upload_id, owner_id)
+    async def _get_owned_session(
+        self, upload_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> UploadSession:
+        session = await self._sessions.get_owned(upload_id, owner_id, organization_id)
         if session is None:
             raise UploadSessionNotFoundException()
         return session
@@ -322,6 +330,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
     async def initiate_upload(
         self,
         owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
         *,
         filename: str,
         total_size: int,
@@ -332,7 +341,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
         idempotency_key: str | None,
     ) -> UploadSession:
         if folder_id is not None:
-            folder = await self._folders.get_active_by_id(folder_id, owner_id)
+            folder = await self._folders.get_active_by_id(folder_id, owner_id, organization_id)
             if folder is None:
                 raise FolderNotFoundException(detail="Target folder not found.")
 
@@ -362,15 +371,16 @@ class ChunkedUploadService(OutboxEmitterMixin):
                 f"maximum of {self._settings.MAX_CHUNKS_PER_UPLOAD}. Use a larger chunk_size."
             )
 
-        if await self._files.name_exists_in_folder(owner_id, folder_id, validated_filename):
+        if await self._files.name_exists_in_folder(owner_id, organization_id, folder_id, validated_filename):
             raise DuplicateFileException()
 
-        storage_object = self._storage.generate_object_name(owner_id, extension)
+        storage_object = self._storage.generate_object_name(owner_id, extension, tenant_id=str(organization_id))
         now = datetime.now(UTC)
         expires_at = now + timedelta(minutes=self._settings.UPLOAD_SESSION_EXPIRATION_MINUTES)
 
         session = UploadSession(
             owner_id=owner_id,
+            organization_id=organization_id,
             folder_id=folder_id,
             filename=validated_filename,
             mime_type=mime_type,
@@ -401,8 +411,8 @@ class ChunkedUploadService(OutboxEmitterMixin):
     # ------------------------------------------------------------------
     # Status / progress / chunk listing
     # ------------------------------------------------------------------
-    async def get_progress(self, upload_id: uuid.UUID, owner_id: uuid.UUID) -> UploadProgress:
-        session = await self._get_owned_session(upload_id, owner_id)
+    async def get_progress(self, upload_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> UploadProgress:
+        session = await self._get_owned_session(upload_id, owner_id, organization_id)
         await self._apply_expiration_if_needed(session)
 
         verified_chunks = await self._chunks.list_verified_ordered(upload_id)
@@ -418,8 +428,8 @@ class ChunkedUploadService(OutboxEmitterMixin):
             uploaded_bytes=uploaded_bytes,
         )
 
-    async def list_chunks(self, upload_id: uuid.UUID, owner_id: uuid.UUID) -> list[UploadChunk]:
-        await self._get_owned_session(upload_id, owner_id)  # ownership check only
+    async def list_chunks(self, upload_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[UploadChunk]:
+        await self._get_owned_session(upload_id, owner_id, organization_id)  # ownership check only
         return await self._chunks.list_for_upload(upload_id)
 
     # ------------------------------------------------------------------
@@ -429,12 +439,13 @@ class ChunkedUploadService(OutboxEmitterMixin):
         self,
         upload_id: uuid.UUID,
         owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
         chunk_number: int,
         data: bytes,
         *,
         declared_checksum: str | None = None,
     ) -> UploadChunk:
-        session = await self._get_owned_session(upload_id, owner_id)
+        session = await self._get_owned_session(upload_id, owner_id, organization_id)
         await self._apply_expiration_if_needed(session)
 
         if session.status == UploadSessionStatus.EXPIRED:
@@ -553,9 +564,11 @@ class ChunkedUploadService(OutboxEmitterMixin):
     # ------------------------------------------------------------------
     # Completion
     # ------------------------------------------------------------------
-    async def complete_upload(self, upload_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> FileMetadata:
+    async def complete_upload(
+        self, upload_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> FileMetadata:
         async with self._guarded_lock(f"upload-session:{upload_id}", ttl_seconds=self._settings.LOCK_DEFAULT_TTL_SECONDS):
-            session = await self._get_owned_session(upload_id, owner_id)
+            session = await self._get_owned_session(upload_id, owner_id, organization_id)
 
             if session.status == UploadSessionStatus.COMPLETED:
                 # Idempotent: a repeated completion request (with or
@@ -563,7 +576,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
                 # instead of redoing (or erroring on) already-finished work.
                 if session.file_id is None:  # pragma: no cover - defensive
                     raise UploadIncompleteException("Upload session is marked completed but has no associated file.")
-                file = await self._files.get_active_by_id(session.file_id, owner_id)
+                file = await self._files.get_active_by_id(session.file_id, owner_id, organization_id)
                 if file is None:  # pragma: no cover - defensive
                     raise FileNotFoundException()
                 return file
@@ -650,14 +663,27 @@ class ChunkedUploadService(OutboxEmitterMixin):
             declared_content_type=session.mime_type,
         )
 
-        if await self._files.name_exists_in_folder(session.owner_id, session.folder_id, session.filename):
+        if await self._files.name_exists_in_folder(
+            session.owner_id, session.organization_id, session.folder_id, session.filename
+        ):
             raise DuplicateFileException()
+
+        # Phase 13: reserved here, immediately before the FileMetadata
+        # row is created — the same "reserve at completion" contract
+        # `QuotaService`'s docstring describes for the single-shot
+        # upload path, applied to the chunked path's own completion
+        # point instead of its (much earlier) initiate step.
+        if self._quota is not None and not await self._quota.try_reserve(
+            session.organization_id, size_bytes=compose_result.size, file_delta=1
+        ):
+            raise QuotaExceededException()
 
         extension = session.filename.rsplit(".", 1)[-1].lower() if "." in session.filename else None
         stored_filename = f"{uuid.uuid4()}.{extension}" if extension else str(uuid.uuid4())
 
         file = FileMetadata(
             owner_id=session.owner_id,
+            organization_id=session.organization_id,
             folder_id=session.folder_id,
             original_filename=session.filename,
             stored_filename=stored_filename,
@@ -677,8 +703,13 @@ class ChunkedUploadService(OutboxEmitterMixin):
             created_by=actor_id,
             updated_by=actor_id,
         )
-        file = await self._files.add(file)
-        await self._versions.create(file_id=file.id, version=1, checksum=actual_checksum, size=compose_result.size)
+        try:
+            file = await self._files.add(file)
+            await self._versions.create(file_id=file.id, version=1, checksum=actual_checksum, size=compose_result.size)
+        except Exception:
+            if self._quota is not None:
+                await self._quota.release(session.organization_id, size_bytes=compose_result.size, file_delta=1)
+            raise
 
         # Phase 8, event #1 of 2: `file.completed` describes the FILE that
         # now exists — the same shape `file.uploaded` has for Phase 3's
@@ -689,6 +720,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             aggregate_type="file",
             aggregate_id=file.id,
             user_id=session.owner_id,
+            organization_id=session.organization_id,
             payload={
                 "file_id": str(file.id),
                 "upload_id": str(session.id),
@@ -728,6 +760,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
             aggregate_type="upload_session",
             aggregate_id=session.id,
             user_id=session.owner_id,
+            organization_id=session.organization_id,
             payload={
                 "upload_id": str(session.id),
                 "file_id": str(file.id),
@@ -744,9 +777,9 @@ class ChunkedUploadService(OutboxEmitterMixin):
     # ------------------------------------------------------------------
     # Cancellation / deletion
     # ------------------------------------------------------------------
-    async def cancel_upload(self, upload_id: uuid.UUID, owner_id: uuid.UUID) -> UploadSession:
+    async def cancel_upload(self, upload_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> UploadSession:
         async with self._guarded_lock(f"upload-session:{upload_id}", ttl_seconds=self._settings.LOCK_DEFAULT_TTL_SECONDS):
-            session = await self._get_owned_session(upload_id, owner_id)
+            session = await self._get_owned_session(upload_id, owner_id, organization_id)
 
             if session.status == UploadSessionStatus.CANCELLED:
                 return session  # idempotent no-op
@@ -774,7 +807,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
         logger.info("upload_cancelled", upload_id=str(upload_id))
         return session
 
-    async def delete_upload(self, upload_id: uuid.UUID, owner_id: uuid.UUID) -> None:
+    async def delete_upload(self, upload_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> None:
         """
         `DELETE /uploads/{id}` — a strict superset of cancel: cancels
         first if the session is still active (freeing its temp GCS
@@ -785,7 +818,7 @@ class ChunkedUploadService(OutboxEmitterMixin):
         `/files/{id}` deletion instead, which is the deliberately
         distinct trash/permanent-delete flow Phase 2/3 already built.
         """
-        session = await self._get_owned_session(upload_id, owner_id)
+        session = await self._get_owned_session(upload_id, owner_id, organization_id)
 
         if session.status == UploadSessionStatus.COMPLETED:
             raise UploadAlreadyFinalizedException(
@@ -793,8 +826,8 @@ class ChunkedUploadService(OutboxEmitterMixin):
             )
 
         if not UploadStateMachine.is_terminal(session.status):
-            await self.cancel_upload(upload_id, owner_id)
-            session = await self._get_owned_session(upload_id, owner_id)
+            await self.cancel_upload(upload_id, owner_id, organization_id)
+            session = await self._get_owned_session(upload_id, owner_id, organization_id)
 
         await self._sessions.delete(session)
         logger.info("upload_session_deleted", upload_id=str(upload_id))
