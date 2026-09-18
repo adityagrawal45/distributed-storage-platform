@@ -26,30 +26,63 @@ class FolderRepository(BaseRepository[Folder]):
     def __init__(self, session: AsyncSession):
         super().__init__(session)
 
-    async def get_active_by_id(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> Folder | None:
+    async def get_active_by_id(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> Folder | None:
+        """
+        `organization_id` is a REQUIRED positional parameter, not an
+        optional filter (Phase 13 §4) — a call site that forgets to
+        pass it is a `TypeError` at the call, not a silently-unscoped
+        query at runtime. This is the mechanism (not merely the
+        convention) behind "tenant isolation is difficult to bypass".
+        """
         result = await self._session.execute(
             select(Folder).where(
-                Folder.id == folder_id, Folder.owner_id == owner_id, Folder.is_deleted.is_(False)
+                Folder.id == folder_id,
+                Folder.owner_id == owner_id,
+                Folder.organization_id == organization_id,
+                Folder.is_deleted.is_(False),
             )
         )
         return result.scalar_one_or_none()
 
-    async def get_any_by_id(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> Folder | None:
+    async def get_any_by_id(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> Folder | None:
         """Fetches regardless of soft-delete state (used by restore/permanent-delete)."""
         result = await self._session.execute(
-            select(Folder).where(Folder.id == folder_id, Folder.owner_id == owner_id)
+            select(Folder).where(
+                Folder.id == folder_id, Folder.owner_id == owner_id, Folder.organization_id == organization_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_in_organization(self, folder_id: uuid.UUID, organization_id: uuid.UUID) -> Folder | None:
+        """
+        Owner-agnostic lookup, scoped ONLY by organization — used by
+        `PermissionResolver`/`ShareService` to resolve a resource a
+        caller does NOT own but may have been granted access to. Still
+        never omits `organization_id`: a non-owner's access is decided
+        by permission grants, never by "any folder in the database".
+        """
+        result = await self._session.execute(
+            select(Folder).where(
+                Folder.id == folder_id, Folder.organization_id == organization_id, Folder.is_deleted.is_(False)
+            )
         )
         return result.scalar_one_or_none()
 
     async def name_exists_in_parent(
         self,
         owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
         parent_folder_id: uuid.UUID | None,
         name: str,
         exclude_id: uuid.UUID | None = None,
     ) -> bool:
         conditions = [
             Folder.owner_id == owner_id,
+            Folder.organization_id == organization_id,
             Folder.name == name,
             Folder.is_deleted.is_(False),
             Folder.parent_folder_id == parent_folder_id
@@ -63,10 +96,15 @@ class FolderRepository(BaseRepository[Folder]):
         return result.scalar_one_or_none() is not None
 
     async def list_children(
-        self, owner_id: uuid.UUID, parent_folder_id: uuid.UUID | None, params: FolderListParams
+        self,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        parent_folder_id: uuid.UUID | None,
+        params: FolderListParams,
     ) -> list[Folder]:
         conditions = [
             Folder.owner_id == owner_id,
+            Folder.organization_id == organization_id,
             Folder.parent_folder_id == parent_folder_id
             if parent_folder_id is not None
             else Folder.parent_folder_id.is_(None),
@@ -86,26 +124,53 @@ class FolderRepository(BaseRepository[Folder]):
         result = await self._session.execute(select(Folder).where(and_(*conditions)).order_by(order))
         return list(result.scalars().all())
 
-    async def list_descendants(self, folder: Folder, owner_id: uuid.UUID) -> list[Folder]:
+    async def list_descendants(self, folder: Folder, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[Folder]:
         """All folders whose path is nested under `folder.path` (any depth)."""
         prefix = folder.path.rstrip("/") + "/"
         result = await self._session.execute(
-            select(Folder).where(Folder.owner_id == owner_id, Folder.path.like(f"{prefix}%"))
+            select(Folder).where(
+                Folder.owner_id == owner_id,
+                Folder.organization_id == organization_id,
+                Folder.path.like(f"{prefix}%"),
+            )
         )
         return list(result.scalars().all())
 
-    async def list_all_active(self, owner_id: uuid.UUID) -> list[Folder]:
+    async def list_all_active(self, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[Folder]:
         """All non-deleted folders for an owner, in one query (used to build the full tree in memory)."""
         result = await self._session.execute(
-            select(Folder).where(Folder.owner_id == owner_id, Folder.is_deleted.is_(False))
+            select(Folder).where(
+                Folder.owner_id == owner_id, Folder.organization_id == organization_id, Folder.is_deleted.is_(False)
+            )
         )
         return list(result.scalars().all())
 
-    async def list_trash(self, owner_id: uuid.UUID) -> list[Folder]:
+    async def list_trash(self, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[Folder]:
         result = await self._session.execute(
             select(Folder)
-            .where(Folder.owner_id == owner_id, Folder.is_deleted.is_(True))
+            .where(
+                Folder.owner_id == owner_id, Folder.organization_id == organization_id, Folder.is_deleted.is_(True)
+            )
             .order_by(Folder.deleted_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def get_ancestor_folder_ids_by_path(
+        self, organization_id: uuid.UUID, paths: list[str]
+    ) -> list[uuid.UUID]:
+        """
+        Resolves a list of exact path strings (an ancestor chain,
+        computed by the caller from one folder's own materialized
+        `path` — see `app/core/authorization.py`) to their folder IDs,
+        scoped to one organization. Used by `PermissionResolver` to
+        find which ancestor folders (if any) have a `ResourcePermission`
+        grant that should cascade down to the resource actually being
+        accessed.
+        """
+        if not paths:
+            return []
+        result = await self._session.execute(
+            select(Folder.id).where(Folder.organization_id == organization_id, Folder.path.in_(paths))
         )
         return list(result.scalars().all())
 
@@ -123,7 +188,11 @@ class FolderRepository(BaseRepository[Folder]):
         new_prefix = new_path.rstrip("/") + "/"
 
         result = await self._session.execute(
-            select(Folder).where(Folder.owner_id == folder.owner_id, Folder.path.like(f"{old_prefix}%"))
+            select(Folder).where(
+                Folder.owner_id == folder.owner_id,
+                Folder.organization_id == folder.organization_id,
+                Folder.path.like(f"{old_prefix}%"),
+            )
         )
         for descendant in result.scalars().all():
             descendant.path = new_prefix + descendant.path[len(old_prefix):]
@@ -136,7 +205,11 @@ class FolderRepository(BaseRepository[Folder]):
         prefix = folder.path.rstrip("/") + "/"
         await self._session.execute(
             update(Folder)
-            .where(Folder.owner_id == folder.owner_id, Folder.path.like(f"{prefix}%"))
+            .where(
+                Folder.owner_id == folder.owner_id,
+                Folder.organization_id == folder.organization_id,
+                Folder.path.like(f"{prefix}%"),
+            )
             .values(level=Folder.level + level_delta)
         )
         await self._session.flush()
