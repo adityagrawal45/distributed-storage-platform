@@ -13,15 +13,11 @@ Phase 7 - caching and authorization
 `get_metadata_cached` is cache-aside on `nimbusfs:file:{id}`, a
 resource-scoped key. As with folders, this does NOT bypass the ownership
 filter that `FileMetadataRepository.get_active_by_id`'s WHERE clause
-provides: `_authorize_cached` re-applies "owned by this caller AND not
-soft-deleted" to the cached payload and raises the identical
-`FileNotFoundException` on mismatch, so a non-owner cannot use the cache
-to confirm that a file ID exists. There is no per-user variation in a
-file's representation today (NimbusFS has no sharing yet - see README's
-future roadmap), so a per-resource key is correct; if per-user
-*permissions* are added in a later phase, the permission set must become
-part of the key or be re-evaluated on every read, and this docstring is
-the place that will need updating.
+provides: `_authorize_cached` re-applies "owned by this caller, in this
+caller's organization (Phase 13), AND not soft-deleted" to the cached
+payload and raises the identical `FileNotFoundException` on mismatch, so
+a non-owner (or a caller in a different tenant) cannot use the cache to
+confirm that a file ID exists.
 
 Every mutating method invalidates through `CacheInvalidator.file_changed`
 / `file_moved`, which also clears the containing folder's children
@@ -93,10 +89,14 @@ class MetadataService(OutboxEmitterMixin):
         return self._cache is not None and self._cache.enabled
 
     @staticmethod
-    def _authorize_cached(payload: dict, owner_id: uuid.UUID) -> FileMetadataRead:
-        """Re-applies the repository ownership/not-deleted filter to a cached payload."""
+    def _authorize_cached(payload: dict, owner_id: uuid.UUID, organization_id: uuid.UUID) -> FileMetadataRead:
+        """Re-applies the repository ownership/tenant/not-deleted filter to a cached payload."""
         file = FileMetadataRead.model_validate(payload)
-        if str(file.owner_id) != str(owner_id) or file.is_deleted:
+        if (
+            str(file.owner_id) != str(owner_id)
+            or str(file.organization_id) != str(organization_id)
+            or file.is_deleted
+        ):
             raise FileNotFoundException()
         return file
 
@@ -104,16 +104,18 @@ class MetadataService(OutboxEmitterMixin):
         if self._invalidator is not None:
             await self._invalidator.file_changed(file.id, file.owner_id, file.folder_id)
 
-    async def _get_owned_active(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadata:
-        file = await self._files.get_active_by_id(file_id, owner_id)
+    async def _get_owned_active(self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> FileMetadata:
+        file = await self._files.get_active_by_id(file_id, owner_id, organization_id)
         if file is None:
             raise FileNotFoundException()
         return file
 
-    async def _validate_folder(self, owner_id: uuid.UUID, folder_id: uuid.UUID | None) -> None:
+    async def _validate_folder(
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, folder_id: uuid.UUID | None
+    ) -> None:
         if folder_id is None:
             return
-        folder = await self._folders.get_active_by_id(folder_id, owner_id)
+        folder = await self._folders.get_active_by_id(folder_id, owner_id, organization_id)
         if folder is None:
             raise FolderNotFoundException(detail="Target folder not found.")
 
@@ -123,10 +125,14 @@ class MetadataService(OutboxEmitterMixin):
             return None
         return filename.rsplit(".", 1)[-1].lower()
 
-    async def create_metadata(self, owner_id: uuid.UUID, payload: FileMetadataCreate) -> FileMetadata:
-        await self._validate_folder(owner_id, payload.folder_id)
+    async def create_metadata(
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, payload: FileMetadataCreate
+    ) -> FileMetadata:
+        await self._validate_folder(owner_id, organization_id, payload.folder_id)
 
-        if await self._files.name_exists_in_folder(owner_id, payload.folder_id, payload.original_filename):
+        if await self._files.name_exists_in_folder(
+            owner_id, organization_id, payload.folder_id, payload.original_filename
+        ):
             raise DuplicateFileException()
 
         extension = self._split_extension(payload.original_filename)
@@ -136,6 +142,7 @@ class MetadataService(OutboxEmitterMixin):
 
         file = FileMetadata(
             owner_id=owner_id,
+            organization_id=organization_id,
             folder_id=payload.folder_id,
             original_filename=payload.original_filename,
             stored_filename=stored_filename,
@@ -152,38 +159,39 @@ class MetadataService(OutboxEmitterMixin):
         await self._invalidate_file(file)
         return file
 
-    async def get_metadata(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadata:
-        return await self._get_owned_active(file_id, owner_id)
+    async def get_metadata(self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> FileMetadata:
+        return await self._get_owned_active(file_id, owner_id, organization_id)
 
-    async def get_metadata_cached(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadataRead:
+    async def get_metadata_cached(
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> FileMetadataRead:
         """Cache-aside `get_metadata`, returning the API schema. See module docstring on authorization."""
-        # Bound to a local rather than repeatedly re-reading `self._cache`
-        # (Phase 12 mypy pass): mypy narrows a LOCAL variable's `X | None`
-        # to `X` after an `is None` guard, but does not see through the
-        # `self._caching` PROPERTY call above to narrow `self._cache`
-        # itself — every `self._cache.foo` below would otherwise still be
-        # typed `CacheService | None`, despite `_caching` being exactly
-        # the check that guarantees it isn't.
         cache = self._cache
         if cache is None or not cache.enabled:
-            return FileMetadataRead.model_validate(await self._get_owned_active(file_id, owner_id))
+            return FileMetadataRead.model_validate(await self._get_owned_active(file_id, owner_id, organization_id))
 
         key = cache.keys.file(file_id)
 
         async def _load() -> dict:
-            # Loaded un-owner-filtered on purpose: the cached entry is a
-            # per-resource representation and `_authorize_cached` applies
-            # the ownership check to the cached and fresh paths alike.
-            file = await self._files.get_any_by_id(file_id, owner_id)
+            # Loaded un-owner-filtered (org-filtered only) on purpose: the
+            # cached entry is a per-resource representation and
+            # `_authorize_cached` applies the ownership+tenant check to
+            # the cached and fresh paths alike.
+            file = await self._files.get_in_organization(file_id, organization_id)
             if file is None:
                 raise FileNotFoundException()
             return FileMetadataRead.model_validate(file).model_dump(mode="json")
 
         payload = await cache.get_or_set(key, _load, cache.ttl_for(CacheEntity.FILE), entity=CacheEntity.FILE)
-        return self._authorize_cached(payload, owner_id)
+        return self._authorize_cached(payload, owner_id, organization_id)
 
     async def update_metadata(
-        self, file_id: uuid.UUID, owner_id: uuid.UUID, payload: FileMetadataUpdate, actor_id: uuid.UUID
+        self,
+        file_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        payload: FileMetadataUpdate,
+        actor_id: uuid.UUID,
     ) -> FileMetadata:
         """
         Updates mutable metadata fields. If `size` or `checksum` change,
@@ -191,7 +199,7 @@ class MetadataService(OutboxEmitterMixin):
         `FileVersion` snapshot row is recorded, mirroring how a real
         upload-a-new-revision flow will work once storage is wired up.
         """
-        file = await self._get_owned_active(file_id, owner_id)
+        file = await self._get_owned_active(file_id, owner_id, organization_id)
 
         content_changed = False
         if payload.mime_type is not None:
@@ -223,14 +231,21 @@ class MetadataService(OutboxEmitterMixin):
         return file
 
     async def rename_file(
-        self, file_id: uuid.UUID, owner_id: uuid.UUID, new_name: str, actor_id: uuid.UUID
+        self,
+        file_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        new_name: str,
+        actor_id: uuid.UUID,
     ) -> FileMetadata:
-        file = await self._get_owned_active(file_id, owner_id)
+        file = await self._get_owned_active(file_id, owner_id, organization_id)
 
         if file.original_filename == new_name:
             return file
 
-        if await self._files.name_exists_in_folder(owner_id, file.folder_id, new_name, exclude_id=file.id):
+        if await self._files.name_exists_in_folder(
+            owner_id, organization_id, file.folder_id, new_name, exclude_id=file.id
+        ):
             raise DuplicateFileException()
 
         old_name = file.original_filename
@@ -242,17 +257,22 @@ class MetadataService(OutboxEmitterMixin):
         return file
 
     async def move_file(
-        self, file_id: uuid.UUID, owner_id: uuid.UUID, new_folder_id: uuid.UUID | None, actor_id: uuid.UUID
+        self,
+        file_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        new_folder_id: uuid.UUID | None,
+        actor_id: uuid.UUID,
     ) -> FileMetadata:
-        file = await self._get_owned_active(file_id, owner_id)
+        file = await self._get_owned_active(file_id, owner_id, organization_id)
 
         if file.folder_id == new_folder_id:
             return file
 
-        await self._validate_folder(owner_id, new_folder_id)
+        await self._validate_folder(owner_id, organization_id, new_folder_id)
 
         if await self._files.name_exists_in_folder(
-            owner_id, new_folder_id, file.original_filename, exclude_id=file.id
+            owner_id, organization_id, new_folder_id, file.original_filename, exclude_id=file.id
         ):
             raise DuplicateFileException(detail="A file with this name already exists in the destination.")
 
@@ -271,8 +291,10 @@ class MetadataService(OutboxEmitterMixin):
         )
         return file
 
-    async def delete_file(self, file_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> None:
-        file = await self._get_owned_active(file_id, owner_id)
+    async def delete_file(
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> None:
+        file = await self._get_owned_active(file_id, owner_id, organization_id)
         file.is_deleted = True
         file.deleted_at = datetime.now(UTC)
         file.deleted_by = actor_id
@@ -287,8 +309,10 @@ class MetadataService(OutboxEmitterMixin):
             {"soft_delete": True, "folder_id": str(file.folder_id) if file.folder_id else None},
         )
 
-    async def restore_file(self, file_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> FileMetadata:
-        file = await self._files.get_any_by_id(file_id, owner_id)
+    async def restore_file(
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> FileMetadata:
+        file = await self._files.get_any_by_id(file_id, owner_id, organization_id)
         if file is None or not file.is_deleted:
             raise FileNotFoundException(detail="File not found in trash.")
 
@@ -304,8 +328,8 @@ class MetadataService(OutboxEmitterMixin):
         )
         return file
 
-    async def permanent_delete_file(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> None:
-        file = await self._files.get_any_by_id(file_id, owner_id)
+    async def permanent_delete_file(self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> None:
+        file = await self._files.get_any_by_id(file_id, owner_id, organization_id)
         if file is None:
             raise FileNotFoundException()
         if not file.is_deleted:
@@ -314,5 +338,5 @@ class MetadataService(OutboxEmitterMixin):
         await self._files.delete(file)
         await self._invalidate_file(file)
 
-    async def list_trash(self, owner_id: uuid.UUID) -> list[FileMetadata]:
-        return await self._files.list_trash(owner_id)
+    async def list_trash(self, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[FileMetadata]:
+        return await self._files.list_trash(owner_id, organization_id)
