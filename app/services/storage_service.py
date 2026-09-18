@@ -117,8 +117,22 @@ class StorageService:
     # Object naming
     # ------------------------------------------------------------------
     @staticmethod
-    def generate_object_name(owner_id: uuid.UUID, extension: str | None, tenant_id: str = "default") -> str:
-        """Builds a unique, non-user-controlled object key. See module docstring for rationale."""
+    def generate_object_name(owner_id: uuid.UUID, extension: str | None, tenant_id: str) -> str:
+        """
+        Builds a unique, non-user-controlled object key. See module docstring for rationale.
+
+        `tenant_id` is now REQUIRED, not defaulted to the literal
+        string `"default"` (Phase 13 §19) — every caller passes the
+        real `organization_id`, so two organizations' objects live
+        under structurally different GCS prefixes
+        (`{organization_id}/{owner_id}/...`) even though Postgres-level
+        `organization_id` filtering is what actually decides who may
+        REQUEST a given object (a shared prefix alone grants no
+        access — GCS has no per-prefix ACL NimbusFS relies on here;
+        see `docs/multi-tenancy.md` "GCS isolation" for why this is
+        namespacing for operational clarity, not the access-control
+        mechanism itself).
+        """
         now = datetime.now(UTC)
         suffix = f"{uuid.uuid4()}.{extension.lstrip('.').lower()}" if extension else str(uuid.uuid4())
         return f"{tenant_id}/{owner_id}/{now.year:04d}/{now.month:02d}/{suffix}"
