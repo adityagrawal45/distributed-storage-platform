@@ -16,15 +16,29 @@ rollback strategy; the shared principle is:
   between Postgres and GCS.
 
 Duplicate-content design decision: when a byte-identical file (same
-SHA-256, same owner, not deleted) already exists, this service does NOT
-re-upload the bytes — the new metadata row's `object_name`/`bucket_name`
-point at the SAME GCS object as the original. This is deliberate
-content-addressable-storage behavior: it saves storage cost and upload
-bandwidth for the common case of a user uploading the same file into two
-different folders, or re-uploading after a client-side retry. The
-trade-off this creates — one GCS object can now be referenced by more
-than one `FileMetadata` row — is exactly why `permanent_delete` (below)
-checks for other referencing rows before deleting the object itself.
+SHA-256, same owner, same organization — Phase 13, not deleted) already
+exists, this service does NOT re-upload the bytes — the new metadata
+row's `object_name`/`bucket_name` point at the SAME GCS object as the
+original. This is deliberate content-addressable-storage behavior: it
+saves storage cost and upload bandwidth for the common case of a user
+uploading the same file into two different folders, or re-uploading
+after a client-side retry. The trade-off this creates — one GCS object
+can now be referenced by more than one `FileMetadata` row — is exactly
+why `permanent_delete` (below) checks for other referencing rows before
+deleting the object itself.
+
+Phase 13 — quota
+-----------------
+`QuotaService.try_reserve` is called immediately before the metadata
+row is persisted (after a real, non-deduped upload's bytes have
+already landed — see `QuotaService`'s own docstring for why reservation
+happens at completion, not at upload start). A rejected reservation
+rolls back the just-uploaded object exactly like a metadata-persistence
+failure does, via the SAME `_rollback_object` path — from the rollback
+logic's point of view, "the metadata write failed" and "the quota
+reservation failed" are the same kind of failure (bytes exist, nothing
+in Postgres may reference them), so they share one rollback mechanism
+rather than two.
 """
 
 import asyncio
@@ -50,6 +64,7 @@ from app.exceptions.custom_exceptions import (
     DuplicateFileException,
     FileNotFoundException,
     FolderNotFoundException,
+    QuotaExceededException,
     RollbackFailedException,
     ValidationException,
 )
@@ -62,6 +77,7 @@ from app.repositories.outbox_repository import OutboxRepository
 from app.services.audit_service import AuditService
 from app.services.cache_invalidator import CacheInvalidator
 from app.services.file_validation_service import FileValidationService
+from app.services.quota_service import QuotaService
 from app.services.storage_service import StorageService
 
 logger = get_logger(__name__)
@@ -82,6 +98,7 @@ class FileUploadService(OutboxEmitterMixin):
         invalidator: CacheInvalidator | None = None,
         outbox: OutboxRepository | None = None,
         audit: AuditService | None = None,
+        quota: QuotaService | None = None,
     ):
         self._files = file_repository
         self._folders = folder_repository
@@ -101,6 +118,11 @@ class FileUploadService(OutboxEmitterMixin):
         # docstring for why FILE_DOWNLOAD is audited at the route layer
         # instead.
         self._audit = audit
+        # Phase 13: same technique again, for storage-quota enforcement.
+        # `None` means "no quota enforcement" — used by every test that
+        # doesn't care about quotas, exactly like `cache=None` disables
+        # caching without those tests needing to know quotas exist.
+        self._quota = quota
 
     async def _invalidate_file(self, file: FileMetadata) -> None:
         if self._invalidator is not None:
@@ -110,10 +132,12 @@ class FileUploadService(OutboxEmitterMixin):
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
-    async def _validate_folder(self, owner_id: uuid.UUID, folder_id: uuid.UUID | None) -> None:
+    async def _validate_folder(
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, folder_id: uuid.UUID | None
+    ) -> None:
         if folder_id is None:
             return
-        folder = await self._folders.get_active_by_id(folder_id, owner_id)
+        folder = await self._folders.get_active_by_id(folder_id, owner_id, organization_id)
         if folder is None:
             raise FolderNotFoundException(detail="Target folder not found.")
 
@@ -143,31 +167,36 @@ class FileUploadService(OutboxEmitterMixin):
             return None
         return filename.rsplit(".", 1)[-1].lower()
 
-    async def _get_owned_active(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadata:
-        file = await self._files.get_active_by_id(file_id, owner_id)
+    async def _get_owned_active(self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> FileMetadata:
+        file = await self._files.get_active_by_id(file_id, owner_id, organization_id)
         if file is None:
             raise FileNotFoundException()
         return file
 
-    async def _object_still_referenced(self, object_name: str, exclude_id: uuid.UUID | None = None) -> bool:
-        """True if some other, non-deleted FileMetadata row still points at this object (dedup safety check)."""
-        return await self._files.object_name_in_use(object_name, exclude_id=exclude_id)
+    async def _object_still_referenced(
+        self, object_name: str, organization_id: uuid.UUID, exclude_id: uuid.UUID | None = None
+    ) -> bool:
+        """True if some other, non-deleted FileMetadata row (same organization) still points at this
+        object (dedup safety check)."""
+        return await self._files.object_name_in_use(object_name, organization_id, exclude_id=exclude_id)
 
     # ------------------------------------------------------------------
     # Upload
     # ------------------------------------------------------------------
     async def upload_file(
-        self, owner_id: uuid.UUID, folder_id: uuid.UUID | None, upload_file: UploadFile
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, folder_id: uuid.UUID | None, upload_file: UploadFile
     ) -> tuple[FileMetadata, bool]:
         """
         Returns `(file_metadata, is_duplicate)`. Flow: validate folder ->
         validate+hash the upload -> reject duplicate filenames early
         (before spending a network upload) -> dedupe identical content ->
-        upload bytes (unless deduped) -> persist metadata + v1 version.
+        upload bytes (unless deduped) -> reserve quota -> persist
+        metadata + v1 version.
 
-        Rollback: if metadata persistence fails AFTER a real (non-deduped)
-        upload succeeded, the just-uploaded object is deleted so we never
-        leave an orphaned, unreferenced object in the bucket.
+        Rollback: if quota reservation or metadata persistence fails
+        AFTER a real (non-deduped) upload succeeded, the just-uploaded
+        object is deleted so we never leave an orphaned, unreferenced
+        object in the bucket.
 
         Phase 11: this outer method is a thin metrics wrapper around
         `_upload_file_inner` (all the actual logic, unchanged) — timing
@@ -178,7 +207,7 @@ class FileUploadService(OutboxEmitterMixin):
         """
         started = time.perf_counter()
         try:
-            file, is_duplicate = await self._upload_file_inner(owner_id, folder_id, upload_file)
+            file, is_duplicate = await self._upload_file_inner(owner_id, organization_id, folder_id, upload_file)
         except Exception:
             safe_call(lambda: FILES_UPLOADED_TOTAL.labels(result="failure").inc(), operation="files_uploaded_inc")
             raise
@@ -193,9 +222,13 @@ class FileUploadService(OutboxEmitterMixin):
         return file, is_duplicate
 
     async def _upload_file_inner(
-        self, owner_id: uuid.UUID, folder_id: uuid.UUID | None, upload_file: UploadFile
+        self,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        folder_id: uuid.UUID | None,
+        upload_file: UploadFile,
     ) -> tuple[FileMetadata, bool]:
-        await self._validate_folder(owner_id, folder_id)
+        await self._validate_folder(owner_id, organization_id, folder_id)
 
         if not upload_file.filename:
             raise ValidationException("A filename is required.")
@@ -209,10 +242,10 @@ class FileUploadService(OutboxEmitterMixin):
         )
         extension = self._split_extension(validated_filename)
 
-        if await self._files.name_exists_in_folder(owner_id, folder_id, validated_filename):
+        if await self._files.name_exists_in_folder(owner_id, organization_id, folder_id, validated_filename):
             raise DuplicateFileException()
 
-        duplicate_source = await self._files.get_by_checksum(owner_id, checksum)
+        duplicate_source = await self._files.get_by_checksum(owner_id, organization_id, checksum)
         is_duplicate = duplicate_source is not None
 
         if duplicate_source is not None:
@@ -234,7 +267,7 @@ class FileUploadService(OutboxEmitterMixin):
             storage_class = duplicate_source.storage_class
             uploaded_object_this_call = False
         else:
-            object_name = self._storage.generate_object_name(owner_id, extension)
+            object_name = self._storage.generate_object_name(owner_id, extension, tenant_id=str(organization_id))
             result = await self._storage.upload(
                 object_name,
                 upload_file.file,
@@ -246,6 +279,18 @@ class FileUploadService(OutboxEmitterMixin):
             uploaded_object_this_call = True
             safe_call(lambda: UPLOAD_BYTES_TOTAL.inc(size), operation="upload_bytes_total_inc")
 
+        # Phase 13: quota is reserved for `file_count` always (+1), but
+        # for `storage_used_bytes` only when this call actually put new
+        # bytes in GCS — a de-duplicated upload costs zero additional
+        # bytes against the quota, matching `QuotaService`'s own
+        # docstring ("what counts against quota, and when").
+        if self._quota is not None:
+            reserved_bytes = size if uploaded_object_this_call else 0
+            if not await self._quota.try_reserve(organization_id, size_bytes=reserved_bytes, file_delta=1):
+                if uploaded_object_this_call:
+                    await self._rollback_object(object_name)
+                raise QuotaExceededException()
+
         try:
             # `stored_filename` is Phase 2's per-row unique key reservation
             # and must stay unique even when `object_name` (the physical
@@ -253,6 +298,7 @@ class FileUploadService(OutboxEmitterMixin):
             stored_filename = f"{uuid.uuid4()}.{extension}" if extension else str(uuid.uuid4())
             file = FileMetadata(
                 owner_id=owner_id,
+                organization_id=organization_id,
                 folder_id=folder_id,
                 original_filename=validated_filename,
                 stored_filename=stored_filename,
@@ -284,8 +330,10 @@ class FileUploadService(OutboxEmitterMixin):
                 aggregate_type="file",
                 aggregate_id=file.id,
                 user_id=owner_id,
+                organization_id=organization_id,
                 payload={
                     "file_id": str(file.id),
+                    "organization_id": str(organization_id),
                     "folder_id": str(folder_id) if folder_id else None,
                     "filename": validated_filename,
                     "content_type": mime_type,
@@ -297,6 +345,9 @@ class FileUploadService(OutboxEmitterMixin):
                 },
             )
         except Exception:
+            if self._quota is not None:
+                reserved_bytes = size if uploaded_object_this_call else 0
+                await self._quota.release(organization_id, size_bytes=reserved_bytes, file_delta=1)
             if uploaded_object_this_call:
                 await self._rollback_object(object_name)
             raise
@@ -319,7 +370,9 @@ class FileUploadService(OutboxEmitterMixin):
     # ------------------------------------------------------------------
     # Download
     # ------------------------------------------------------------------
-    async def get_downloadable_file(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadata:
+    async def get_downloadable_file(
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> FileMetadata:
         """
         Phase 11: `files_downloaded_total` is incremented HERE (on
         access being granted), not after the streaming response finishes
@@ -330,13 +383,22 @@ class FileUploadService(OutboxEmitterMixin):
         make it to the client".
         """
         try:
-            file = await self._get_owned_active(file_id, owner_id)
+            file = await self._get_owned_active(file_id, owner_id, organization_id)
             if file.upload_status != UploadStatus.COMPLETED or not file.object_name:
                 raise FileNotFoundException(detail="This file has no uploaded content yet.")
         except Exception:
             safe_call(lambda: FILES_DOWNLOADED_TOTAL.labels(result="failure").inc(), operation="files_downloaded_inc")
             raise
         safe_call(lambda: FILES_DOWNLOADED_TOTAL.labels(result="success").inc(), operation="files_downloaded_inc")
+        return file
+
+    async def get_downloadable_in_organization(self, file_id: uuid.UUID, organization_id: uuid.UUID) -> FileMetadata:
+        """Owner-agnostic variant used by `ShareService`'s redemption path — a share grants access
+        to a resource NOT owned by whoever is downloading it, so `get_downloadable_file`'s
+        owner-filtered lookup is the wrong one to use there."""
+        file = await self._files.get_in_organization(file_id, organization_id)
+        if file is None or file.upload_status != UploadStatus.COMPLETED or not file.object_name:
+            raise FileNotFoundException(detail="This file has no uploaded content yet.")
         return file
 
     def stream(self, file: FileMetadata) -> AsyncIterator[bytes]:
@@ -372,9 +434,17 @@ class FileUploadService(OutboxEmitterMixin):
     # Signed URL
     # ------------------------------------------------------------------
     async def get_signed_url(
-        self, file_id: uuid.UUID, owner_id: uuid.UUID, expires_in_minutes: int | None
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID, expires_in_minutes: int | None
     ) -> str:
-        file = await self.get_downloadable_file(file_id, owner_id)
+        """
+        Phase 13 §20: authenticate -> determine tenant -> AUTHORIZE
+        resource (via `get_downloadable_file`'s owner+organization
+        filter) -> generate. A caller authenticated as a real NimbusFS
+        user can never reach `generate_signed_url` for a `file_id`
+        outside their own `organization_id` — the lookup above 404s
+        first, before a signed URL is ever asked of GCS.
+        """
+        file = await self.get_downloadable_file(file_id, owner_id, organization_id)
         assert file.object_name is not None  # see stream()'s comment
         return await self._storage.generate_signed_url(file.object_name, expiration_minutes=expires_in_minutes)
 
@@ -382,7 +452,12 @@ class FileUploadService(OutboxEmitterMixin):
     # Replace (new version)
     # ------------------------------------------------------------------
     async def replace_file(
-        self, file_id: uuid.UUID, owner_id: uuid.UUID, upload_file: UploadFile, actor_id: uuid.UUID
+        self,
+        file_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        upload_file: UploadFile,
+        actor_id: uuid.UUID,
     ) -> FileMetadata:
         """
         Uploads new bytes to a BRAND NEW object (never overwrites the
@@ -393,8 +468,9 @@ class FileUploadService(OutboxEmitterMixin):
         over) consistent — never a state where the metadata points at
         bytes that don't exist.
         """
-        file = await self._get_owned_active(file_id, owner_id)
+        file = await self._get_owned_active(file_id, owner_id, organization_id)
         old_object_name = file.object_name
+        old_size = file.size
 
         head_bytes, checksum, size = await self._hash_and_sniff(upload_file)
         _, mime_type = self._validator.validate_upload(
@@ -404,7 +480,20 @@ class FileUploadService(OutboxEmitterMixin):
             declared_content_type=upload_file.content_type,
         )
 
-        new_object_name = self._storage.generate_object_name(owner_id, file.extension)
+        # A replace's net quota impact is the SIZE DELTA, not the new
+        # file's full size — the old bytes are about to be released
+        # below (once nothing else references them). Reserved BEFORE
+        # the upload, same "never let bytes exist that quota didn't
+        # account for" principle `upload_file` follows.
+        size_delta = size - old_size
+        if (
+            self._quota is not None
+            and size_delta > 0
+            and not await self._quota.try_reserve(organization_id, size_bytes=size_delta, file_delta=0)
+        ):
+            raise QuotaExceededException()
+
+        new_object_name = self._storage.generate_object_name(owner_id, file.extension, tenant_id=str(organization_id))
         result = await self._storage.upload(
             new_object_name, upload_file.file, content_type=mime_type, checksum_sha256=checksum, size=size
         )
@@ -427,8 +516,10 @@ class FileUploadService(OutboxEmitterMixin):
                 aggregate_type="file",
                 aggregate_id=file.id,
                 user_id=owner_id,
+                organization_id=organization_id,
                 payload={
                     "file_id": str(file.id),
+                    "organization_id": str(organization_id),
                     "version": file.version,
                     "content_type": mime_type,
                     "size": size,
@@ -439,11 +530,17 @@ class FileUploadService(OutboxEmitterMixin):
                 },
             )
         except Exception:
+            if self._quota is not None and size_delta > 0:
+                await self._quota.release(organization_id, size_bytes=size_delta, file_delta=0)
             await self._rollback_object(new_object_name)
             raise
 
-        if old_object_name and not await self._object_still_referenced(old_object_name, exclude_id=file.id):
+        if old_object_name and not await self._object_still_referenced(old_object_name, organization_id, exclude_id=file.id):
             await self._storage.delete(old_object_name)
+        if self._quota is not None and size_delta < 0:
+            # The new file is SMALLER — release the difference now that
+            # the old (larger) object has been dropped.
+            await self._quota.release(organization_id, size_bytes=-size_delta, file_delta=0)
 
         await self._invalidate_file(file)
         logger.info("replace_completed", file_id=str(file.id), object_name=new_object_name)
@@ -452,7 +549,7 @@ class FileUploadService(OutboxEmitterMixin):
     # ------------------------------------------------------------------
     # Permanent delete (physical bytes + row)
     # ------------------------------------------------------------------
-    async def permanent_delete(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> None:
+    async def permanent_delete(self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> None:
         """
         Deletes the database row AND, if no other row still references
         the same object (see the dedup design decision above), the GCS
@@ -467,14 +564,22 @@ class FileUploadService(OutboxEmitterMixin):
         FILE_DOWNLOAD which is audited at the route layer, because this
         is a destructive mutation with owner/folder/file IDs already in
         hand from the lookup the operation itself needed anyway.
+
+        Phase 13: releases quota (bytes + file count) — but only if no
+        OTHER row still references the same object, mirroring the exact
+        condition that decides whether the GCS object itself is deleted
+        (a de-duplicated file's bytes were never separately charged, so
+        deleting ONE of several rows pointing at shared bytes must not
+        release bytes that are still legitimately in use).
         """
-        file = await self._files.get_any_by_id(file_id, owner_id)
+        file = await self._files.get_any_by_id(file_id, owner_id, organization_id)
         if file is None:
             raise FileNotFoundException()
         if not file.is_deleted:
             raise ValidationException("File must be moved to trash before it can be permanently deleted.")
 
         object_name = file.object_name
+        size = file.size
         owner = file.owner_id
         folder = file.folder_id
         await self._files.delete(file)
@@ -482,14 +587,23 @@ class FileUploadService(OutboxEmitterMixin):
         if self._invalidator is not None:
             await self._invalidator.file_changed(file_id, owner, folder)
 
-        if object_name and not await self._object_still_referenced(object_name):
+        object_still_referenced = (
+            await self._object_still_referenced(object_name, organization_id) if object_name else True
+        )
+        if object_name and not object_still_referenced:
             await self._storage.delete(object_name)
+
+        if self._quota is not None:
+            await self._quota.release(
+                organization_id, size_bytes=(0 if object_still_referenced else size), file_delta=1
+            )
 
         if self._audit is not None:
             await self._audit.record(
                 AuditEventType.FILE_DELETE,
                 result=AuditResult.SUCCESS,
                 actor_user_id=owner_id,
+                organization_id=organization_id,
                 resource_type="file",
                 resource_id=file_id,
             )
