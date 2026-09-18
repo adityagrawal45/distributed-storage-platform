@@ -26,32 +26,55 @@ class FileMetadataRepository(BaseRepository[FileMetadata]):
     def __init__(self, session: AsyncSession):
         super().__init__(session)
 
-    async def get_active_by_id(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadata | None:
+    async def get_active_by_id(
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> FileMetadata | None:
+        """`organization_id` required, not optional — see `FolderRepository.get_active_by_id`'s docstring."""
         result = await self._session.execute(
             select(FileMetadata).where(
                 FileMetadata.id == file_id,
                 FileMetadata.owner_id == owner_id,
+                FileMetadata.organization_id == organization_id,
                 FileMetadata.is_deleted.is_(False),
             )
         )
         return result.scalar_one_or_none()
 
-    async def get_any_by_id(self, file_id: uuid.UUID, owner_id: uuid.UUID) -> FileMetadata | None:
+    async def get_any_by_id(
+        self, file_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> FileMetadata | None:
         """Fetches regardless of soft-delete state (used by restore/permanent-delete)."""
         result = await self._session.execute(
-            select(FileMetadata).where(FileMetadata.id == file_id, FileMetadata.owner_id == owner_id)
+            select(FileMetadata).where(
+                FileMetadata.id == file_id,
+                FileMetadata.owner_id == owner_id,
+                FileMetadata.organization_id == organization_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_in_organization(self, file_id: uuid.UUID, organization_id: uuid.UUID) -> FileMetadata | None:
+        """Owner-agnostic lookup scoped only by organization — see `FolderRepository.get_in_organization`."""
+        result = await self._session.execute(
+            select(FileMetadata).where(
+                FileMetadata.id == file_id,
+                FileMetadata.organization_id == organization_id,
+                FileMetadata.is_deleted.is_(False),
+            )
         )
         return result.scalar_one_or_none()
 
     async def name_exists_in_folder(
         self,
         owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
         folder_id: uuid.UUID | None,
         original_filename: str,
         exclude_id: uuid.UUID | None = None,
     ) -> bool:
         conditions = [
             FileMetadata.owner_id == owner_id,
+            FileMetadata.organization_id == organization_id,
             FileMetadata.original_filename == original_filename,
             FileMetadata.is_deleted.is_(False),
             FileMetadata.folder_id == folder_id
@@ -64,16 +87,25 @@ class FileMetadataRepository(BaseRepository[FileMetadata]):
         result = await self._session.execute(select(FileMetadata.id).where(and_(*conditions)).limit(1))
         return result.scalar_one_or_none() is not None
 
-    async def get_by_checksum(self, owner_id: uuid.UUID, checksum: str) -> FileMetadata | None:
+    async def get_by_checksum(self, owner_id: uuid.UUID, organization_id: uuid.UUID, checksum: str) -> FileMetadata | None:
         """
         Finds an existing, non-deleted, successfully-uploaded file with
         identical content for this owner — used by FileUploadService to
         dedupe storage bytes (see its docstring for the full rationale).
+
+        Scoped by `organization_id` (Phase 13), not just `owner_id`: two
+        different organizations must never be told "this content already
+        exists" about each other's data, and — since deduplication makes
+        the new row point at the SAME GCS object as the match — allowing
+        a cross-organization match would mean two tenants' `FileMetadata`
+        rows silently sharing one underlying object, which is exactly the
+        kind of GCS-level tenant leak Phase 13 §19 warns about.
         """
         result = await self._session.execute(
             select(FileMetadata)
             .where(
                 FileMetadata.owner_id == owner_id,
+                FileMetadata.organization_id == organization_id,
                 FileMetadata.checksum == checksum,
                 FileMetadata.is_deleted.is_(False),
                 FileMetadata.object_name.is_not(None),
@@ -83,9 +115,18 @@ class FileMetadataRepository(BaseRepository[FileMetadata]):
         )
         return result.scalar_one_or_none()
 
-    async def object_name_in_use(self, object_name: str, exclude_id: uuid.UUID | None = None) -> bool:
-        """True if any non-deleted row (other than `exclude_id`) still points at this GCS object name."""
-        conditions = [FileMetadata.object_name == object_name, FileMetadata.is_deleted.is_(False)]
+    async def object_name_in_use(
+        self, object_name: str, organization_id: uuid.UUID, exclude_id: uuid.UUID | None = None
+    ) -> bool:
+        """True if any non-deleted row (other than `exclude_id`), IN THE SAME ORGANIZATION, still
+        points at this GCS object name. Object names are already organization-namespaced
+        (`StorageService.generate_object_name`), so a cross-org collision cannot happen in
+        practice — the filter is defense in depth, not the only thing preventing it."""
+        conditions = [
+            FileMetadata.object_name == object_name,
+            FileMetadata.organization_id == organization_id,
+            FileMetadata.is_deleted.is_(False),
+        ]
         if exclude_id is not None:
             conditions.append(FileMetadata.id != exclude_id)
         result = await self._session.execute(select(FileMetadata.id).where(and_(*conditions)).limit(1))
@@ -115,18 +156,22 @@ class FileMetadataRepository(BaseRepository[FileMetadata]):
         )
         return list(result.scalars().all())
 
-    async def list_trash(self, owner_id: uuid.UUID) -> list[FileMetadata]:
+    async def list_trash(self, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[FileMetadata]:
         result = await self._session.execute(
             select(FileMetadata)
-            .where(FileMetadata.owner_id == owner_id, FileMetadata.is_deleted.is_(True))
+            .where(
+                FileMetadata.owner_id == owner_id,
+                FileMetadata.organization_id == organization_id,
+                FileMetadata.is_deleted.is_(True),
+            )
             .order_by(FileMetadata.deleted_at.desc())
         )
         return list(result.scalars().all())
 
     async def search(
-        self, owner_id: uuid.UUID, params: FileSearchParams, offset: int, limit: int
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, params: FileSearchParams, offset: int, limit: int
     ) -> tuple[list[FileMetadata], int]:
-        conditions = [FileMetadata.owner_id == owner_id]
+        conditions = [FileMetadata.owner_id == owner_id, FileMetadata.organization_id == organization_id]
 
         if params.q:
             like_term = f"%{params.q}%"
