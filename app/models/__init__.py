@@ -2,10 +2,15 @@ from app.models.audit_log import AuditLog
 from app.models.file_metadata import FileMetadata, FileStatus
 from app.models.file_version import FileVersion
 from app.models.folder import Folder
+from app.models.group import Group, GroupMembership
 from app.models.notification import Notification
+from app.models.organization import Organization
+from app.models.organization_membership import OrganizationMembership
 from app.models.outbox_event import OutboxEvent, OutboxEventStatus
 from app.models.processed_event import ProcessedEvent, ProcessedEventStatus
 from app.models.refresh_token import RefreshToken
+from app.models.resource_permission import ResourcePermission
+from app.models.share import Share
 from app.models.upload_chunk import UploadChunk
 from app.models.upload_session import UploadSession
 from app.models.user import User, UserRole
@@ -28,4 +33,11 @@ __all__ = [
     "Notification",
     # Phase 10
     "AuditLog",
+    # Phase 13
+    "Organization",
+    "OrganizationMembership",
+    "Group",
+    "GroupMembership",
+    "ResourcePermission",
+    "Share",
 ]
