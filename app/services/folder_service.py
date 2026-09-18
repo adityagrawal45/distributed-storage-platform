@@ -3,11 +3,13 @@ Folder business logic.
 
 Design decisions:
 - Every mutation re-validates ownership by always querying with
-  `owner_id` in the WHERE clause (via the repository) — a user can never
-  even discover whether another user's folder ID exists, let alone
-  modify it. This is enforced at the repository layer, not just checked
-  after the fact in the service, so there's no path that accidentally
-  skips it.
+  `owner_id` AND `organization_id` in the WHERE clause (via the
+  repository) — a user can never even discover whether another user's
+  (or another TENANT's) folder ID exists, let alone modify it. This is
+  enforced at the repository layer, not just checked after the fact in
+  the service, so there's no path that accidentally skips it. Phase 13
+  adds `organization_id` to this same enforcement point rather than a
+  parallel one — see `docs/multi-tenancy.md` "Tenant isolation".
 - Move validation order matters: we check "does target exist" before
   "is target a descendant of self" before "is target the same as
   current parent" — cheapest/most-common failure reasons first.
@@ -24,8 +26,9 @@ is different, so it is spelled out rather than assumed:
 
 - **Folder metadata** (`nimbusfs:folder:{id}`) is keyed by resource, not by
   caller — one folder has one representation. Ownership is NOT skipped: the
-  cached payload carries `owner_id`, and `_authorize_cached` re-applies
-  exactly the check the repository's `WHERE owner_id = :owner` clause would
+  cached payload carries `owner_id`/`organization_id` (Phase 13), and
+  `_authorize_cached` re-applies exactly the check the repository's
+  `WHERE owner_id = :owner AND organization_id = :org` clause would
   have applied, raising the same `FolderNotFoundException` (never a 403 —
   a user must not be able to probe for the existence of another user's
   folder IDs, which is the property the repository-level filter provides
@@ -40,7 +43,8 @@ is different, so it is spelled out rather than assumed:
   itself contains only ancestors of an already-authorized folder.
 
 Nothing here caches an *authorization decision*. It caches resources, and
-every read re-derives the decision from the cached resource's owner.
+every read re-derives the decision from the cached resource's owner AND
+organization.
 
 Invalidation happens in every mutating method via `CacheInvalidator` (see
 that module for the fan-out and the acknowledged
@@ -93,17 +97,24 @@ class FolderService(OutboxEmitterMixin):
         return self._cache is not None and self._cache.enabled
 
     @staticmethod
-    def _authorize_cached(payload: dict, owner_id: uuid.UUID) -> FolderRead:
+    def _authorize_cached(payload: dict, owner_id: uuid.UUID, organization_id: uuid.UUID) -> FolderRead:
         """
-        Re-applies the repository's ownership + not-deleted filter to a
-        value that came from the cache instead of from a WHERE clause.
+        Re-applies the repository's ownership + tenant + not-deleted
+        filter to a value that came from the cache instead of from a
+        WHERE clause.
 
         Raises `FolderNotFoundException` (not an authorization error) on
         mismatch, preserving the existing "you cannot even discover
-        another user's folder IDs" property.
+        another user's folder IDs" property — now also true across
+        organizations (Phase 13): a cached folder from Organization A
+        must 404, not merely 403, for a caller acting in Organization B.
         """
         folder = FolderRead.model_validate(payload)
-        if str(folder.owner_id) != str(owner_id) or folder.is_deleted:
+        if (
+            str(folder.owner_id) != str(owner_id)
+            or str(folder.organization_id) != str(organization_id)
+            or folder.is_deleted
+        ):
             raise FolderNotFoundException()
         return folder
 
@@ -120,26 +131,28 @@ class FolderService(OutboxEmitterMixin):
         if self._invalidator is not None:
             await self._invalidator.folder_changed(folder.id, folder.owner_id, folder.parent_folder_id)
 
-    async def _get_owned_active(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> Folder:
-        folder = await self._folders.get_active_by_id(folder_id, owner_id)
+    async def _get_owned_active(self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> Folder:
+        folder = await self._folders.get_active_by_id(folder_id, owner_id, organization_id)
         if folder is None:
             raise FolderNotFoundException()
         return folder
 
-    async def _resolve_parent(self, owner_id: uuid.UUID, parent_folder_id: uuid.UUID | None) -> Folder | None:
+    async def _resolve_parent(
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, parent_folder_id: uuid.UUID | None
+    ) -> Folder | None:
         if parent_folder_id is None:
             return None
-        parent = await self._folders.get_active_by_id(parent_folder_id, owner_id)
+        parent = await self._folders.get_active_by_id(parent_folder_id, owner_id, organization_id)
         if parent is None:
             raise FolderNotFoundException(detail="Target parent folder not found.")
         return parent
 
     async def create_folder(
-        self, owner_id: uuid.UUID, name: str, parent_folder_id: uuid.UUID | None
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, name: str, parent_folder_id: uuid.UUID | None
     ) -> Folder:
-        parent = await self._resolve_parent(owner_id, parent_folder_id)
+        parent = await self._resolve_parent(owner_id, organization_id, parent_folder_id)
 
-        if await self._folders.name_exists_in_parent(owner_id, parent_folder_id, name):
+        if await self._folders.name_exists_in_parent(owner_id, organization_id, parent_folder_id, name):
             raise DuplicateFolderException()
 
         path = build_child_path(parent.path if parent else None, name)
@@ -147,6 +160,7 @@ class FolderService(OutboxEmitterMixin):
 
         folder = Folder(
             owner_id=owner_id,
+            organization_id=organization_id,
             parent_folder_id=parent_folder_id,
             name=name,
             path=path,
@@ -162,8 +176,10 @@ class FolderService(OutboxEmitterMixin):
             aggregate_type="folder",
             aggregate_id=folder.id,
             user_id=owner_id,
+            organization_id=organization_id,
             payload={
                 "folder_id": str(folder.id),
+                "organization_id": str(organization_id),
                 "name": folder.name,
                 "path": folder.path,
                 "level": folder.level,
@@ -172,62 +188,72 @@ class FolderService(OutboxEmitterMixin):
         )
         return folder
 
-    async def get_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> Folder:
-        return await self._get_owned_active(folder_id, owner_id)
+    async def get_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID) -> Folder:
+        return await self._get_owned_active(folder_id, owner_id, organization_id)
 
-    async def get_folder_cached(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> FolderRead:
+    async def get_folder_cached(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> FolderRead:
         """Cache-aside `get_folder`, returning the API schema. See module docstring on authorization."""
         # See metadata_service.py's get_metadata_cached for why this is a
         # local variable, not repeated `self._cache` access (Phase 12
         # mypy pass: `self._caching` is a property, opaque to narrowing).
         cache = self._cache
         if cache is None or not cache.enabled:
-            return FolderRead.model_validate(await self._get_owned_active(folder_id, owner_id))
+            return FolderRead.model_validate(await self._get_owned_active(folder_id, owner_id, organization_id))
 
         key = cache.keys.folder(folder_id)
 
         async def _load() -> dict:
-            # Loaded WITHOUT the owner filter on purpose: the cached entry
-            # is a per-resource representation shared by any authorized
-            # caller, and `_authorize_cached` applies the ownership check
-            # uniformly to both the fresh and cached paths. Loading it
-            # owner-filtered would make the cached value silently
-            # caller-specific under a resource-scoped key — exactly the
-            # bug this design is avoiding.
-            folder = await self._folders.get_any_by_id(folder_id, owner_id)
+            # Loaded WITHOUT the owner/org filter on purpose: the cached
+            # entry is a per-resource representation shared by any
+            # authorized caller, and `_authorize_cached` applies the
+            # ownership+tenant check uniformly to both the fresh and
+            # cached paths. Loading it filtered would make the cached
+            # value silently caller-specific under a resource-scoped
+            # key — exactly the bug this design is avoiding.
+            folder = await self._folders.get_in_organization(folder_id, organization_id)
             if folder is None:
                 raise FolderNotFoundException()
             return FolderRead.model_validate(folder).model_dump(mode="json")
 
         payload = await cache.get_or_set(key, _load, cache.ttl_for(CacheEntity.FOLDER), entity=CacheEntity.FOLDER)
-        return self._authorize_cached(payload, owner_id)
+        return self._authorize_cached(payload, owner_id, organization_id)
 
     async def list_children(
-        self, owner_id: uuid.UUID, parent_folder_id: uuid.UUID | None, params: FolderListParams
+        self,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        parent_folder_id: uuid.UUID | None,
+        params: FolderListParams,
     ) -> list[Folder]:
         if parent_folder_id is not None:
             # Validates the parent exists & is owned before listing its contents.
-            await self._get_owned_active(parent_folder_id, owner_id)
-        return await self._folders.list_children(owner_id, parent_folder_id, params)
+            await self._get_owned_active(parent_folder_id, owner_id, organization_id)
+        return await self._folders.list_children(owner_id, organization_id, parent_folder_id, params)
 
     async def list_children_cached(
-        self, owner_id: uuid.UUID, parent_folder_id: uuid.UUID | None, params: FolderListParams
+        self,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        parent_folder_id: uuid.UUID | None,
+        params: FolderListParams,
     ) -> list[FolderRead]:
         """Cache-aside children listing, keyed per folder AND per listing parameter set."""
         cache = self._cache
         if cache is None or not cache.enabled:
-            folders = await self.list_children(owner_id, parent_folder_id, params)
+            folders = await self.list_children(owner_id, organization_id, parent_folder_id, params)
             return [FolderRead.model_validate(f) for f in folders]
 
         if parent_folder_id is not None:
             # Authorize the parent first (itself cache-aside), so a
             # non-owner never reaches the listing key at all.
-            await self.get_folder_cached(parent_folder_id, owner_id)
+            await self.get_folder_cached(parent_folder_id, owner_id, organization_id)
 
         key = cache.keys.folder_children(parent_folder_id, owner_id, self._listing_params(params))
 
         async def _load() -> list[dict]:
-            folders = await self._folders.list_children(owner_id, parent_folder_id, params)
+            folders = await self._folders.list_children(owner_id, organization_id, parent_folder_id, params)
             return [FolderRead.model_validate(f).model_dump(mode="json") for f in folders]
 
         payload = await cache.get_or_set(
@@ -238,14 +264,21 @@ class FolderService(OutboxEmitterMixin):
         )
         return [FolderRead.model_validate(item) for item in payload]
 
-    async def rename_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID, new_name: str, actor_id: uuid.UUID) -> Folder:
-        folder = await self._get_owned_active(folder_id, owner_id)
+    async def rename_folder(
+        self,
+        folder_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        new_name: str,
+        actor_id: uuid.UUID,
+    ) -> Folder:
+        folder = await self._get_owned_active(folder_id, owner_id, organization_id)
 
         if folder.name == new_name:
             return folder
 
         if await self._folders.name_exists_in_parent(
-            owner_id, folder.parent_folder_id, new_name, exclude_id=folder.id
+            owner_id, organization_id, folder.parent_folder_id, new_name, exclude_id=folder.id
         ):
             raise DuplicateFolderException()
 
@@ -258,7 +291,7 @@ class FolderService(OutboxEmitterMixin):
         # it must run against the pre-rename tree. IDs are stable across
         # the rewrite, so this set is still exactly right after it.
         descendants = (
-            await self._folders.list_descendants(folder, owner_id) if old_path != new_path else []
+            await self._folders.list_descendants(folder, owner_id, organization_id) if old_path != new_path else []
         )
 
         folder.name = new_name
@@ -274,9 +307,14 @@ class FolderService(OutboxEmitterMixin):
         return folder
 
     async def move_folder(
-        self, folder_id: uuid.UUID, owner_id: uuid.UUID, new_parent_folder_id: uuid.UUID | None, actor_id: uuid.UUID
+        self,
+        folder_id: uuid.UUID,
+        owner_id: uuid.UUID,
+        organization_id: uuid.UUID,
+        new_parent_folder_id: uuid.UUID | None,
+        actor_id: uuid.UUID,
     ) -> Folder:
-        folder = await self._get_owned_active(folder_id, owner_id)
+        folder = await self._get_owned_active(folder_id, owner_id, organization_id)
 
         if folder.parent_folder_id == new_parent_folder_id:
             return folder  # no-op move
@@ -284,12 +322,12 @@ class FolderService(OutboxEmitterMixin):
         if new_parent_folder_id == folder.id:
             raise CircularReferenceException(detail="Cannot move a folder into itself.")
 
-        new_parent = await self._resolve_parent(owner_id, new_parent_folder_id)
+        new_parent = await self._resolve_parent(owner_id, organization_id, new_parent_folder_id)
 
         if new_parent is not None and is_same_or_descendant_path(new_parent.path, folder.path):
             raise CircularReferenceException()
 
-        if await self._folders.name_exists_in_parent(owner_id, new_parent_folder_id, folder.name):
+        if await self._folders.name_exists_in_parent(owner_id, organization_id, new_parent_folder_id, folder.name):
             raise DuplicateFolderException(
                 detail="A folder with this name already exists in the destination."
             )
@@ -303,7 +341,7 @@ class FolderService(OutboxEmitterMixin):
         # Same reasoning as `rename_folder`: gather descendants against the
         # still-old `folder.path` before it's mutated below.
         descendants = (
-            await self._folders.list_descendants(folder, owner_id) if old_path != new_path else []
+            await self._folders.list_descendants(folder, owner_id, organization_id) if old_path != new_path else []
         )
 
         folder.parent_folder_id = new_parent_folder_id
@@ -326,12 +364,14 @@ class FolderService(OutboxEmitterMixin):
                 await self._invalidator.descendant_breadcrumbs_changed([d.id for d in descendants])
         return folder
 
-    async def delete_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> None:
+    async def delete_folder(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> None:
         """Soft delete: this folder AND every descendant move into the trash together."""
-        folder = await self._get_owned_active(folder_id, owner_id)
+        folder = await self._get_owned_active(folder_id, owner_id, organization_id)
 
         now = datetime.now(UTC)
-        descendants = await self._folders.list_descendants(folder, owner_id)
+        descendants = await self._folders.list_descendants(folder, owner_id, organization_id)
 
         for node in [folder, *descendants]:
             node.is_deleted = True
@@ -361,6 +401,7 @@ class FolderService(OutboxEmitterMixin):
             user_id=owner_id,
             payload={
                 "folder_id": str(folder.id),
+                "organization_id": str(organization_id),
                 "name": folder.name,
                 "path": folder.path,
                 "soft_delete": True,
@@ -369,8 +410,10 @@ class FolderService(OutboxEmitterMixin):
             },
         )
 
-    async def restore_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID, actor_id: uuid.UUID) -> Folder:
-        folder = await self._folders.get_any_by_id(folder_id, owner_id)
+    async def restore_folder(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> Folder:
+        folder = await self._folders.get_any_by_id(folder_id, owner_id, organization_id)
         if folder is None or not folder.is_deleted:
             raise FolderNotFoundException(detail="Folder not found in trash.")
 
@@ -378,7 +421,7 @@ class FolderService(OutboxEmitterMixin):
         # deleted as part of the same operation (i.e. everything currently
         # soft-deleted under its path), but does NOT resurrect items that
         # were independently deleted before this folder was.
-        descendants = await self._folders.list_descendants(folder, owner_id)
+        descendants = await self._folders.list_descendants(folder, owner_id, organization_id)
 
         folder.is_deleted = False
         folder.deleted_at = None
@@ -399,8 +442,10 @@ class FolderService(OutboxEmitterMixin):
             await self._invalidate_folder(node)
         return folder
 
-    async def permanent_delete_folder(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> None:
-        folder = await self._folders.get_any_by_id(folder_id, owner_id)
+    async def permanent_delete_folder(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> None:
+        folder = await self._folders.get_any_by_id(folder_id, owner_id, organization_id)
         if folder is None:
             raise FolderNotFoundException()
         if not folder.is_deleted:
@@ -409,7 +454,7 @@ class FolderService(OutboxEmitterMixin):
         # Descendants are captured BEFORE the delete: afterwards the rows
         # are gone (FK cascade) and there is nothing left to enumerate, so
         # their cache entries would be unreachable orphans until TTL.
-        descendants = await self._folders.list_descendants(folder, owner_id)
+        descendants = await self._folders.list_descendants(folder, owner_id, organization_id)
 
         # Physical delete cascades to descendant folders via the FK's
         # ON DELETE CASCADE, and to contained files via FileMetadata's
@@ -420,7 +465,9 @@ class FolderService(OutboxEmitterMixin):
         for node in descendants:
             await self._invalidate_folder(node)
 
-    async def get_tree(self, owner_id: uuid.UUID, root_folder_id: uuid.UUID | None) -> list[FolderTreeNode]:
+    async def get_tree(
+        self, owner_id: uuid.UUID, organization_id: uuid.UUID, root_folder_id: uuid.UUID | None
+    ) -> list[FolderTreeNode]:
         """
         Builds the folder tree as nested `FolderTreeNode`s.
 
@@ -428,12 +475,12 @@ class FolderService(OutboxEmitterMixin):
         folder the owner has. Otherwise returns a single tree rooted at
         the given folder.
         """
-        all_folders = await self._list_all_active(owner_id)
+        all_folders = await self._list_all_active(owner_id, organization_id)
 
         if root_folder_id is None:
             roots = [f for f in all_folders if f.parent_folder_id is None]
         else:
-            root = await self._get_owned_active(root_folder_id, owner_id)
+            root = await self._get_owned_active(root_folder_id, owner_id, organization_id)
             roots = [root]
 
         by_parent: dict[uuid.UUID | None, list[Folder]] = {}
@@ -452,20 +499,22 @@ class FolderService(OutboxEmitterMixin):
 
         return [build_node(r) for r in sorted(roots, key=lambda f: f.name.lower())]
 
-    async def _list_all_active(self, owner_id: uuid.UUID) -> list[Folder]:
+    async def _list_all_active(self, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[Folder]:
         # Deliberately simple: fetch every active folder for the owner in
         # one query, then build the tree in memory. Folder trees per user
         # are not expected to be large enough (thousands, not millions) to
         # need recursive-CTE pagination for this operation.
-        return await self._folders.list_all_active(owner_id)
+        return await self._folders.list_all_active(owner_id, organization_id)
 
-    async def get_breadcrumb(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> list[BreadcrumbItem]:
-        folder = await self._get_owned_active(folder_id, owner_id)
+    async def get_breadcrumb(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> list[BreadcrumbItem]:
+        folder = await self._get_owned_active(folder_id, owner_id, organization_id)
 
         chain: list[Folder] = [folder]
         current = folder
         while current.parent_folder_id is not None:
-            parent = await self._folders.get_active_by_id(current.parent_folder_id, owner_id)
+            parent = await self._folders.get_active_by_id(current.parent_folder_id, owner_id, organization_id)
             if parent is None:
                 break
             chain.append(parent)
@@ -474,7 +523,9 @@ class FolderService(OutboxEmitterMixin):
         chain.reverse()
         return [BreadcrumbItem(id=f.id, name=f.name, path=f.path) for f in chain]
 
-    async def get_breadcrumb_cached(self, folder_id: uuid.UUID, owner_id: uuid.UUID) -> list[BreadcrumbItem]:
+    async def get_breadcrumb_cached(
+        self, folder_id: uuid.UUID, owner_id: uuid.UUID, organization_id: uuid.UUID
+    ) -> list[BreadcrumbItem]:
         """
         Cache-aside breadcrumb trail.
 
@@ -486,15 +537,15 @@ class FolderService(OutboxEmitterMixin):
         """
         cache = self._cache
         if cache is None or not cache.enabled:
-            return await self.get_breadcrumb(folder_id, owner_id)
+            return await self.get_breadcrumb(folder_id, owner_id, organization_id)
 
         # Authorize first — the cached trail is keyed by folder only.
-        await self.get_folder_cached(folder_id, owner_id)
+        await self.get_folder_cached(folder_id, owner_id, organization_id)
 
         key = cache.keys.folder_breadcrumbs(folder_id)
 
         async def _load() -> list[dict]:
-            items = await self.get_breadcrumb(folder_id, owner_id)
+            items = await self.get_breadcrumb(folder_id, owner_id, organization_id)
             return [item.model_dump(mode="json") for item in items]
 
         payload = await cache.get_or_set(
@@ -505,5 +556,5 @@ class FolderService(OutboxEmitterMixin):
         )
         return [BreadcrumbItem.model_validate(item) for item in payload]
 
-    async def list_trash(self, owner_id: uuid.UUID) -> list[Folder]:
-        return await self._folders.list_trash(owner_id)
+    async def list_trash(self, owner_id: uuid.UUID, organization_id: uuid.UUID) -> list[Folder]:
+        return await self._folders.list_trash(owner_id, organization_id)
