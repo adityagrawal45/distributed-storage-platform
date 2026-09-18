@@ -517,3 +517,86 @@ class EventPublishError(NimbusFSException):
 
     def __init__(self, detail: str = "Failed to publish an event to Pub/Sub."):
         super().__init__(detail)
+
+
+# ---------------------------------------------------------------------
+# Multi-tenancy / sharing / administration (Phase 13)
+# ---------------------------------------------------------------------
+# Every new exception here subclasses an ALREADY-REGISTERED base
+# (`NotFoundException`/`AuthorizationException`/`ConflictException`/
+# `ValidationException`) — zero new exception handlers, zero
+# `app/main.py` changes, the exact "extend, don't duplicate" pattern
+# Phase 6's own exceptions already established for this codebase.
+class OrganizationNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Organization not found."):
+        super().__init__(detail)
+
+
+class GroupNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Group not found."):
+        super().__init__(detail)
+
+
+class MembershipNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Membership not found."):
+        super().__init__(detail)
+
+
+class ShareNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Share not found."):
+        super().__init__(detail)
+
+
+class ShareExpiredOrRevokedException(NotFoundException):
+    """
+    Deliberately the SAME message/status as `ShareNotFoundException` —
+    and deliberately NOT a distinct `AuthorizationException` — for a
+    share token specifically (Phase 13 §16/§36): telling an attacker
+    "this token is valid but expired" vs. "this token never existed"
+    vs. "this token was revoked" leaks information about which tokens
+    are real, which is exactly what an opaque bearer credential's
+    unguessability is supposed to make irrelevant. All three outcomes
+    (never existed, expired, revoked) return the identical 404.
+    """
+
+    def __init__(self, detail: str = "Share not found."):
+        super().__init__(detail)
+
+
+class NotOrganizationMemberException(AuthorizationException):
+    def __init__(self, detail: str = "You are not a member of this organization."):
+        super().__init__(detail)
+
+
+class OrganizationSuspendedException(AuthorizationException):
+    def __init__(self, detail: str = "This organization has been suspended."):
+        super().__init__(detail)
+
+
+class InvalidSharePasswordException(AuthorizationException):
+    def __init__(self, detail: str = "Incorrect share password."):
+        super().__init__(detail)
+
+
+class LastOwnerException(ConflictException):
+    """Raised when an action would leave an organization with zero active OWNERs."""
+
+    def __init__(self, detail: str = "An organization must always have at least one owner."):
+        super().__init__(detail)
+
+
+class QuotaExceededException(ConflictException):
+    """
+    Raised by `QuotaService`/`FileUploadService` when an operation
+    would push `Organization.storage_used_bytes` past
+    `storage_limit_bytes`. Modeled as a `ConflictException` (409, via
+    the already-registered handler) rather than inventing a new HTTP
+    semantic (`507 Insufficient Storage` exists but nothing else in
+    this codebase's exception hierarchy uses a non-4xx/5xx-conventional
+    code) — a quota conflict is conceptually "the current state of the
+    world conflicts with this request succeeding," the same shape
+    `DuplicateFileException` already represents for a different reason.
+    """
+
+    def __init__(self, detail: str = "This operation would exceed the organization's storage quota."):
+        super().__init__(detail)
