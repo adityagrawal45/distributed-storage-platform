@@ -15,7 +15,7 @@
 | `utils/` | Small stateless helper functions (e.g. path building) |
 | `tests/` | Unit/integration tests, fixtures |
 
-## 4. Database Design
+## 4. Database Design 
 
 **`users`**
 
