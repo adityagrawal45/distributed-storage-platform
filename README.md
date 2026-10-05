@@ -2,7 +2,7 @@
 |---|---|
 | `api/` | HTTP concerns only: routing, request/response wrapping |
 | `core/config` | Typed, environment-driven settings |
-| `core/security` | Password hashing, JWT issuing/verification |
+| `core/security` | Password hashing,  JWT issuing/verification |
 | `database/` | Engine/session/pool management, health checks |
 | `models/` | ORM table definitions |
 | `repositories/` | Query/persistence logic per entity |
