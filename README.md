@@ -1,4 +1,4 @@
-| Directory | Responsibility |
+| Directory | Responsibility | 
 |---|---|
 | `api/` | HTTP concerns only: routing, request/response wrapping |
 | `core/config` | Typed, environment-driven settings |
