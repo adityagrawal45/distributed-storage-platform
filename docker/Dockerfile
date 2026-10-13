@@ -20,7 +20,7 @@
 # attack surface: an attacker who gets code execution in the runtime
 # container cannot compile anything, because there's nothing to compile
 # with.
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim AS builder 
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
