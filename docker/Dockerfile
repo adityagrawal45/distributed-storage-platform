@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1 
 #
 # Phase 5: this is now the SINGLE canonical Dockerfile — used by both
 # `docker-compose.yml` (local dev, with `command:` overriding CMD for
