@@ -1,5 +1,5 @@
 | Directory | Responsibility | 
-|---|---| 
+|---|---|  
 | `api/` | HTTP concerns only: routing, request/response wrapping |
 | `core/config` | Typed, environment-driven settings |
 | `core/security` | Password hashing,  JWT issuing/verification |
